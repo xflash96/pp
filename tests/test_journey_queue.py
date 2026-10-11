@@ -1,0 +1,637 @@
+"""User journeys through `pp queue`: what a person (or an agent) types, step by step, and what they see.
+
+Each test is one story through the real CLI and a real detached worker (poll 0.2s), in the sandbox of
+tests/journey.py. A fake nvidia-smi that sees no GPU keeps the machine's real cards out of it unless a story
+installs fake ones."""
+import json
+import os
+import shlex
+import sys
+import time
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from journey import ROOT, Journey, replace_file  # noqa: E402
+
+BASE = "[queue.default]\npoll = 0.2\nidle_exit = 30\n"
+
+
+class QueueJourney(Journey):
+    def setUp(self):
+        super().setUp()
+        self.setcfg(BASE)
+
+    def setcfg(self, text: str):
+        """Replace the whole config file (TOML forbids defining a table twice, so stories rewrite it), in one step."""
+        replace_file(f"{self.env['PP_CONFIG_DIR']}/config.toml", text)
+
+    def add(self, *args, env=None, cwd=None) -> str:
+        r = self.pp("queue", "add", *args, env=env, cwd=cwd)
+        return r.stdout.split()[-1]
+
+    def show(self, jid) -> dict:
+        return json.loads(self.pp("queue", "show", str(jid), "--json").stdout)
+
+    def wait(self, *ids, code=0, env=None, extra=()):
+        return self.pp("queue", "wait", *map(str, ids), "--timeout", "20", "--poll", "0.2", *extra, code=code, env=env)
+
+    def status(self, *args, code=0) -> str:
+        return self.pp("queue", *args, code=code).stdout
+
+    def state(self, jid) -> str:
+        return self.show(jid)["state"]
+
+    def as_agent(self, sid="sess-a"):
+        return dict(self.env, CLAUDE_CODE_SESSION_ID=sid)
+
+
+class TestFirstSteps(QueueJourney):
+    def test_first_job_from_nothing_to_its_log(self):
+        self.assertIn("no queues yet", self.status())
+        r = self.pp("queue", "add", "--", "sh", "-c", "echo hello-from-the-job")
+        jid = r.stdout.strip()
+        self.assertTrue(jid.isdigit(), r.stdout)
+        self.assertIn("started the default worker", r.stderr)          # nobody has to start it
+        self.assertIn(f"queued {jid} (default)", r.stderr)
+        out = self.wait(jid).stdout
+        self.assertIn(f"done {jid} rc=0", out)
+        st = self.status()
+        self.assertIn("== default   worker up", st)
+        self.assertIn(f"{jid}  done  rc=0", st)
+        show = self.pp("queue", "show", jid).stdout
+        for word in ("(default)  done", "command", "sh -c 'echo hello-from-the-job'", "\n  hello-from-the-job"):
+            self.assertIn(word, show)
+        self.assertIn("hello-from-the-job", self.pp("queue", "log", jid).stdout)
+        j = self.show(jid)
+        self.assertEqual((j["state"], j["rc"], j["watchers"]), ("done", 0, []))
+        d = json.loads(self.status("--json"))
+        self.assertEqual([x["id"] for x in d["recent"]], [int(jid)])
+        self.assertEqual(d["config_errors"], [])
+        self.assertEqual(json.loads(self.status("ls", "--json"))["recent"], d["recent"])
+
+    def test_a_quick_job_reports_how_long_it_ran_not_how_long_until_it_was_noticed(self):
+        jid = self.add("--", "sh", "-c", "while [ ! -f go ]; do sleep 0.05; done")
+        self.until(lambda: self.state(jid) == "running")
+        self.assertIn("stopped worker", self.pp("queue", "worker", "stop").stdout)
+        rcf = self.show(jid)["rcfile"]                      # where this attempt writes its exit code
+        self.write("work/go", "")
+        self.until(lambda: os.path.exists(rcf))             # it ended, unwatched
+        wrote_its_code = os.path.getmtime(rcf)              # its own last act, with nothing watching for it
+        noticed = time.time()
+        self.pp("queue", "worker", "start")                 # and a worker sees it only now
+        self.wait(jid)
+        j = self.show(jid)
+        self.assertAlmostEqual(j["ended"], wrote_its_code, places=3)   # when it ended ...
+        self.assertLess(j["ended"], noticed)                           # ... not when it was noticed
+        self.assertAlmostEqual(j["seconds"], j["ended"] - j["started"], places=3)
+
+    def test_mistakes_while_adding_are_refused_before_anything_is_queued(self):
+        bad = [(["add"], "no command"),
+               (["add", "--from", "nope.txt"], "No such file"),
+               (["add", "--need", "slots=-1", "--", "true"], "positive number"),
+               (["add", "--need", "slots=nan", "--", "true"], "positive number"),
+               (["add", "--env", "FOO", "--", "true"], "NAME=VALUE"),
+               (["add", "--cwd", "/no/such/dir", "--", "true"], "no directory"),
+               (["add", "--retries", "-1", "--", "true"], "--retries"),
+               (["add", "--retry-if", "(", "--", "true"], "--retry-if"),
+               (["add", "--timeout", "soon", "--", "true"], "not a duration"),
+               (["add", "--need", "net=1", "--", "./fetch.sh"], "nothing provides 'net'")]
+        self.write("work/quotes.txt", "echo fine\necho \"unclosed\n")
+        bad.append((["add", "--from", "quotes.txt"], "line 2"))
+        for argv, want in bad:
+            r = self.pp("queue", *argv, code=2)
+            self.assertIn(want, r.stderr, argv)
+            self.assertNotIn("Traceback", r.stderr, argv)
+        self.assertIn("no queues yet", self.status())               # nothing slipped through
+        for argv in (["show", "999"], ["kill", "abc"], ["log", "7"], ["drop", "3-1"]):
+            self.assertIn("no job matches", self.pp("queue", *argv, code=2).stderr)
+        self.assertIn("invalid choice", self.pp("queue", "bogus", code=2).stderr)
+        self.setcfg(BASE + "[queue.dl]\npoll = 0.2\n[queue.dl.resources]\nnet = 2\n")      # declared, as in the help
+        self.write("work/fetch.sh", "#!/bin/sh\necho fetched\n", 0o755)
+        self.assertIn("done", self.wait(self.add("-q", "dl", "--need", "net=1", "--", "./fetch.sh")).stdout)
+
+    def test_one_job_per_line_from_a_file_or_stdin(self):
+        self.write("work/cmds.txt", "# nightly\necho one\n\nsh -c 'echo two; exit 1'\n")
+        ids = self.pp("queue", "add", "--from", "cmds.txt", "--prio", "5").stdout.split()
+        ids += self.pp("queue", "add", "--from", "-", input="echo three\n").stdout.split()
+        self.assertEqual(len(ids), 3)
+        r = self.wait(f"{ids[0]}-{ids[-1]}", code=1)              # a range
+        self.assertIn(f"done {ids[0]}", r.stdout)
+        self.assertIn(f"FAILED {ids[1]} rc=1", r.stdout)
+        self.assertIn(f"done {ids[2]}", r.stdout)
+        self.assertEqual(self.show(ids[0])["prio"], 5)
+        self.assertIn("running 0, queued 0", self.pp("queue", "wait", "--idle", "--timeout", "20", "--poll", "0.2").stdout)
+
+
+class TestOrdering(QueueJourney):
+    def test_slots_run_order_reprio_hold_release_and_drop(self):
+        self.setcfg(BASE + "[queue.default.resources]\nslots = 1\n")
+        blocker = self.add("--tag", "blocker", "--", "sleep", "30")
+        a, b, c = (self.add("--tag", t, "--", "true") for t in ("a", "b", "c"))
+        self.until(lambda: self.state(blocker) == "running")
+        st = self.status()
+        self.assertIn("slots 1/1", st)
+        self.assertIn("waiting: slots", st)
+        self.assertNotIn("[pp queue]", st)          # a running job with no output yet shows no pp banner as its line
+        self.assertIn(f"reprio {c} -> p0", self.pp("queue", "reprio", "c", "0").stdout)     # by tag
+        queued = self.status()
+        self.assertLess(queued.index(f"  {c}  p0"), queued.index(f"  {a}  p10"))
+        self.pp("queue", "hold", b)
+        self.assertIn("is held; hold works on queued jobs", self.pp("queue", "hold", b, code=2).stderr)
+        r = self.pp("queue", "drop", blocker, code=2)
+        self.assertIn(f"drop works on queued/held jobs. `pp queue kill {blocker}` stops it", r.stderr)
+        self.pp("queue", "drop", a)
+        self.assertIn(f"killed {blocker} (stopped on SIGTERM)", self.pp("queue", "kill", blocker).stdout)
+        self.wait(c)
+        self.assertEqual(self.state(b), "held")
+        r = self.pp("queue", "wait", b, "--timeout", "1", "--poll", "0.2", code=3)      # held: it never ends
+        self.assertIn(f"{b} held", r.stderr)
+        self.pp("queue", "release", b)
+        self.wait(b)
+        self.assertLess(self.show(c)["started"], self.show(b)["started"])
+        self.assertEqual(self.show(blocker)["reason"], "killed")
+        self.assertIn("no job matches", self.pp("queue", "show", a, code=2).stderr)      # dropped: gone
+        self.assertIn("not running", self.pp("queue", "kill", c, code=2).stderr)
+
+    def test_a_job_added_on_hold_runs_once_released(self):
+        self.setcfg(BASE + "[queue.later]\npoll = 0.2\n")
+        h = self.add("-q", "later", "--hold", "--", "echo", "released-ok")
+        self.assertIn("worker down", self.pp("queue", "-q", "later", "worker", "status").stdout)
+        r = self.pp("queue", "release", h)
+        self.assertIn("started the later worker", r.stderr)            # nothing else would launch it
+        self.wait(h)
+
+
+class TestFailures(QueueJourney):
+    def test_failure_then_log_note_and_retry(self):
+        jid = self.add("--tag", "boom", "--", "sh", "-c", "echo working; echo 'Traceback: kaboom' >&2; exit 4")
+        r = self.wait(jid, code=1)
+        self.assertIn(f"FAILED {jid} rc=4", r.stdout)
+        self.assertIn("  | Traceback: kaboom", r.stdout)
+        self.assertNotIn(f"job {jid} (default) in", r.stdout)       # the launch banner only repeats the command
+        self.assertIn(f"next: pp queue log {jid} | pp queue retry {jid}", r.stdout)
+        self.assertIn("Traceback: kaboom", self.pp("queue", "log", jid).stdout)
+        self.assertIn(f"noted on {jid}", self.pp("queue", "note", jid, "kaboom", "because", "X").stdout)
+        self.pp("queue", "note", jid, "--by", "nightly", "told the team")
+        self.assertIn("note: told the team", self.status())        # the latest note, in the recent list
+        notes = self.show(jid)["notes"]
+        self.assertEqual([(n["text"], n["by"]) for n in notes], [("kaboom because X", "user"), ("told the team", "nightly")])
+        self.pp("queue", "note", jid, code=2)
+        r = self.pp("queue", "retry", jid)
+        new = r.stdout.strip()
+        self.assertIn(f"retry of {jid} queued as {new}", r.stderr)
+        self.wait(new, code=1)
+        self.assertRegex(self.pp("queue", "show", new).stdout, rf"retry of +job {jid}\n")
+        live = self.add("--", "sleep", "30")
+        self.assertIn("retry re-queues ended jobs", self.pp("queue", "retry", live, code=2).stderr)
+
+    def test_timeout_then_retries_that_match_and_that_do_not(self):
+        t = self.add("--timeout", "1s", "--tag", "slow", "--", "sh", "-c", 'trap "echo got-TERM; exit 7" TERM; '
+                     'while :; do sleep 0.1; done')
+        flaky = self.add("--retries", "2", "--retry-delay", "0s", "--retry-if", "Connection reset", "--tag", "flaky",
+                         "--", "sh", "-c", "echo Connection reset by peer; exit 1")
+        other = self.add("--retries", "2", "--retry-delay", "0s", "--retry-if", "Connection reset", "--tag", "disk",
+                         "--", "sh", "-c", "echo disk full; exit 1")
+        r = self.wait(t, flaky, other, code=1)
+        self.assertIn(f"FAILED {t} rc=- (timeout)", r.stdout)
+        self.assertIn("got-TERM", r.stdout)
+        self.assertEqual(self.show(flaky)["attempt"], 3)                  # 0s delay: retried at once, twice
+        self.assertEqual(len(self.show(flaky)["history"]), 2)
+        self.assertEqual(self.show(other)["attempt"], 1)
+        self.assertIn("not retried: neither the reason (exit 1) nor the log tail matches /Connection reset/", r.stdout)
+        self.assertIn("not retried", self.pp("queue", "show", other).stdout)
+
+    def test_a_queue_default_timeout_can_be_lifted_for_one_job(self):
+        self.setcfg(BASE + 'timeout = "1s"\n')
+        a = self.add("--", "sleep", "2")
+        b = self.add("--timeout", "none", "--", "sleep", "2")
+        self.assertEqual((self.show(a)["timeout"], self.show(b)["timeout"]), (1.0, None))
+        self.wait(a, code=1)
+        self.wait(b)
+
+    def test_hooks_get_the_outcome_in_their_environment(self):
+        jid = self.add("--tag", "hooky", "--on-fail", 'echo "$PP_QUEUE_JOB $PP_QUEUE_EVENT rc=$PP_QUEUE_RC $PP_QUEUE_TAG" > failed.out',
+                       "--on-done", "touch done.out", "--", "sh", "-c", "exit 3")
+        ok = self.add("--on-done", "echo ok > done2.out", "--", "true")
+        self.wait(jid, code=1)
+        self.wait(ok)
+        out = self.until(lambda: os.path.exists(f"{self.work}/failed.out") and self.read(f"{self.work}/failed.out"))
+        self.assertEqual(out, f"{jid} failed rc=3 hooky\n")
+        self.assertTrue(self.until(lambda: os.path.exists(f"{self.work}/done2.out")))
+        self.assertFalse(os.path.exists(f"{self.work}/done.out"))
+        self.assertIn("failed: echo", self.pp("queue", "show", jid).stdout)
+
+    def test_log_follow_rides_through_a_retry_and_exits_like_wait(self):
+        jid = self.add("--retries", "1", "--retry-delay", "0s", "--", "sh", "-c", "echo line-$PP_QUEUE_JOB; sleep 0.5; exit 1")
+        r = self.pp("queue", "log", jid, "-f", code=1, timeout=30)
+        self.assertEqual(r.stdout.count(f"line-{jid}"), 2)
+        self.assertIn("attempt 1/2 after exit 1", r.stdout)
+        self.assertIn(f"FAILED {jid}", r.stderr)
+
+
+class TestWorkers(QueueJourney):
+    def test_a_stopped_worker_leaves_jobs_running_and_the_next_one_adopts_them(self):
+        jid = self.add("--", "sh", "-c", "sleep 1.5; echo adopted; exit 3")
+        self.until(lambda: self.state(jid) == "running")
+        self.assertIn("stopped worker", self.pp("queue", "worker", "stop").stdout)
+        self.assertIn("worker down", self.pp("queue", "worker", "status").stdout)
+        st = self.status()
+        self.assertIn("nothing records how they end: `pp queue worker start -q default`", st)
+        self.assertIn("started worker", self.pp("queue", "worker", "start").stdout)
+        self.assertIn("already up", self.pp("queue", "worker", "start").stdout)
+        r = self.wait(jid, code=1)
+        self.assertIn(f"FAILED {jid} rc=3", r.stdout)
+        self.assertIn("adopting 1 running job", self.read(f"{self.env['PP_STATE_DIR']}/queue/default/worker.log"))
+
+    def test_killing_a_job_that_already_ended_records_how_it_really_ended(self):
+        jid = self.add("--", "sh", "-c", "while [ ! -f go ]; do sleep 0.05; done; exit 5")
+        self.until(lambda: self.state(jid) == "running")
+        self.assertIn("stopped worker", self.pp("queue", "worker", "stop").stdout)    # nobody records the end now
+        rcf = self.show(jid)["rcfile"]
+        self.write("work/go", "")
+        self.until(lambda: os.path.exists(rcf))                                       # it ended
+        r = self.pp("queue", "kill", jid)
+        self.assertIn(f"job {jid} had already ended: FAILED {jid} rc=5", r.stdout)
+        self.assertEqual((self.show(jid)["rc"], self.show(jid).get("reason")), (5, None))
+
+    def test_a_kill_with_no_worker_up_starts_one_and_it_stops_the_job(self):
+        """Only a queue's worker stops its jobs. With no worker up the kill starts one, that worker carries
+        out the stop, and the queue's queued jobs are launched too, as they are after any other `add`."""
+        jid = self.add("--", "sh", "-c", "while :; do sleep 0.1; done")
+        self.until(lambda: self.state(jid) == "running")
+        self.assertIn("stopped worker", self.pp("queue", "worker", "stop").stdout)
+        self.assertIn(f"kill 1 job(s): {jid}", self.pp("queue", "kill", jid, "-n").stdout)
+        self.assertEqual(self.state(jid), "running")        # -n only shows, so nothing asked it to stop
+        queued = self.add("--no-start", "--", "true")
+        r = self.pp("queue", "kill", jid)
+        self.assertIn("started the default worker", r.stderr)
+        self.assertIn(f"killed {jid} (stopped on SIGTERM)", r.stdout)
+        self.assertEqual(self.show(jid)["reason"], "killed")
+        self.assertIn("worker up", self.pp("queue", "worker", "status").stdout)
+        self.wait(queued)                                   # and the rest of the queue ran
+
+    def test_a_stop_is_not_a_pause_and_the_next_add_starts_a_worker(self):
+        """What the help says about `pp queue worker stop`: it stops the worker that is up, and the next
+        command that needs a worker starts one."""
+        self.wait(self.add("--", "true"))
+        self.assertIn("stopped worker", self.pp("queue", "worker", "stop").stdout)
+        self.assertIn("worker down", self.pp("queue", "worker", "status").stdout)
+        jid = self.add("--", "true")
+        self.assertIn("worker up", self.pp("queue", "worker", "status").stdout)
+        self.wait(jid)
+
+
+class TestResources(QueueJourney):
+    def test_a_shared_counter_and_a_queues_own_share_of_it(self):
+        self.setcfg(BASE + "[queue.a]\npoll = 0.2\n[queue.b]\npoll = 0.2\n[queue.b.resources]\nlicense = 1\n"
+                    "[resources]\nlicense = 2\n")
+        self.assertIn("[resources] license = 2", self.pp("queue", "add", "--need", "license=3", "--", "true", code=2).stderr)
+        self.assertIn("[queue.b.resources] license = 1",
+                      self.pp("queue", "add", "-q", "b", "--need", "license=2", "--", "true", code=2).stderr)
+        a1 = self.add("-q", "a", "--need", "license=1", "--", "sleep", "30")
+        b1 = self.add("-q", "b", "--need", "license=1", "--", "sleep", "30")
+        self.until(lambda: self.state(a1) == self.state(b1) == "running")    # both licences held before any waiter
+        b2 = self.add("-q", "b", "--need", "license=1", "--", "true")
+        a2 = self.add("-q", "a", "--need", "license=1", "--", "true")
+        st = self.until(lambda: (s := self.status()).count("waiting: license") == 2 and s)
+        self.assertIn("shared: license 2/2", st)
+        self.assertIn("waiting: license: [resources] license; 2+1 > 2", st)              # a2: the shared pool
+        self.assertIn("waiting: license: [queue.b.resources] license; 1+1 > 1", st)      # b2: b's own share
+        self.pp("queue", "kill", a1)
+        self.wait(a2)
+        self.assertEqual(self.state(b2), "queued")
+
+    def test_a_probed_pool_and_a_failing_probe(self):
+        self.write("home/free", "1\n")
+        self.setcfg(BASE + '[resources]\nnodes = { probe = "cat $HOME/free", every = "0.2s", settle = "60s" }\n')
+        first = self.add("--need", "nodes=1", "--", "sleep", "30")
+        second = self.add("--need", "nodes=1", "--", "true")
+        self.until(lambda: self.state(first) == "running")
+        st = self.until(lambda: (s := self.status()) and "probe says" in s and s)
+        self.assertIn("not free ([resources] nodes); probe says 1, 1 of it launched since, need 1", st)
+        self.assertIn("nodes 1 in use (probe: 1 free", st)
+        self.setcfg(BASE + '[resources]\nnodes = { probe = "echo cannot reach slurmctld >&2; exit 1", every = "0.2s" }\n')
+        st = self.until(lambda: (s := self.status()) and "probe failed" in s and s)
+        self.assertIn("exit 1: cannot reach slurmctld", st)
+        self.assertEqual(self.state(second), "queued")
+
+    def test_gpu_memory_is_reserved_per_card(self):
+        self.gpus((24, 2), (12, 1))
+        self.assertIn("no card's budget is that large (22)", self.pp("queue", "add", "--gpu-gb", "30", "--", "true", code=2).stderr)
+        cmd = ["--", "sh", "-c", "echo card=$CUDA_VISIBLE_DEVICES; sleep 30"]
+        g1, g2, g3 = self.add("--gpu-gb", "20", *cmd), self.add("--gpu-gb", "10", *cmd), self.add("--gpu-gb", "10", *cmd)
+        self.until(lambda: self.state(g2) == "running")
+        self.assertEqual((self.show(g1)["gpu"], self.show(g2)["gpu"]), (0, 1))
+        self.assertIn("card=1", self.until(lambda: "card=1" in (s := self.pp("queue", "log", g2).stdout) and s))
+        st = self.status()
+        self.assertIn("GPU0 0% 2.0/24G  GPU1 0% 1.0/12G", st)
+        self.assertIn("gpu_gb 10 does not fit on any card; card 0 reserved 20+10 > 22", st)
+        self.assertIn("card 1 reserved 10+10 > 10", st)
+        self.assertEqual(self.state(g3), "queued")
+        self.tool("nvidia-smi", "exit 9\n")
+        self.assertIn("nvidia-smi sees no GPU (nvidia-smi exited 9)",     # its own word on why
+                      self.pp("queue", "add", "--gpu-gb", "1", "--", "true", code=2).stderr)
+
+
+class TestConfigMistakes(QueueJourney):
+    def test_a_broken_config_is_named_and_stops_launches_but_not_bookkeeping(self):
+        runner = self.add("--tag", "gated", "--", "sh", "-c", "while [ ! -f go ]; do sleep 0.05; done")
+        self.until(lambda: self.state(runner) == "running")       # and it runs until the story says so
+        self.setcfg(BASE + "retry = 2\n")                         # a typo: retries
+        later = self.pp("queue", "add", "--", "true", code=1)
+        self.assertIn("unknown retry", later.stderr)
+        st = self.status(code=1)                                   # still shows what runs, and why nothing starts
+        self.assertIn("bad config: [queue.default]: unknown retry", st)
+        self.assertIn(f"{runner}  gated", st)
+        self.write("work/go", "")
+        self.wait(runner, extra=("--no-start",))                   # the worker still records the end
+        self.setcfg(BASE.replace("poll = 0.2", 'poll = "fast"'))
+        self.assertIn("poll: 'fast' is not a duration", self.status(code=1))
+        self.setcfg("[queue.default]\nretries = \"two\"\n")
+        r = self.pp("queue", "add", "--", "true", code=1)
+        self.assertIn("retries = 'two': a whole number", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.setcfg("[resources\nx = 1\n")
+        self.assertIn("bad config", self.pp("queue", code=1).stdout)
+        self.setcfg(BASE)
+        self.assertNotIn("bad config", self.status())
+        log = self.read(f"{self.env['PP_STATE_DIR']}/queue/default/worker.log")
+        self.assertIn("bad config, nothing launches until it is fixed", log)
+        self.assertLess(log.count("unknown retry"), 3)              # said once per change, not every loop
+
+    def test_queue_names(self):
+        for name in ("DL", "probes", "watchers", "a/b"):
+            self.assertIn("is not a queue name", self.pp("queue", "add", "-q", name, "--", "true", code=2).stderr)
+        self.add("-q", "dl", "--", "true")
+        self.assertIn("no queue 'dlx' yet (there are: dl)", self.status("-q", "dlx"))
+
+
+class TestAgent(QueueJourney):
+    def test_an_agent_queues_waits_on_its_own_jobs_and_is_told_how(self):
+        me, other = self.as_agent("sess-a"), self.as_agent("sess-b")
+        r = self.pp("queue", "add", "--", "sh", "-c", "sleep 0.5; echo agent-tail; exit 2", env=me)
+        mine = r.stdout.strip()
+        self.assertIn(f"run `pp queue wait {mine}` in the background", r.stderr)
+        theirs = self.add("--hold", "--", "true", env=other)
+        ok = self.pp("queue", "add", "--", "sleep", "1", env=me).stdout.strip()
+        self.assertIsNone(self.show(ok)["on_fail"])                         # it hears back by waiting, not by a hook
+        self.assertEqual(self.show(mine)["owner"]["session"], "sess-a")
+        self.wait(mine, code=1)                   # it ended before the agent waited (a person saw it): not missed
+        r = self.wait(code=1, env=me, extra=("--mine",))
+        self.assertIn(f"FAILED {mine} rc=2", r.stdout)
+        self.assertIn("| agent-tail", r.stdout)
+        self.assertIn(f"done {ok}", r.stdout)
+        self.assertNotIn(f" {theirs} ", r.stdout)
+        self.assertIn("wait pid", self.pp("queue", "show", mine).stdout)       # reported to
+        self.assertIn("nothing of this session's", self.wait(env=me, extra=("--mine",)).stdout)
+        self.assertIn("not inside an agent session", self.wait(code=2, extra=("--mine",)).stderr)
+        self.assertNotIn("in the background", self.pp("queue", "add", "--", "true").stderr)     # a person: no hint
+
+    def test_watch_streams_each_event_and_a_drop_is_not_success(self):
+        x = self.add("--hold", "--tag", "hx", "--", "true")
+        y = self.add("--hold", "--tag", "hy", "--", "true")
+        w = self.spawn("queue", "watch", x, y, "--poll", "0.2", "--timeout", "20")
+        self.until(lambda: "watch pid" in self.pp("queue", "show", x).stdout)
+        self.pp("queue", "release", x)
+        self.until(lambda: self.state(x) == "done")
+        self.pp("queue", "drop", y)
+        out, err = w.communicate(timeout=20)
+        self.assertEqual(w.returncode, 1)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], f"[queue watch] {x} held, {y} held")
+        self.assertIn(f"{x} released  hx", lines)
+        self.assertIn(f"{x} started  hx", lines)
+        self.assertTrue(any(ln.startswith(f"done {x} rc=0") for ln in lines), out)
+        self.assertIn(f"dropped {y}", lines)
+        self.assertIn("held, so this waits forever. `pp queue release` them", err)
+
+
+class TestCleaning(QueueJourney):
+    def test_clean_previews_refuses_without_a_terminal_then_removes(self):
+        ids = [self.add("--", "true") for _ in range(3)]
+        self.wait(*ids)
+        live = self.add("--hold", "--", "true")
+        r = self.pp("queue", "clean", "-n")
+        self.assertIn("3 ended job record(s)", r.stdout)
+        self.assertIn(f"default: {ids[0]}-{ids[2]}", r.stdout)
+        self.assertIn("pass -y", self.pp("queue", "clean", code=2).stderr)
+        self.assertEqual(self.state(ids[0]), "done")
+        self.assertIn("nothing to clean", self.pp("queue", "clean", "--older", "1d", "-y").stdout)
+        self.assertIn("removed 3", self.pp("queue", "clean", "-y").stdout)
+        self.assertEqual(os.listdir(f"{self.env['PP_STATE_DIR']}/queue/default/logs"), [])
+        self.assertEqual(self.state(live), "held")
+
+
+
+class TestSelections(QueueJourney):
+    """A range, or a tag several jobs share, is a selection: jobs it does not suit are left as they are, and kill and
+    drop show it and ask first. A job named by its id must suit the verb."""
+
+    def running(self, jid):
+        self.assertTrue(self.until(lambda: self.state(jid) == "running"), self.state(jid))
+
+    def test_drop_a_range_shows_asks_and_leaves_a_running_job(self):
+        run = self.add("--tag", "r", "--", "sleep", "30")
+        self.running(run)
+        a = self.add("--hold", "--tag", "a", "--", "true")
+        b = self.add("--hold", "--tag", "b", "--", "true")
+        r = self.pp("queue", "drop", f"{run}-{b}", "-n")
+        self.assertIn(f"drop 2 job(s): {a} a, {b} b", r.stdout)
+        self.assertIn(f"left as they are: {run} running", r.stdout)
+        self.assertEqual(self.state(a), "held")
+        self.assertIn("pass -y", self.pp("queue", "drop", f"{run}-{b}", code=2).stderr)    # no terminal to ask in
+        r = self.pp("queue", "drop", f"{run}-{b}", "-y")              # did what it could: exit 0
+        self.assertIn(f"dropped {a}", r.stdout)
+        self.assertEqual(self.state(run), "running")
+        self.assertIn(f"job {run} is running", self.pp("queue", "drop", run, code=2).stderr)    # named: an error
+        self.assertIn(f"killed {run}", self.pp("queue", "kill", run).stdout)                     # an id: at once
+
+    def test_hold_over_a_range_lists_what_it_left(self):
+        self.setcfg(BASE + "[queue.default.resources]\nslots = 1\n")         # q waits for run's slot
+        run = self.add("--need", "slots=1", "--", "sleep", "30")
+        self.running(run)
+        q = self.add("--need", "slots=1", "--", "true")
+        r = self.pp("queue", "hold", f"{run}-{q}")
+        self.assertIn(f"held {q}", r.stdout)
+        self.assertIn(f"left as they are: {run} running", r.stdout)
+        self.pp("queue", "kill", run)
+
+    def test_a_tag_several_jobs_share(self):
+        a = self.add("--tag", "exp1", "--", "true")
+        self.wait(a)
+        b = self.pp("queue", "retry", a).stdout.split()[0]           # a retry keeps the tag
+        self.wait(b)
+        r = self.pp("queue", "show", "exp1")
+        self.assertIn(f"job {b} ", r.stdout)
+        self.assertIn(f"'exp1' names jobs {a}, {b}; showing the newest, {b}", r.stderr)
+        self.assertIn("note one by its id", self.pp("queue", "note", "exp1", "why", code=2).stderr)
+        self.assertIn(f"done {a}", self.pp("queue", "wait", "exp1").stdout)           # wait takes the whole group
+        self.assertIn("reads as a job id or a range", self.pp("queue", "add", "--tag", "12-15", "--", "true", code=2).stderr)
+
+    def test_q_narrows_a_tag_that_spans_queues(self):
+        a = self.add("--hold", "--tag", "same", "--", "true")
+        b = self.add("-q", "dl", "--hold", "--tag", "same", "--", "true")
+        self.assertIn("use ids, or -q", self.pp("queue", "drop", "same", "-n", code=2).stderr)
+        r = self.pp("queue", "-q", "dl", "drop", "same", "-y")
+        self.assertIn(f"dropped {b}", r.stdout)
+        self.assertEqual(self.state(a), "held")
+
+    def test_release_over_a_selection_starts_one_worker(self):
+        ids = [self.add("--hold", "--tag", "batch3", "--", "true") for _ in range(3)]
+        r = self.pp("queue", "release", "batch3")
+        self.assertEqual(r.stderr.count("started the default worker"), 1, r.stderr)
+        self.wait(*ids)
+
+    def test_wait_takes_a_duration_and_ends_with_its_own_jobs(self):
+        j = self.add("--", "true")
+        r = self.pp("queue", "wait", j, "--timeout", "1m", "--poll", "0.2")
+        self.assertIn(f"done {j}", r.stdout)
+        self.assertNotIn("[queue wait]", r.stdout)          # no whole-queue line under a wait for ids
+        self.assertIn("duration", self.pp("queue", "wait", j, "--timeout", "soon", code=2).stderr)
+
+    def test_worker_status_is_a_report(self):
+        self.add("--no-start", "--", "true")
+        js = json.loads(self.pp("queue", "worker", "status", "--json").stdout)
+        self.assertEqual([(w["queue"], w["up"]) for w in js], [("default", False)])
+
+    def test_backfill_follows_the_config_while_the_worker_runs(self):
+        self.setcfg(BASE + "[resources]\ntok = 1\n")
+        a = self.add("--need", "tok=1", "--", "sleep", "30")
+        self.running(a)
+        b = self.add("--need", "tok=1", "--", "true")              # waits at the head for tok
+        c = self.add("--", "true")                                  # fits, but strict order keeps it behind b
+        self.until(lambda: "waiting: tok" in self.status())       # a tick found b blocked, and so launched no c
+        self.assertEqual(self.state(c), "queued")
+        self.setcfg(BASE + "backfill = true\n[resources]\ntok = 1\n")
+        self.assertTrue(self.until(lambda: self.state(c) == "done"), self.state(c))
+        self.assertEqual(self.state(b), "queued")
+        self.pp("queue", "kill", a)
+
+
+class TestReadme(QueueJourney):
+    def test_try_it(self):
+        """The README's "Try it", line by line, and what its comments promise."""
+        with open(os.path.join(ROOT, "README.md")) as f:
+            block = f.read().split("## Try it", 1)[1].split("```", 2)[1]
+        lines = [ln.split("  #")[0].strip() for ln in block.splitlines() if ln.startswith("pp ")]
+        self.assertEqual(len(lines), 6, lines)
+        outs = []
+        for line in lines:
+            args = shlex.split(line)[1:]
+            if args[:2] == ["queue", "wait"]:
+                args += ["--poll", "0.2"]
+            if args == ["queue"]:       # its comment promises the job's last line of output, so wait for one
+                self.until(lambda: "working" in self.pp("queue", code=None).stdout,
+                           what="the job's first line of output")
+            outs.append(self.pp(*args, code=None))
+        self.assertIn("working", outs[1].stdout)        # `pp queue`: running, with that last line
+        self.assertIn("done 1 rc=0", outs[2].stdout)
+        self.assertEqual(outs[2].returncode, 0)
+        self.assertIn("hello", outs[3].stdout)
+        self.assertIn("FAILED 2 rc=3", outs[5].stdout)
+        self.assertEqual(outs[5].stdout.count("| trying"), 2, outs[5].stdout)
+        self.assertEqual(outs[5].returncode, 1)
+
+# a project's runner, as a container wrapper would be: it reports what it was given, then runs the command
+RUNNER = """#!/bin/sh
+echo "RUNNER cwd=$(pwd) cuda=${CUDA_VISIBLE_DEVICES-unset} hf=${HF_HUB_OFFLINE-unset} seed=${SEED-unset} job=$PP_QUEUE_JOB"
+exec "$@"
+"""
+PROJECT = 'name = "toyproj"\n[queue]\nrunner = "docker/run.sh"\nenv = { HF_HUB_OFFLINE = "1", SEED = "project" }\n'
+
+
+class TestProjectRunner(QueueJourney):
+    """A project's .pp.toml [queue] wraps the jobs added from it, as experiments in a container need."""
+
+    def setUp(self):
+        super().setUp()
+        self.setcfg(BASE + "[queue.exp]\npoll = 0.2\nidle_exit = 30\n")
+        self.proj = self.git_repo("work/toyproj", {".pp.toml": PROJECT, "docker/run.sh": RUNNER, "lab/run.py": ""})
+
+    def exp(self, *args, cwd=None) -> str:
+        return self.add("-q", "exp", *args, cwd=cwd or self.proj)
+
+    def project(self, name: str, toml: str, files: dict | None = None) -> str:
+        root = os.path.join(self.work, name)
+        self.write(os.path.join(root, ".pp.toml"), toml)
+        for rel, (text, mode) in (files or {}).items():
+            self.write(os.path.join(root, rel), text, mode)
+        return root
+
+    def refused(self, root: str, *words: str, code: int = 2):
+        r = self.pp("queue", "add", "--", "echo", "x", cwd=root, code=code)
+        self.assertNotIn("Traceback", r.stderr)
+        for w in words:
+            self.assertIn(w, r.stderr)
+
+    def test_queue_from_the_root_and_a_subdirectory_then_read_the_results(self):
+        sub = os.path.join(self.proj, "lab")
+        a = self.exp("--tag", "root-run", "--", "echo", "from-root")
+        r = self.pp("queue", "add", "-q", "exp", "--env", "SEED=job", "--", "sh", "-c", "echo from-sub", cwd=sub)
+        b = r.stdout.strip()
+        self.assertIn(f"queued {b} (exp) [toyproj]", r.stderr)
+        self.assertIn("(via run.sh)", r.stderr)
+        self.wait(a, b)
+        log = self.pp("queue", "log", b).stdout
+        self.assertIn(f"RUNNER cwd={sub} cuda=unset hf=1 seed=job job={b}", log)    # --env beats the project's env
+        self.assertIn("from-sub", log)
+        self.assertIn(f"cwd={self.proj} ", self.pp("queue", "log", a).stdout)
+        job = self.show(b)
+        self.assertEqual((job["project"], job["queue"]), ("toyproj", "exp"))
+        self.assertEqual(job["runner"], [os.path.join(self.proj, "docker/run.sh")])
+        self.assertIn("root-run", self.status("-q", "exp"))
+
+    def test_add_echoes_the_command_not_just_the_runner(self):
+        deep = os.path.join(self.work, "a-rather-long-directory-name-for-a-project", "with-a-nested-checkout")
+        self.git_repo(deep, {".pp.toml": PROJECT, "docker/run.sh": RUNNER})
+        r = self.pp("queue", "add", "--no-start", "--", "python", "-m", "lab.run", "--seed", "7", cwd=deep)
+        self.assertIn("python -m lab.run --seed 7", r.stderr)
+
+    def test_a_directory_without_pp_toml_runs_the_bare_command(self):
+        plain = os.path.join(self.work, "scratch")
+        os.makedirs(plain)
+        j = self.add("--", "sh", "-c", "echo bare; pwd", cwd=plain)
+        self.wait(j)
+        log = self.pp("queue", "log", j).stdout
+        self.assertNotIn("RUNNER", log)
+        self.assertIn(f"bare\n{plain}", log)
+
+    def test_no_runner_skips_the_wrapper_for_one_job(self):
+        j = self.exp("--no-runner", "--", "echo", "unwrapped")
+        self.wait(j)
+        log = self.pp("queue", "log", j).stdout
+        self.assertNotIn("RUNNER", log)
+        self.assertIn("unwrapped", log)
+        self.assertEqual(self.show(j)["env"]["HF_HUB_OFFLINE"], "1")      # the project's env still applies
+
+    def test_each_broken_project_says_what_to_fix(self):
+        missing = self.project("missing", '[queue]\nrunner = "docker/run.sh"\n')
+        self.refused(missing, "does not exist", "--no-runner")
+        noexec = self.project("noexec", '[queue]\nrunner = "docker/run.sh"\n', {"docker/run.sh": (RUNNER, 0o644)})
+        self.refused(noexec, "not executable", "chmod +x")
+        self.refused(self.project("nopath", '[queue]\nrunner = "no-such-wrapper --gpus all"\n'), "not on PATH")
+        self.refused(self.project("badtype", "[queue]\nrunner = 3\n"), "runner must be", code=1)     # config errors
+        self.refused(self.project("badenv", '[queue]\nenv = "HF=1"\n'), "env must be a table", code=1)
+        self.refused(self.project("notable", 'queue = "docker/run.sh"\n'), "queue must be a table", code=1)
+        self.refused(self.project("typo", '[queue]\nrunnr = "docker/run.sh"\n'), "unknown runnr", code=1)
+        self.refused(self.project("badtoml", "[queue\n"), ".pp.toml", code=1)
+        self.assertEqual(json.loads(self.status("--json"))["queued"], [])    # nothing got queued
+        j = self.pp("queue", "add", "--no-runner", "--", "echo", "anyway", cwd=missing).stdout.strip()
+        self.wait(j)
+
+    def test_a_runner_list_and_a_runner_on_path_work(self):
+        root = self.project("listy", '[queue]\nrunner = ["env", "LISTY=1"]\n')
+        j = self.add("--", "sh", "-c", "echo listy=$LISTY", cwd=root)
+        self.wait(j)
+        self.assertIn("listy=1", self.pp("queue", "log", j).stdout)
+
+    def test_the_reserved_card_is_handed_to_the_runner(self):
+        self.gpus((24, 2), (24, 20))                          # card 1 is nearly full: someone else uses it
+        a = self.exp("--gpu-gb", "20", "--", "echo", "a-ran")
+        self.wait(a)
+        self.assertIn("cuda=0", self.pp("queue", "log", a).stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

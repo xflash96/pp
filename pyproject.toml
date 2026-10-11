@@ -1,0 +1,38 @@
+[project]
+name = "ppkit"
+version = "0.1.0"           # the same as pp/__init__.py's __version__; tests/test_cli.py checks
+description = "A CLI kit for user & agents"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "The pp Authors" }]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["cli", "job queue", "gpu", "agents", "toolkit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Shells",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+pp = "pp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/xflash96/pp"
+Issues = "https://github.com/xflash96/pp/issues"
+Changelog = "https://github.com/xflash96/pp/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "pp"          # the package imports as pp; ppkit is only its name on PyPI
+module-root = ""
+source-include = ["bin/**", "ci/**", "tests/**", "CHANGELOG.md", "CONTRIBUTING.md", ".pp.toml"]

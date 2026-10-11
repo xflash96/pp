@@ -1,0 +1,45 @@
+#!/bin/bash
+# ci/package [PYTHON]: what PyPI gets. It builds the sdist and wheel into dist/, installs the wheel into a fresh
+# environment, and runs pp from it as `uv tool install ppkit` would, in a throwaway home. CI runs it on 3.11; the
+# release job runs it and then publishes dist/.
+#
+# Checks: the wheel holds the pp package alone; pp starts and says where it lives; a queued job runs (its worker
+# starts as `python -P -m pp`, from a directory whose own pp/ would break it if it were imported); `pp cmd new`
+# refuses to write into the installed package and writes a --user command instead.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+src=$PWD
+rm -rf dist
+uv build --quiet --out-dir dist
+python3 - dist/*.whl <<'EOF'
+import sys, zipfile
+top = {n.split("/")[0] for n in zipfile.ZipFile(sys.argv[1]).namelist()}
+extra = {t for t in top if t != "pp" and not t.endswith(".dist-info")}
+sys.exit(f"ci/package: the wheel holds more than pp: {sorted(extra)}" if extra else 0)
+EOF
+
+work=$(mktemp -d)
+pp=$work/venv/bin/pp
+trap '"$pp" queue worker stop -q default >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+uv venv --quiet --python "${1:-3.11}" "$work/venv"
+uv pip install --quiet --python "$work/venv/bin/python" "$src"/dist/*.whl
+
+export HOME=$work/home NO_COLOR=1
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME PP_CONFIG_DIR PP_STATE_DIR PP_DATA_DIR PP_PATH CLAUDE_CODE_SESSION_ID
+mkdir -p "$HOME" "$work/here/pp"
+echo 'raise SystemExit("ci/package: imported the pp/ of the current directory")' > "$work/here/pp/__init__.py"
+cd "$work/here"
+
+fail() { echo "ci/package: $*" >&2; exit 1; }
+out=$("$pp" --version)
+[[ $out == "pp $(sed -n 's/^__version__ = "\(.*\)"$/\1/p' "$src/pp/__init__.py") ($work/venv/lib/"* ]] || fail "pp --version: $out"
+jid=$("$pp" queue add -- sh -c 'echo from-the-wheel' 2>/dev/null)
+"$pp" queue wait "$jid" --timeout 60 >/dev/null || fail "job $jid: $("$pp" queue show "$jid")"
+"$pp" queue log "$jid" | grep -q from-the-wheel || fail "job $jid's log: $("$pp" queue log "$jid")"
+set +e
+out=$("$pp" cmd new hello 2>&1); rc=$?
+set -e
+[[ $rc == 2 && $out == *--user* ]] || fail "pp cmd new without --user: exit $rc: $out"
+"$pp" cmd new hello --user -s "Say hello" >/dev/null
+[[ $("$pp" hello world) == world ]] || fail "a --user command does not run"
+echo "ci/package: $(ls "$src"/dist | tr '\n' ' ')ok on Python ${1:-3.11}"

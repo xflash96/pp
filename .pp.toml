@@ -1,0 +1,9 @@
+# pp's own project config. `pp promote -n` previews, `pp promote` releases pp itself.
+name = "pp"
+
+[promote]
+source = "git"
+check = "ci/check"                                   # runs inside the release: the exact bytes `pp` will run
+links = { "~/.local/bin/pp" = "bin/pp" }             # prod: always a promoted release
+dev_links = { "~/.local/bin/ppd" = "bin/pp" }        # dev: this working tree
+keep = 5

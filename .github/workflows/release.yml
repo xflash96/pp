@@ -1,0 +1,40 @@
+# A v* tag releases ppkit: the CI checks, then the tag must be pp's version and have a CHANGELOG section, then the
+# package is built and smoke-tested (ci/package), published to PyPI by Trusted Publishing (no token is stored),
+# and attached to a GitHub release whose notes are that section.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    environment: pypi # PyPI's trusted publisher for ppkit names this environment
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # Trusted Publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.9.21"
+          enable-cache: false
+      - name: the tag is pp's version, and CHANGELOG.md has its section
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' pp/__init__.py)
+          test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME, but pp is $version"; exit 1; }
+          awk -v h="## $GITHUB_REF_NAME" '$0 == h {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q . "$RUNNER_TEMP/notes.md" || { echo "CHANGELOG.md has no '## $GITHUB_REF_NAME' section"; exit 1; }
+      - run: ci/package 3.11
+      - run: uv publish --trusted-publishing always dist/*
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+        env:
+          GH_TOKEN: ${{ github.token }}
