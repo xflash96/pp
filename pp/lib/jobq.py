@@ -902,9 +902,17 @@ def _latest_note(j: dict) -> str:
     return ("note: " + _text(notes[-1]["text"].replace("\n", " "), 60)) if notes else ""
 
 
+# What a field of the machine surface is where the record does not hold it yet: a job that has not started
+# has no exit code and no attempt of its own, and a reader of `--json` finds the field all the same. So every
+# field below is on a job in each of the five states, and a reader tells "nothing yet" from "no such field".
+NOT_YET = {"rc": None, "reason": None, "not_retried": None, "started": None, "ended": None, "seconds": None,
+           "rcfile": None, "envfile": None, "container": None, "log_at": None, "cards": [], "stop_cmd": None,
+           "history": [], "notes": [], "reported": [], "hooks": []}
+
+
 def public(j: dict) -> dict:
     """A job as JSON consumers (`show/status --json`) see it: every stored field, with the job's environment
-    masked.
+    masked, and every promised field a record of this state does not hold yet (NOT_YET).
 
     Fields others rely on: id (int), state, queue, tag (or null), project, cwd, cmd (argv), runner (argv,
     maybe []), stop_cmd ("group" or the command that reaches what the runner started), needs, prio, owner
@@ -913,8 +921,8 @@ def public(j: dict) -> dict:
     runner started elsewhere carries), envfile (the file that runner reads its environment from),
     notes [{t, by, text}], reported [{t, by, session}], history (one entry per attempt that ended, each with
     that attempt's own rcfile, envfile, container, log_at and cards), stop {by, t, grace, timeout, sent,
-    kill9, denied, was, cmd, rc} on a job asked to stop, and from `show` also jobcore.watchers
-    [{pid, verb, session}].
+    kill9, denied, was, cmd, rc} on a job asked to stop, after [id] on a job that names the jobs it waits
+    for, and from `show` also jobcore.watchers [{pid, verb, session}].
 
     `env` and `shell_env` keep their keys and give every value as "***". A token or a secret is what the help
     says to pass with --env, and an agent reads `--json` to see how its jobs are getting on, so the values
@@ -926,7 +934,7 @@ def public(j: dict) -> dict:
     out, and `denied` is when pp was refused the job's process group. A stop with `denied` set is not in
     flight: nothing more goes out for it, and the job runs on until it ends on its own. `was` is who asked
     for the stop this one landed on, where a kill landed on a timeout's."""
-    out = {k: v for k, v in j.items() if not k.startswith("_")}
+    out = {**NOT_YET, **{k: v for k, v in j.items() if not k.startswith("_")}}
     for k in ("env", "shell_env"):
         if isinstance(out.get(k), dict):
             out[k] = dict.fromkeys(out[k], "***")

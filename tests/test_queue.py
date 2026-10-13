@@ -1643,6 +1643,29 @@ class TestShowNote(QueueCase):
         self.assertNotIn("HF_TOKEN", self.call("show", str(j))[1])      # the text form says neither
         self.assertEqual(jobstore.find(j)["env"], {"HF_TOKEN": "hf-secret-123"})
 
+    def test_every_promised_field_is_on_a_job_in_every_state(self):
+        """The machine surface is every field of the promised list, off a record in each of the five states.
+        A field a record does not hold yet comes back empty rather than missing, so a reader tells "nothing
+        yet" from "no such field" and never has to guess which state a field appears in."""
+        self.config("slots = 1")        # so the one that is to stay queued has no slot to take
+        w = jobq.worker_for("default")
+        states = {"done": self.add(cmd="true"), "failed": self.add(cmd="exit 3")}
+        self.run_until(w, lambda: self.state(states["failed"]) == "failed")
+        states["running"] = self.add(cmd="sleep 30")
+        w.tick()
+        states["queued"] = self.add()
+        states["held"] = self.add("--hold")
+        w.tick()
+        for state, jid in states.items():
+            with self.subTest(state=state):
+                self.assertEqual(self.state(jid), state)
+                j = json.loads(self.call("show", str(jid), "--json")[1])
+                self.assertEqual([f for f in journey.PROMISED if f not in j], [])
+                self.assertEqual(j["cards"] if state != "running" else [], [])
+                for f in ("history", "notes", "reported", "hooks"):
+                    self.assertIsInstance(j[f], list, f)
+        self.assertNotIn("after", json.loads(self.call("show", str(states["queued"]), "--json")[1]))
+
     def test_note_by_session(self):
         j = self.add("--hold")
         self.sb.as_session("test-session-3")

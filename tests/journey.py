@@ -43,6 +43,15 @@ BUILTINS = tuple(sorted(f[:-3] for f in os.listdir(os.path.join(ROOT, "pp", "com
                         if f.endswith(".py") and not f.startswith("_")))
 
 
+# Every field `pp queue show --json` promises, read off one record. A reader ignores a field it does not
+# know, so a field beside these is no failure; a field missing from a job in any of the five states is. Both
+# tiers read this one list: the journey of an agent session, and the machine-surface test of tests/test_queue.py.
+PROMISED = ("id", "state", "queue", "tag", "project", "cwd", "cmd", "runner", "needs", "prio", "owner",
+            "timeout", "grace", "retries", "attempt", "rc", "reason", "not_retried", "added", "started",
+            "ended", "seconds", "log", "log_at", "container", "envfile", "rcfile", "cards", "history", "notes",
+            "reported", "hooks", "env", "shell_env", "stop_cmd")
+
+
 def has(*cmds: str) -> bool:
     return all(c in BUILTINS for c in cmds)
 

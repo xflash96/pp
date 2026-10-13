@@ -694,7 +694,7 @@ class TestProjectRunner(QueueJourney):
 import shutil  # noqa: E402
 import signal  # noqa: E402
 
-from journey import kill_pid, needs  # noqa: E402
+from journey import PROMISED, kill_pid, needs  # noqa: E402
 
 from pp.lib import proc  # noqa: E402
 
@@ -718,12 +718,6 @@ HELP_SECTIONS = ("A first project whose work runs in a container, in four steps"
                  "Timeouts and retries", "Hooks, on the FINAL outcome of a job", "Workers, and after a reboot",
                  "Agents", "What pp queue leaves to you, on purpose")
 
-# Every field `show --json` promises, off one record. A reader ignores a field it does not know, so a field
-# beside these is no failure.
-PROMISED = ("id", "state", "queue", "tag", "project", "cwd", "cmd", "runner", "needs", "prio", "owner",
-            "timeout", "grace", "retries", "attempt", "rc", "reason", "not_retried", "added", "started",
-            "ended", "seconds", "log", "log_at", "container", "envfile", "rcfile", "cards", "history", "notes",
-            "reported", "hooks", "env", "shell_env", "watchers")
 
 # A runner of the shape a container runner has, and the fault a stop command closes: the work it starts is in a
 # session of its own, outside the job's process group, so no signal pp sends reaches it, and the runner itself
@@ -1380,7 +1374,6 @@ class TestTheSecondProjectAndTheSession(Lab):
         for j in (ja, jb):                                       # the records are the store's, not a tree's
             self.assertTrue(self.field(j, "rcfile").startswith(self.env["PP_STATE_DIR"]), j["rcfile"])
 
-    @unittest.expectedFailure
     def test_a_session_hears_how_its_own_jobs_ended(self):
         """`wait --mine` covers every job this session queued that is live, and every one that ended without
         the session hearing it. It exits 0 when all ended well, 1 when any failed, and 3 when it gives up at
@@ -1396,7 +1389,7 @@ class TestTheSecondProjectAndTheSession(Lab):
         self.write("work/go", "")
         self.pp("queue", "wait", "--mine", "--poll", "0.2", code=0, env=agent)
         j = self.show(live)
-        self.assertEqual([f for f in PROMISED if f not in j], [])
+        self.assertEqual([f for f in PROMISED + ("watchers",) if f not in j], [])
         parked = self.add("--hold", "--tag", "s1_eval", "--", "true", env=agent)
         waiter = self.spawn("queue", "wait", "s1_eval", "--poll", "0.2")
         self.until(lambda: self.show(parked)["watchers"], what="the wait to be watching the held job")
