@@ -67,6 +67,25 @@ its sources.
   `[queue.NAME]`, which the queue's worker re-reads every loop, so they
   change under running jobs with no restart.
 
+The other commands: help by flag, plans under `-n`, and links one target holds.
+
+- `pp -h NAME` and `pp --help NAME` print that command's help, as
+  `pp help NAME` does. `pp -h NAME VERB` prints the verb's.
+- `pp promote rollback`, `pp promote link`, `pp promote init` and
+  `pp cmd new` take `-n`: each one shows its plan and changes nothing.
+- `pp promote` does not take over a link path another target holds. The
+  refusal names that target, and `--force-links` moves the link. It used
+  to move any link that pointed into a release directory.
+- `pp promote status --json` has `failed`: the current release's
+  activation failed, or nothing gated it.
+- `pp promote diff --json` has `source_gone`. A target whose project
+  directory is gone exits 1 there, in place of git's error.
+- `pp cmd ls --json` has `aliases`, each command's short names.
+- An unknown key in `[[http.roots]]` or `[[http.discover]]` is a config
+  error naming the file and the key. A misspelt `marker` used to serve
+  every folder under `under`.
+- `pp help http` documents every `[http]` key with its default.
+
 ## v0.1.1
 
 Fixes. A few command lines and config values that did harm are refused.
