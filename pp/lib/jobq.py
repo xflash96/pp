@@ -1447,7 +1447,7 @@ class Worker:
         if self.stopping():
             return          # told to stop while the readings were taken
         taken: list = []        # (record, card, claim) for each job this pass admitted
-        blocked = None          # the first job that did not fit, and why
+        blocked: tuple = (None, "")     # the first job that did not fit, and why
         try:
             # one transaction for the whole pass: it reads the running jobs it admits against once, and reads
             # each job it is about to start again in that same scope, since another queue's worker may be
@@ -1460,7 +1460,7 @@ class Worker:
                         continue        # held, dropped or started meanwhile
                     ok, why, card = res.admit(cur, running)
                     if not ok:
-                        if blocked is None:
+                        if blocked[0] is None:
                             blocked = (cur, why)
                         if self.backfill:
                             continue
@@ -1483,10 +1483,7 @@ class Worker:
             # whose run is over. Releasing twice is not an error.
             for _cur, _card, claim in taken:
                 claim.release()
-        if blocked is None:
-            self._note(None)
-        else:
-            self._note(*blocked)
+        self._note(*blocked)
 
     @staticmethod
     def _claim(s: Txn, j: dict, gpu: int | None):
