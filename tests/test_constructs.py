@@ -302,9 +302,9 @@ _SIGNALS_THE_WORKER = ("cmd_worker", "work")
 
 
 # the Worker's own way into a job's signal and its reap: the tick that runs a pass, the pass itself, the step
-# it takes per job, the signal it sends, and the two that ask for one. `tick` is among them: one call to it
-# signals this queue's jobs, escalates, reaps them and records how each ended, so `work` is its one home.
-_WORKER_OWN = ("tick", "carry_out", "_step", "_send", "_signal_group", "_sweep_group")
+# it takes per job, the stop that asks for a signal, and the signal itself. `tick` is among them: one call to
+# it signals this queue's jobs, escalates, reaps them and records how each ended, so `work` is its one home.
+_WORKER_OWN = ("tick", "carry_out", "_step", "_send", "_signal_group")
 
 
 def _signals_a_job(name: str) -> bool:
@@ -998,7 +998,6 @@ class TestConstructs(unittest.TestCase):
                     "w._step(j, facts)",
                     "w._send(j, a)",
                     "w._signal_group(j, 15)",
-                    "w._sweep_group(j)",
                     "w.tick()",                             # one tick does the whole of the reserved work
                     "jobq.Worker(q).tick()",
                     "getattr(w, 'tick')()")

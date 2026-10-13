@@ -1292,7 +1292,9 @@ class Worker:
                 return Action(NOTHING)      # nothing else records a running job: there is nothing to record
             a = decide(cur, facts)
             if a.sweep:
-                self._sweep_group(cur)      # its leader is gone; anything left in its group goes too
+                # the leader of this job's group is gone and its run is over, so anything left in that group
+                # goes too: a command that held the signal back does not outlive the job
+                self._signal_group(cur, signal.SIGKILL)
             if a.do == TIME_UP:
                 cur["stop"] = {"by": "timeout", "timeout": True, "t": a.t, "grace": a.grace}
                 s.save(cur)
@@ -1411,11 +1413,6 @@ class Worker:
         waits for the record."""
         if h is not None:
             proc.signal_pid(h, WAKE)
-
-    def _sweep_group(self, job: dict):
-        """The leader of a stopped job's group is gone; anything left in that group goes too, so a command that
-        held the signal back does not outlive the job."""
-        self._signal_group(job, signal.SIGKILL)
 
     def _signal_group(self, job: dict, sig: int) -> str | None:
         """Signal the job's process group, and say how that went (proc.signal_group's outcomes), or None while
