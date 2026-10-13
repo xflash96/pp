@@ -538,6 +538,32 @@ class TestStore(QueueCase):
         self.assertEqual(jobstore.find(2)["cmd"], ["echo", "two words"])
         self.assertEqual([j["id"] for j in jobq._resolve(["batch"])], [1, 2])
 
+    def test_an_interrupted_batch_names_every_job_it_stored(self):
+        """A batch lands in one transaction, and that transaction holds the signals back for its whole length.
+        A Ctrl-C in it is raised once it ends, and the ids are on stdout by then: one line per record the store
+        holds, so a script reads the id of every job it queued and can name and wait on each one.
+
+        journey.interruptible is what makes the raised SIGINT arrive."""
+        f = self.sb.path("cmds.txt")
+        with open(f, "w") as fh:
+            fh.write("".join(f"echo {n}\n" for n in range(5)))
+        real = jobstore.Txn.add
+
+        def add_then_ctrl_c(s, job, state):
+            out = real(s, job, state)
+            if out["id"] == 2:
+                proc.raise_to_self(signal.SIGINT)   # what a terminal sends pp while the batch is landing
+            return out
+
+        out, err = io.StringIO(), io.StringIO()
+        with journey.interruptible(), redirect_stdout(out), redirect_stderr(err), \
+                mock.patch.object(jobstore.Txn, "add", add_then_ctrl_c):
+            with self.assertRaises(KeyboardInterrupt):       # which pp exits 130 on (pp/cli.py)
+                jobq.run_cli(["add", "--hold", "--cwd", self.work, "--from", f], "queue", "default", "doc")
+        stored = sorted(j["id"] for j in jobstore.jobs("held"))
+        self.assertEqual(stored, [1, 2, 3, 4, 5])
+        self.assertEqual(sorted(int(line) for line in out.getvalue().split()), stored)
+
     def test_durations(self):
         self.assertEqual(jobq.parse_duration("90"), 90)
         self.assertEqual(jobq.parse_duration("30m"), 1800)

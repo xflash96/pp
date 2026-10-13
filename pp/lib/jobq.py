@@ -815,16 +815,21 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
         if prepare_job:
             prepare_job(job, a)
         records.append(job)
-    ids = jobcore.add_jobs(records, state)      # n records, n ids, one scope
-    for jid, job in zip(ids, records):
-        c = job["cmd"]
-        print(jid)
-        extra = " ".join(x for x in (f"timeout {ui.human_duration(timeout)}" if timeout else "",
-                                      f"retries {retries}" if retries else "",
-                                      f"on-fail {on_fail}" if on_fail else "") if x)
-        via = f"  (via {_text(os.path.basename(job['runner'][0]))})" if job["runner"] else ""
-        print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(project)}] p{a.prio} {_needs_str(needs)} {extra}  "
-              f"{_text(shlex.join(c), 100)}{via}", file=sys.stderr)
+    # The records and the ids they were given, whole: a batch lands in one transaction of the store, and the
+    # signals that transaction holds back are delivered the moment it ends. They wait for these lines too, so
+    # every job pp stored has its id on stdout and a Ctrl-C on a long `--from` file leaves a script the id of
+    # everything it queued.
+    with lock.deferring():
+        ids = jobcore.add_jobs(records, state)      # n records, n ids, one scope
+        for jid, job in zip(ids, records):
+            c = job["cmd"]
+            print(jid)
+            extra = " ".join(x for x in (f"timeout {ui.human_duration(timeout)}" if timeout else "",
+                                          f"retries {retries}" if retries else "",
+                                          f"on-fail {on_fail}" if on_fail else "") if x)
+            via = f"  (via {_text(os.path.basename(job['runner'][0]))})" if job["runner"] else ""
+            print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(project)}] p{a.prio} {_needs_str(needs)} {extra}  "
+                  f"{_text(shlex.join(c), 100)}{via}", file=sys.stderr)
     if not a.hold and not a.no_start:
         _worker_up(q, wake=True)
     if owner:     # the pull side: an agent hears the outcome by waiting on it in the background
