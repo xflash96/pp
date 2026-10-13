@@ -254,6 +254,9 @@ SETTINGS = (
     _S("env", "job", "strings", default={}, merge=True, repeat=True, metavar="K=V",
        says="set in the job's environment; wins over the project's [queue] env",
        refuses="a name holding = or NUL; a value holding a newline"),
+    _S("log", "job", "path", field="log_pattern", metavar="PATH",
+       says="where this job's output goes: {tag} and {id} are filled in, under the project root",
+       refuses="another placeholder; '..'; a relative path that leaves the project root"),
     _S("timeout", "job", "duration", none_ok=True, metavar="DUR",
        says="stop it after DUR (90s, 30m, 2h, 1d); none: no timeout",
        refuses='""; a non-finite value; over 1e9 seconds'),
@@ -603,23 +606,26 @@ class Resources:
 
 # ---- worker ---------------------------------------------------------------------------------------
 
-def _tail_start(f, n: int) -> int:
-    """Where the last n lines of open binary file f begin (its end when n is 0), without reading all of it."""
+def _tail_start(f, n: int, floor: int = 0) -> int:
+    """Where the last n lines of open binary file f begin (its end when n is 0), without reading all of it,
+    and never before `floor`, which is where this attempt's own output begins (`log_at`)."""
     end = pos = f.seek(0, 2)
     buf = b""
     while n > 0 and pos > 0 and buf.count(b"\n") <= n:
         pos = max(0, pos - 65536)
         f.seek(pos)
         buf = f.read(end - pos)
-    return end - sum(len(line) for line in buf.splitlines(keepends=True)[-n:]) if n > 0 else end
+    start = end - sum(len(line) for line in buf.splitlines(keepends=True)[-n:]) if n > 0 else end
+    return max(start, min(floor, end))
 
 
-def _tail(src, n: int) -> list[str]:
-    """Last n lines of a file (a path, or a file open for binary reading) without reading all of it."""
+def _tail(src, n: int, floor: int = 0) -> list[str]:
+    """Last n lines of a file (a path, or a file open for binary reading) without reading all of it, and none
+    from before `floor`."""
     if isinstance(src, str):
         with open(src, "rb") as f:
-            return _tail(f, n)
-    src.seek(_tail_start(src, n))
+            return _tail(f, n, floor)
+    src.seek(_tail_start(src, n, floor))
     return src.read().decode(errors="replace").splitlines()[-n:] if n > 0 else []
 
 
@@ -652,8 +658,14 @@ def failure_tail(job: dict, n: int) -> list[str]:
 
 
 def log_tail(job: dict, n: int = 40) -> list[str]:
+    """The last n lines of this attempt's own output, from the offset the launch recorded (`log_at`): so a
+    --retry-if pattern never matches an earlier attempt of the same job and never matches pp's own line.
+
+    What the offset does not give is a job's own lines out of a file several jobs share: lines another job
+    wrote since this attempt began are inside the region, because an offset bounds a start and not an author.
+    That is the reason to give a retrying job a file of its own with {tag} or {id}."""
     try:
-        return _tail(job["log"], n) if job.get("log") else []
+        return _tail(job["log"], n, job.get("log_at") or 0) if job.get("log") else []
     except OSError:
         return []
 
@@ -809,6 +821,16 @@ def project_name(cwd: str) -> str:
         return named.get("name") or os.path.basename(os.path.normpath(root))
     g = config.git_root(cwd)
     return os.path.basename(os.path.normpath(g or cwd))
+
+
+def _under(spec: str, root: str) -> str:
+    """Where a `log` pattern's file goes: an absolute path as it is, and a relative one under `root`, which is
+    the project root (the directory holding the .pp.toml found from the job's directory) or the job's own
+    directory where it is in no project. The same rule for the key and for the flag, so one path written one
+    way means one thing. A pattern holding '..' is refused where it is read (`jobpolicy.pattern`), which is
+    what keeps a relative one from leaving that root."""
+    spec = os.path.expanduser(spec)
+    return spec if os.path.isabs(spec) else os.path.join(root, spec)
 
 
 def _from_lines(src: str) -> list[list[str]]:
@@ -969,6 +991,8 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     project, qc = _pcfg(cwd), _qcfg(q)
     gave = {r.name: policy.resolve(r, _given(a, r), project.gives.get(r.name, policy.NOTSET),
                                    qc.get(r.name, policy.NOTSET)) for r in JOB_ROWS}
+    if gave["log"]:
+        gave["log"] = _under(gave["log"], project.root or cwd)   # the store fills in its {tag} and its {id}
     needs = {"slots": 1, **{k: gave[k] for k in ("gpu_gb", "cpu", "mem_gb") if gave[k] is not None},
              **gave["need"]}
     why = Resources(q, needs, live=False).check(needs)
@@ -1288,7 +1312,7 @@ def cmd_log(a) -> int:
                 print(line)
         return 0
     with f:     # the tail, then what follows it, from one open file: no line falls between
-        f.seek(_tail_start(f, a.lines))
+        f.seek(_tail_start(f, a.lines, j.get("log_at") or 0))
         while True:
             chunk = f.read()
             if chunk:

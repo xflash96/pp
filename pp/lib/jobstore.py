@@ -268,7 +268,9 @@ class Txn:
                 n += 1
                 if any(os.path.exists(_jpath(x, n)) for x in others):
                     continue
-                job.update(id=n, state=state, log=os.path.join(qroot(q, "logs"), f"{n}.log"), added=time.time())
+                job.update(id=n, state=state, added=time.time(),
+                           log=policy.log_path(job.get("log_pattern"), n, job.get("tag"),
+                                               os.path.join(qroot(q, "logs"), f"{n}.log")))
                 _stage_job(job, tmp)
                 try:
                     os.link(tmp, _jpath(q, n))

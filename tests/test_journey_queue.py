@@ -531,7 +531,8 @@ class TestReadme(QueueJourney):
         self.assertEqual(outs[2].returncode, 0)
         self.assertIn("hello", outs[3].stdout)
         self.assertIn("FAILED 2 rc=3", outs[5].stdout)
-        self.assertEqual(outs[5].stdout.count("| trying"), 2, outs[5].stdout)
+        # the tail of a failure is the failed attempt's own output, from where that attempt began
+        self.assertEqual(outs[5].stdout.count("| trying"), 1, outs[5].stdout)
         self.assertEqual(outs[5].returncode, 1)
 
 # a project's runner, as a container wrapper would be: it reports what it was given, then runs the command
@@ -700,6 +701,7 @@ mv "$CELLS/$NAME.run.part" "$CELLS/$NAME.run"
 if [ -n "${PP_QUEUE_ENVFILE:-}" ]; then
   cp "$PP_QUEUE_ENVFILE" "$CELLS/$NAME.env.part" && mv "$CELLS/$NAME.env.part" "$CELLS/$NAME.env"
 fi
+cd "$ROOT"      # the work runs at the project root, as -v "$ROOT:/work" -w /work makes it in a container
 setsid "$ROOT/docker/cell.sh" "$CELLS/$NAME.pid" "$@" &
 wait $!
 """
@@ -936,7 +938,6 @@ class TestTheProject(Lab):
     """Steps 3 to 6: a project declares how its work is launched and stopped, its runner keeps working for its
     other callers, a kill and a timeout both end what the runner started, and one job by hand prints its id."""
 
-    @unittest.expectedFailure
     def test_a_project_declares_its_runner_stop_log_and_env_once(self):
         """A job added from the project carries its runner, its stop command, its log path and its environment
         on the record. A project with a runner and no stop refuses the add. A job with no tag is queued under a
@@ -954,7 +955,6 @@ class TestTheProject(Lab):
         p = self.show(plain)
         self.assertEqual((p["state"], self.field(p, "log")), ("queued", f"{root}/logs/{plain}.log"))
 
-    @unittest.expectedFailure
     def test_the_runner_runs_the_same_for_a_caller_that_is_not_pp(self):
         """The runner's other callers set no PP_QUEUE variable, and the script runs for them under `set -u`.
         Under pp the environment file the runner is handed holds the project's env, the job's own env and the
@@ -986,7 +986,6 @@ class TestTheProject(Lab):
         self.write("work/go", "")
         self.wait(jid)
 
-    @unittest.expectedFailure
     def test_a_kill_and_a_timeout_both_end_what_the_runner_started(self):
         """A kill runs the project's stop command once, with this attempt's container name in its environment,
         and what the runner started is gone. A timeout does the same. The stop command's exit code is on the
@@ -1029,16 +1028,18 @@ class TestTheProject(Lab):
         group = self.add("-q", "lab", "--no-runner", "--tag", "stop_probe", "--",
                          "sh", "-c", 'trap "" TERM; while :; do sleep 0.2; done', cwd=root)
         self.until(lambda: self.state(group) == "running", what=f"job {group} running")
+        held = self.show(group)["pgid"]                             # what the job's own group holds
         asks = len(self.asked_to_stop(root))
         self.pp("queue", "kill", group, "--grace", "1")
         self.until(lambda: self.ended(group), timeout=25, what=f"job {group} ended")
         g = self.show(group)
         self.assertEqual(self.stop_of(g), "group")
-        self.assertIsNotNone(self.field(g, "stop").get("sent"))
-        self.assertIsNotNone(self.field(g, "stop").get("kill9"))
-        self.assertEqual(len(self.asked_to_stop(root)), asks)       # no command ran for a job of the group
+        self.assertIsNotNone(self.field(g, "stop").get("sent"))     # the SIGTERM went to that group
+        self.assertEqual(g["reason"], "killed")
+        self.assertEqual(len(self.asked_to_stop(root)), asks)       # and no command ran for a job of the group
+        # the command held the signal back, so what took it was the SIGKILL of its group once its run was over
+        self.until(lambda: not proc.alive(held), what="the group of a command that ignored the SIGTERM")
 
-    @unittest.expectedFailure
     def test_one_job_by_hand_prints_its_id_on_stdout(self):
         """`add` prints one id on stdout and nothing else there, so a driver reads the id from it. The job's
         whole output goes to the path the project's pattern names, and the record names that path."""
@@ -1238,7 +1239,6 @@ class TestTheRetriesAndTheRecovery(Lab):
         self.wait(held, code=1)
         self.assertEqual(self.field(self.show(held), "container"), second)
 
-    @unittest.expectedFailure
     def test_the_next_worker_adopts_a_running_job(self):
         """A job keeps running when its worker stops, and nothing records how it ends until a worker is back.
         The next worker adopts it under the pid the job's claim names. The exit code the job wrote is its own,
@@ -1310,7 +1310,6 @@ class TestTheRetriesAndTheRecovery(Lab):
 class TestTheSecondProjectAndTheSession(Lab):
     """Steps 14 and 15: a second project joins the queue, and an agent session hears how its own jobs ended."""
 
-    @unittest.expectedFailure
     def test_two_projects_share_one_queue(self):
         """One queue holds jobs of both projects, and each job carries its own project's name. A job added with
         --cwd into the second project takes that project's runner, stop, log and env, not the first project's.

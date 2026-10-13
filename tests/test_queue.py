@@ -491,8 +491,8 @@ class TestStore(QueueCase):
             s.save(cur)
         start = jobq._tail_start
 
-        def late(f, n):
-            pos = start(f, n)
+        def late(f, n, floor=0):
+            pos = start(f, n, floor)
             with open(j["log"], "a") as g:
                 g.write("late\n")
             return pos
@@ -3642,6 +3642,29 @@ class TestThePolicyTables(unittest.TestCase):
                 else:
                     self.assertRaises(ValueError, jobpolicy.tag, value)
 
+    # -- log: where a job's output goes ----------------------------------------------------------------------
+    def test_where_a_jobs_output_goes(self):
+        """A closed set of two placeholders, `{tag}` and `{id}`, filled in when the job takes its id. `{tag}`
+        is the job's name or its id where it has none, so nothing is refused for a missing name. Another
+        placeholder and a path holding '..' are refused where the pattern is read, and a job with no pattern
+        takes the queue's own path."""
+        default = "/state/queue/lab/logs/12.log"
+        rows = [("no pattern at all", None, "named", default),
+                ("one job's own path", "/data/one.log", "named", "/data/one.log"),
+                ("{tag}", "/p/logs/{tag}.log", "c3_recall.s0", "/p/logs/c3_recall.s0.log"),
+                ("{tag} of a job with no name", "/p/logs/{tag}.log", None, "/p/logs/12.log"),
+                ("{id}", "/p/logs/{id}.log", "c3_recall.s0", "/p/logs/12.log"),
+                ("both, and each once", "/p/{tag}/{id}.log", "c3", "/p/c3/12.log"),
+                ("{id} twice", "/p/{id}/{id}.log", None, "/p/12/12.log")]
+        for what, spec, tag, want in rows:
+            with self.subTest(what):
+                self.assertEqual(jobpolicy.log_path(spec, 12, tag, default), want)
+        for ok in ("logs/{tag}.log", "{id}.log", "/data/runs/{tag}/out.log", "plain.log", "~/logs/{id}.log"):
+            self.assertEqual(jobpolicy.pattern(ok), ok)
+        for bad in ("logs/{queue}.log", "logs/{tag:%Y}.log", "logs/{}.log", "../logs/{id}.log",
+                    "logs/../{id}.log", "", "  ", None, 7, ["logs"]):
+            self.assertRaises(ValueError, jobpolicy.pattern, bad)
+
     # -- select: the forms a selection takes -----------------------------------------------------------------
     # Records of two queues, of all five states, one of them with no name of its own: what every form of the
     # grammar is read against below.
@@ -3904,6 +3927,8 @@ class TestTheSettingsTable(unittest.TestCase):
         ("mem_gb", "job", "--mem-gb", "[queue] mem_gb, [queue.NAME] mem_gb", None, False),
         ("need", "job", "--need", "[queue] need, [queue.NAME] need", {}, False),
         ("env", "job", "--env", "[queue] env, [queue.NAME] env", {}, False),
+        # the store names the file where no pattern does: <state>/queue/<name>/logs/<id>.log
+        ("log", "job", "--log", "[queue] log, [queue.NAME] log", None, False),
         ("timeout", "job", "--timeout", "[queue] timeout, [queue.NAME] timeout", None, False),
         ("retries", "job", "--retries", "[queue] retries, [queue.NAME] retries", 0, True),
         ("retry_delay", "job", "--retry-delay", "[queue] retry_delay, [queue.NAME] retry_delay", 30.0, True),
@@ -3924,7 +3949,7 @@ class TestTheSettingsTable(unittest.TestCase):
     )
 
     # the rows of the same table whose flag and behaviour a later stage brings: (setting, scope, stage)
-    LATER = (("log", "job", 4),)
+    LATER = ()
 
     @staticmethod
     def keys_of(row) -> str:
@@ -3962,8 +3987,8 @@ class TestTheSettingsTable(unittest.TestCase):
         for name, scope, stage in self.LATER:
             with self.subTest(setting=name, stage=stage):
                 self.assertNotIn((name, scope), declared)
-                self.assertEqual(stage, 4)
-        self.assertEqual([r for r in self.LATER if r[2] == 5], [], "no row of the table waits for stage 5")
+                self.assertGreater(stage, 4)
+        self.assertEqual(self.LATER, (), "every row of the table is declared and carried out")
 
     def test_a_rows_sources_follow_from_its_scope(self):
         """Which sources a row has follows from what the setting belongs to, and nothing else decides it: a
@@ -3988,7 +4013,7 @@ class TestTheSettingsTable(unittest.TestCase):
         """A row arrives with its type and its refusals written down, so a setting cannot be added without
         saying what a user may write and what is refused."""
         kinds = {"text", "whole", "amount", "counts", "strings", "duration", "period", "regex", "command",
-                 "shell", "argv", "number", "boolean", "pools"}
+                 "shell", "argv", "path", "number", "boolean", "pools"}
         for r in jobq.SETTINGS:
             with self.subTest(setting=r.name, scope=r.scope):
                 self.assertIn(r.kind, kinds)

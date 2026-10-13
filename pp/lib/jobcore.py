@@ -264,7 +264,7 @@ class Worker:
                 jobstore._requeue(s, cur, a)
             elif a.do == policy.ENDED_AS:
                 jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
-        if a.sweep and (cmd := policy.stop_command(cur)):
+        if cmd := policy.swept_stop(cur, a):
             # after the scope, since starting a process in one would make every reader of the store wait for
             # it: nobody asked for this stop, so nothing is recorded for it and no outcome rests on it
             self.hooks += [h for h in [self._stop(cur, cmd)] if h is not None]

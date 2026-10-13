@@ -115,6 +115,7 @@ Per project, from the nearest .pp.toml up from the job's directory:
                                      # project root); --no-runner skips it for one job
     stop = "group"                   # how a stop reaches the work the runner started: "group" where that
                                      # work stays in the job's own process group, else a shell command
+    log = "logs/{tag}.log"           # where each job's output goes, under the project root
     env = { HF_HUB_OFFLINE = "1" }   # added to each job's environment; add's --env wins
     timeout = "6h"                   # and any other per-job key, as this project's default
 
@@ -237,9 +238,22 @@ that command end rather than that it worked. Anything left in the job's process 
 goes with it, and a run that ended with no exit code of its own runs that stop command once more, so nothing
 the runner started outlives the attempt that started it.
 
-A job's record names the files that are its own: its log, the exit code each attempt wrote, and the log of
-each hook that ran for it. `drop` and `clean` take those with the record, so neither leaves a file behind that
-nothing names. State: ~/.local/state/pp/queue/<name>/.
+Where a job's output goes: `log` in a project's [queue], or --log PATH on one job, is a path in which {tag}
+and {id} are filled in, those two and no others. {tag} is the job's tag, or its id where the job has none, so
+nothing is refused for a missing tag. A path holding `..` is refused; otherwise a relative path is under the
+project root and an absolute one is taken as it is. Every attempt appends to that one file, with a
+`[pp queue]` line before each naming the job and the attempt, and several jobs may share a file. Without
+either the file is <state>/queue/<name>/logs/<id>.log. Either way the record names it, and `log`, `show`, a
+failure's tail and PP_QUEUE_LOG all follow the record. --retry-if, a failure's tail and `log -f` read from
+where this attempt's own output begins, so a pattern never matches an earlier attempt of the same job and
+never matches pp's own line; an offset bounds a start and not an author, though, so lines another job wrote
+into a shared file in the same window are still in it, and a job that carries --retry-if wants a file of its
+own.
+
+A job's record names the files that are its own: its log, and the exit code and the environment file of each
+attempt, and the log of each hook that ran for it. `drop` and `clean` take with the record every file pp put
+in its own store, and never a log at a path your `log` or your --log named. State:
+~/.local/state/pp/queue/<name>/.
 """
 from __future__ import annotations
 

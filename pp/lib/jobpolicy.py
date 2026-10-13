@@ -830,6 +830,8 @@ def value(setting: Setting, raw):
         return shell(raw)
     if kind == "argv":
         return words(raw)
+    if kind == "path":
+        return pattern(raw)
     if kind == "text":
         return text(raw)
     if kind == "strings":
@@ -919,6 +921,38 @@ def shell(v) -> str:
     return v
 
 
+PLACES = re.compile(r"\{([^{}]*)\}")      # what reads as a placeholder in a path, so an unknown one is refused
+
+
+def pattern(v) -> str:
+    """A path a job's output goes to: `{tag}` and `{id}` are filled in, those two and no others, and it holds
+    no `..`.
+
+    A closed set of two placeholders, with no formats and no filters: a pattern language is bounded at birth,
+    and a third placeholder would be a release of pp's and not a dialect. `..` is refused outright, which is
+    also what keeps a relative path from leaving the project root it is resolved against."""
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"{v!r}: a path, with {{tag}} or {{id}} in it where several jobs share it")
+    unknown = [m for m in PLACES.findall(v) if m not in ("tag", "id")]
+    if unknown:
+        raise ValueError(f"'{v}': {{{unknown[0]}}} is no placeholder of a log path; {{tag}} and {{id}} are the two")
+    if ".." in v:
+        raise ValueError(f"'{v}': a log path holds no '..'")
+    return v
+
+
+def log_path(spec: str | None, jid: int, tag: str | None, default: str) -> str:
+    """Where this job's output goes: the pattern its project or its flag gave with `{tag}` and `{id}` filled
+    in, or the queue's own logs/<id>.log where neither gave one.
+
+    `{tag}` is the job's name, or its id where the job has none, so nothing is refused for a missing name and
+    `logs/{tag}.log` is a safe pattern for a project whose one-off jobs carry none. A name may never read as
+    an id (`tag`), so a filled-in `{tag}` and a filled-in `{id}` can never name one path from two jobs."""
+    if not spec:
+        return default
+    return spec.replace("{tag}", str(tag or jid)).replace("{id}", str(jid))
+
+
 def words(v):
     """A command line a setting carries: a string, which the reader that runs it splits the way a shell quotes
     words, or a list of strings already split. It comes back as it was given, since splitting is the job of
@@ -940,6 +974,18 @@ def stop_command(job: dict) -> str | None:
     its own group and a command naming a container nothing created would fail for a job pp stopped."""
     cmd = job.get("stop_cmd")
     return None if not cmd or cmd == GROUP else cmd
+
+
+def swept_stop(job: dict, action: Action) -> str | None:
+    """The project's stop command the sweep of an attempt whose run is over runs, or None where it runs none.
+
+    It runs where nothing of that attempt's stop ever went out: the attempt was lost, or died of a signal, or
+    a stop was asked of it that no worker carried out. Where the command has already gone out for that stop
+    it has done its work, and a second run would say one stop happened twice. Nobody asked for this one, so
+    its output goes to the job's log, nothing is recorded for it and no outcome rests on it (I25)."""
+    if not action.sweep or (job.get("stop") or {}).get("sent"):
+        return None
+    return stop_command(job)
 
 
 def regex(v) -> str | None:
