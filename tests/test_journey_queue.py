@@ -629,6 +629,32 @@ class TestProjectRunner(QueueJourney):
         j = self.pp("queue", "add", "--no-runner", "--", "echo", "anyway", cwd=missing).stdout.strip()
         self.wait(j)
 
+    def test_one_job_says_its_own_runner_stop_and_log(self):
+        """`--runner`, `--stop` and `--log` are the flags of three rows whose key is a project's own, so one
+        job of its own needs no .pp.toml: what each comes to is on the job's record. A flag wins over the
+        project's key for that one job, a job that skips the runner carries the group whatever the project
+        says, and a log path with another placeholder in it, or with `..`, is refused."""
+        plain = os.path.join(self.work, "scratch")
+        self.write("work/scratch/run.sh", RUNNER, 0o755)
+        jid = self.add("-q", "exp", "--no-start", "--tag", "solo", "--runner", "./run.sh",
+                       "--stop", "echo stopped", "--log", "logs/{tag}.log", "--", "true", cwd=plain)
+        j = self.show(jid)
+        self.assertEqual(j["runner"], [os.path.join(plain, "run.sh")])
+        self.assertEqual(j["stop_cmd"], "echo stopped")
+        self.assertEqual(j["log"], os.path.join(plain, "logs/solo.log"))
+        cont = self.project("container",
+                            '[queue]\nrunner = "./run.sh"\nstop = "echo project"\nlog = "{id}.log"\n',
+                            {"run.sh": (RUNNER, 0o755)})
+        kept = self.show(self.add("-q", "exp", "--no-start", "--", "true", cwd=cont))
+        self.assertEqual((kept["stop_cmd"], kept["log"]), ("echo project", f"{cont}/{kept['id']}.log"))
+        mine = self.add("-q", "exp", "--no-start", "--stop", "echo mine", "--", "true", cwd=cont)
+        self.assertEqual(self.show(mine)["stop_cmd"], "echo mine")       # the flag, over the project's key
+        skipped = self.show(self.add("-q", "exp", "--no-start", "--no-runner", "--", "true", cwd=cont))
+        self.assertEqual((skipped["runner"], skipped["stop_cmd"]), ([], "group"))
+        for bad in ("logs/{queue}.log", "../out.log"):
+            r = self.pp("queue", "add", "-q", "exp", "--no-start", "--log", bad, "--", "true", code=2)
+            self.assertIn("--log", r.stderr)
+
     def test_a_runner_list_and_a_runner_on_path_work(self):
         root = self.project("listy", '[queue]\nrunner = ["env", "LISTY=1"]\nstop = "group"\n')
         j = self.add("--", "sh", "-c", "echo listy=$LISTY", cwd=root)

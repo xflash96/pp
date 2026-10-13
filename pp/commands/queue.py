@@ -275,7 +275,7 @@ def _runner(spec, root: str, where: str, path: str | None) -> list[str]:
         return []
     exe = os.path.expanduser(argv[0])
     if not os.path.isabs(exe) and os.sep in exe:
-        exe = os.path.join(root, exe)
+        exe = os.path.normpath(os.path.join(root, exe))     # one path, however the project wrote it
     if os.sep not in exe:
         if not shutil.which(exe, path=path):
             ui.die(f"queue: runner {exe} (from {where}) is not on PATH; or pass --no-runner", 2)
