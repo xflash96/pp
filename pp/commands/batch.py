@@ -47,7 +47,10 @@ PATHS are files, folders, or quoted globs. A folder is an item itself; -r means 
 Rename refuses when two items would get the same name or a new name is already taken, and lists every problem
 at once. Run refuses the same way when two items would write the same {out}, since the one that finishes last
 would win. Swaps (a<->b) and renaming a folder together with what is inside it are handled. Every applied
-rename is journaled under ~/.local/state/pp/batch/journal; that journal is what `undo` reverses.
+rename is journaled under ~/.local/state/pp/batch/journal; that journal is what `undo` reverses. A rename a
+Ctrl-C ends journals the renames that landed, so `undo` puts those back and asks about nothing else. A rename
+killed outright, or ended by a reboot, says nothing about what landed: `undo` takes that journal all the same,
+names every item it cannot put back, and `--partial` restores the rest.
 """
 from __future__ import annotations
 
@@ -509,8 +512,9 @@ def cmd_rename(a) -> int:
     entries = [{k: c[k] for k in ("parent", "old", "new", "depth")} for c in changes]
     journal = {"created": time.time(), "cwd": os.getcwd(), "argv": a.argv, "status": "pending", "entries": entries}
     _write_journal(jpath, journal)     # before touching anything: a crash mid-way still leaves a record
+    done: list = []
     try:
-        apply_groups(entries, "old", "new", deepest_first=True)
+        apply_groups(entries, "old", "new", deepest_first=True, done=done)
     except OSError as e:
         bad = getattr(e, "rollback_failed", [])
         journal["status"] = "failed" if bad else "rolled-back"
@@ -524,6 +528,17 @@ def cmd_rename(a) -> int:
         else:
             print("rolled back: nothing changed", file=sys.stderr)
         return 1
+    except BaseException:
+        # a Ctrl-C ends the renames between groups (_rename_group holds it back inside one). The journal keeps
+        # the ones that landed and nothing else, so `pp batch undo` puts back exactly what is on disk and asks
+        # about nothing else; a journal with nothing on it never was applied.
+        landed = {d for _, d in done}
+        with _closing(jpath) as j:
+            j["entries"] = [e for e in entries if os.path.join(e["parent"], e["new"]) in landed]
+            j["status"] = "applied" if j["entries"] else "rolled-back"
+            print(f"stopped with {len(j['entries'])} of {len(entries)} item(s) renamed"
+                  + ("; undo with: pp batch undo" if j["entries"] else ""), file=sys.stderr)
+        raise
     journal["status"] = "applied"
     _write_journal(jpath, journal)
     print(f"renamed {len(changes)} item(s); undo with: pp batch undo")
@@ -561,10 +576,26 @@ def cmd_undo(a) -> int:
         else:
             print("no rename journals yet")
         return 0
-    target = next(((p, j) for p, j in js if j.get("status") == "applied"), None)
+    target = None
+    for p, j in js:
+        if j.get("status") in ("applied", "pending", "failed"):
+            target = (p, j)
+            if j["status"] != "applied":
+                # a journal that does not say which of its items landed: a rename ended by a kill, a closed
+                # session or a reboot, or one whose own rollback stopped part way. It is the rename the
+                # directory is half way through, so it is the one undo takes: every item is tested on disk,
+                # the ones it cannot put back are listed, and --partial restores the rest. Reversing the
+                # rename before it would mix a third generation of names into the directory instead. A
+                # rolled-back journal is silent: nothing of it is on disk.
+                why = ("ended before it said what it renamed" if j["status"] == "pending" else
+                       "stopped part way through its own rollback")
+                ui.warn(f"{os.path.basename(p)[:-5]} {why}, so undo takes it and tests each item on disk. "
+                        f"The journal is {p}")
+            break
     if not target:
-        ui.die("nothing to undo (no applied rename journal)", 1)
+        ui.die("nothing to undo (no rename journal to reverse)", 1)
     jpath, journal = target
+    status = journal.get("status")       # what undo took the journal as; another undo of it writes "undone"
     entries = journal["entries"]
     ren = {os.path.join(e["parent"], e["old"]): os.path.join(e["parent"], e["new"]) for e in entries}
     ren_names = {k: os.path.basename(v) for k, v in ren.items()}
@@ -575,9 +606,17 @@ def cmd_undo(a) -> int:
     for e in entries:
         here = os.path.join(_now(e["parent"], ren_names), e["new"])
         back = os.path.join(_now(e["parent"], ren_names), e["old"])
+        # whether the old name is on disk holding something no entry of this journal was renamed to
+        old_there = os.path.lexists(back) and e["old"] not in news_by_parent[e["parent"]]
         if not os.path.lexists(here):
-            problems.append(f"{_rel(here)} is gone (moved or deleted since the rename)")
-        elif os.path.lexists(back) and e["old"] not in news_by_parent[e["parent"]]:
+            # where an item is comes from disk, not from what the journal's status would suggest: a rename
+            # that ended before it said what it renamed, and one whose own rollback stopped part way, both
+            # leave some items back at their old name and some at neither name
+            problems.append(f"{_rel(back)} is at its old name already, so there is nothing to put back"
+                            if old_there else
+                            f"{_rel(here)} is gone: it was moved or deleted since, or a rename that stopped "
+                            "left it at a .staging-batch- name")
+        elif old_there:
             problems.append(f"{_rel(back)} exists now, so {_rel(here)} cannot go back")
         else:
             pairs.append((_rel(here), _rel(os.path.join(e["parent"], e["old"]))))
@@ -604,7 +643,7 @@ def cmd_undo(a) -> int:
     if rc is not None:
         return rc
     with _undoing():
-        if _journal(jpath).get("status") != "applied":
+        if _journal(jpath).get("status") != status:
             # another `pp batch undo` took this journal while this one was asking; it has had its renames
             ui.die(f"{os.path.basename(jpath)[:-5]} was undone while this asked; `pp batch undo` again", 1)
         done: list = []

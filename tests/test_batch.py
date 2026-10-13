@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import sys
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -276,6 +277,79 @@ class TestRename(BatchCase):
         self.run_pp("undo", "-y")
         self.assertEqual(self.tree(), ["a.txt"])
 
+    def half_renamed(self, status: str):
+        """A rename of b0..b9 to c0..c9 that ended after five of them, as a kill or a reboot leaves it: the
+        journal says `status` and says nothing about which items landed. -> its path.
+
+        A SIGKILL cannot be held back, so no journal repair runs and the directory is left half renamed.
+        Written out here rather than killed, so the half is the same half on every machine."""
+        jpath = os.path.join(batch._journal_dir(), "29991231-235959-000000.json")
+        entries = [{"parent": os.getcwd(), "old": f"b{i}.txt", "new": f"c{i}.txt",
+                    "depth": os.getcwd().count(os.sep)} for i in range(10)]
+        for i in range(5):
+            os.rename(f"b{i}.txt", f"c{i}.txt")
+        batch._write_journal(jpath, {"created": time.time(), "cwd": os.getcwd(), "argv": [],
+                                     "status": status, "entries": entries})
+        return jpath
+
+    def test_undo_takes_the_journal_of_the_rename_that_was_killed(self):
+        """A rename ended by a kill, a closed session or a reboot leaves its journal saying nothing about
+        which items landed, and the directory half renamed. That half-done rename is the one to reverse, so
+        undo takes its journal and tests every item on disk: the items that landed go back, and the ones the
+        rename never reached are named. Reversing the rename before it instead would put a third generation
+        of names into the directory, and the next step undo prints would be about that other rename."""
+        for i in range(10):
+            touch(f"a{i}.txt")
+        self.run_pp("rename", "^a", "b", "*.txt", "-y")                  # the rename before: applied
+        jpath = self.half_renamed("pending")
+        rc, out, err = self.run_pp("undo", "-n")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("29991231-235959-000000 ended before it said what it renamed", err)
+        self.assertIn(jpath, err)
+        self.assertIn("undo 29991231-235959-000000", out)                # the killed rename, not the one before
+        self.assertIn("b9.txt is at its old name already, so there is nothing to put back", err)
+        self.assertIn("pp batch undo --partial", err)
+        rc, out, err = self.run_pp("undo", "--partial", "-y")            # the step the refusal names
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("restored 5 item(s); 5 left as they are", out)
+        self.assertEqual(self.tree(), [f"b{i}.txt" for i in range(10)])  # one generation of names, not three
+        rc, out, err = self.run_pp("undo", "-y")                         # and the rename before is next
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.tree(), [f"a{i}.txt" for i in range(10)])
+
+    def test_undo_takes_a_journal_whose_rollback_stopped_part_way(self):
+        """A rename whose own rollback stopped part way leaves items at half-renamed names, and its journal
+        says "failed". Which of its items are on disk is as unknown as a killed rename's, so undo takes it
+        the same way.
+
+        What each item it cannot put back says comes from disk: an item the rollback did put back is at its
+        old name with nothing to do, and only one that is at neither name is one to go looking for."""
+        for i in range(10):
+            touch(f"b{i}.txt")
+        jpath = self.half_renamed("failed")
+        os.remove("c4.txt")                              # at neither name, as a killed swap leaves one
+        rc, out, err = self.run_pp("undo", "-n")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("b9.txt is at its old name already, so there is nothing to put back", err)
+        self.assertIn("c4.txt is gone", err)
+        self.assertIn(".staging-batch- name", err)       # where such an item is, if it is anywhere
+        self.assertNotIn("b9.txt is gone", err)
+        touch("c4.txt")                                  # found again, so the rest of the undo can go ahead
+        rc, out, err = self.run_pp("undo", "--partial", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("stopped part way through its own rollback", err)
+        self.assertIn(jpath, err)
+        self.assertEqual(self.tree(), [f"b{i}.txt" for i in range(10)])
+        self.assertEqual(batch._journal(jpath)["status"], "undone")
+        # a rolled-back rename put every item back itself, so there is nothing for undo to say about it
+        touch("a.txt")
+        self.run_pp("rename", "a", "b", "a.txt", "-y")
+        batch._write_journal(jpath, {"created": time.time(), "cwd": os.getcwd(), "argv": [],
+                                     "status": "rolled-back", "entries": []})
+        rc, out, err = self.run_pp("undo", "-y")
+        self.assertEqual((rc, err), (0, ""), out)
+        self.assertIn("a.txt", self.tree())
+
     def test_undo_refuses_when_state_changed(self):
         touch("one.txt")
         touch("two.txt")
@@ -287,6 +361,53 @@ class TestRename(BatchCase):
         self.assertIn("one.md is gone", err)
         self.assertIn("two.txt exists now", err)
         self.assertEqual(self.tree(), ["two.md", "two.txt"])
+
+    def test_a_ctrl_c_part_way_through_a_rename_leaves_what_landed_to_undo(self):
+        """The renames are what a person waits for, so a Ctrl-C ends them where it lands. The journal then
+        holds the renames that landed and nothing else, so `pp batch undo` is about what is on disk, and the
+        rename before this one is not what it offers."""
+        touch("prev.txt")
+        self.run_pp("rename", "prev", "PREV", "prev.txt", "-y")
+        for i in range(1, 5):
+            touch(f"a{i}.txt")
+        real, moved = batch._mv, []
+
+        def after_two(src, dst, done):
+            real(src, dst, done)
+            moved.append(dst)
+            if len(moved) == 2:
+                proc.raise_to_self(signal.SIGINT)       # what a terminal sends pp on Ctrl-C
+
+        with mock.patch.object(batch, "_mv", after_two):
+            _, err = self.interrupted("rename", "^a", "b", "a*.txt", "-y")
+        self.assertEqual(self.tree(), ["PREV.txt", "a3.txt", "a4.txt", "b1.txt", "b2.txt"])
+        self.assertIn("stopped with 2 of 4 item(s) renamed; undo with: pp batch undo", err)
+        j = self.journal()
+        self.assertEqual(j["status"], "applied")
+        self.assertEqual([e["new"] for e in j["entries"]], ["b1.txt", "b2.txt"])
+        rc, out, err = self.run_pp("undo", "-y")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("restored 2 item(s)", out)
+        self.assertEqual(self.tree(), ["PREV.txt", "a1.txt", "a2.txt", "a3.txt", "a4.txt"])
+
+    def test_a_rename_that_landed_nothing_is_not_an_undo_of_its_own(self):
+        """Nothing is renamed, so there is nothing to put back: the journal says so, and undo walks past it to
+        the rename before."""
+        touch("prev.txt")
+        self.run_pp("rename", "prev", "PREV", "prev.txt", "-y")
+        touch("a.txt")
+
+        def at_once(src, dst, done):
+            proc.raise_to_self(signal.SIGINT)
+
+        with mock.patch.object(batch, "_mv", at_once):
+            _, err = self.interrupted("rename", "a", "b", "a.txt", "-y")
+        self.assertIn("stopped with 0 of 1 item(s) renamed", err)
+        self.assertNotIn("undo with", err)
+        self.assertEqual(self.journal()["status"], "rolled-back")
+        rc, out, _ = self.run_pp("undo", "-y")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tree(), ["a.txt", "prev.txt"])
 
     def test_a_ctrl_c_part_way_through_an_undo_leaves_the_rest_to_undo(self):
         """The renames are what a person waits for, so a Ctrl-C ends them where it lands. The journal then
