@@ -292,7 +292,15 @@ def _excluded(rel: str, patterns: list[str]) -> bool:
         any(fnmatch.fnmatch(part, p) for part in rel.split(os.sep) for p in patterns)
 
 
+def _unreadable(e: OSError, src: str) -> str:
+    """What pp could not read in a tree project, said the one way: the hash raises an OSError, and each caller
+    adds what it means for what it was doing."""
+    return f"{e.filename or src}: {e.strerror}; pp cannot read it"
+
+
 def _tree_files(src: str, patterns: list[str]) -> list[str]:
+    """Every file a release of this tree holds: what `_copy` copies and no more, so a fifo or a socket is no
+    file of a release and opening one to hash it never returns."""
     out = []
     for dirpath, dirnames, filenames in os.walk(src):
         rel_dir = os.path.relpath(dirpath, src)
@@ -307,7 +315,10 @@ def _tree_files(src: str, patterns: list[str]) -> list[str]:
             else:
                 keep.append(d)
         dirnames[:] = keep
-        out += [r for r in (os.path.join(rel_dir, f) for f in filenames) if not _excluded(r, patterns)]
+        for f in filenames:
+            rel, p = os.path.join(rel_dir, f), os.path.join(dirpath, f)
+            if not _excluded(rel, patterns) and (os.path.islink(p) or os.path.isfile(p)):
+                out.append(rel)
     return sorted(out)
 
 
@@ -411,7 +422,13 @@ class Facts:
                     self.untracked = sorted(r for r in out if r)
         elif t.mode == "tree":
             self.rels = _tree_files(t.source, t.excludes())
-            self.rev = _tree_hash(t.source, self.rels)
+            try:
+                self.rev = _tree_hash(t.source, self.rels)
+            except OSError as e:
+                # a file pp may not read is a blocker, listed with the others, and no release is made from it
+                self.blockers.append(f"{_unreadable(e, t.source)}, so it cannot be in the release: add it to "
+                                     f"`exclude`. pp stopped at this file, so another one it cannot read is "
+                                     f"named by a later run")
         else:
             self.blockers.append(f'unknown source = "{t.mode}" (git or tree)')
 
@@ -787,9 +804,13 @@ def _status_row(name: str, src: str) -> dict:
             row["ahead"] = int(n.stdout) if n.returncode == 0 else None
         row["dirty"] = bool(_git(src, "status", "--porcelain", "--untracked-files=no", "--", ".").stdout.strip())
     elif t.mode == "tree" and os.path.isdir(src):
-        row["head"] = _tree_hash(src, _tree_files(src, t.excludes()))
-        row["ahead"] = 0 if row["head"] == info.get("rev") else None
-        row["dirty"] = row["head"] != info.get("rev")
+        try:
+            row["head"] = _tree_hash(src, _tree_files(src, t.excludes()))
+        except OSError as e:            # this target's drift is unknown; the other targets' rows still print
+            ui.warn(f"{name}: {_unreadable(e, src)}, so the source is not compared")
+        else:
+            row["ahead"] = 0 if row["head"] == info.get("rev") else None
+            row["dirty"] = row["head"] != info.get("rev")
     cur_dir = os.path.join(t.releases, "current")
     for kind, base in (("links", cur_dir), ("dev_links", src)):
         for path, rel in (t.cfg.get(kind) or {}).items():
@@ -835,7 +856,9 @@ def cmd_status(argv: list[str]) -> int:
     for r in rows:
         ahead = "-" if r["ahead"] is None else (f"+{r['ahead']}" if r["ahead"] else "0")
         if r["mode"] == "tree":
-            ahead = "same" if r["ahead"] == 0 else "differs"
+            # `head` is None in exactly the cases pp did not read the source, and `-` is what the git rows
+            # print for a drift that is not known
+            ahead = "-" if r["head"] is None else ("same" if r["ahead"] == 0 else "differs")
         table.append([r["name"], r["current"] or "(none)", (r["rev"] or "")[:10] + ("*" if r["release_dirty"] else ""),
                       ahead, "dirty" if r["dirty"] else "", "ok" if r["links_ok"] else " ".join(f"{x['problem']} {x['path']}" for x in r["link_problems"]),
                       r["source"] + ("" if os.path.isdir(r["source"]) else "  (gone)")])

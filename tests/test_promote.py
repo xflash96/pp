@@ -420,6 +420,58 @@ class TestPromote(Base):
 
 
 
+class TestATreeProjectPpCannotRead(Base):
+    """A tree project is what `source = "tree"` is written for, and a service project holds more than regular
+    files. The hash opened whatever the walk listed, with no bound and no handler."""
+
+    def tree(self) -> str:
+        src = os.path.join(self.tmp, "svc")
+        self.write(".pp.toml", 'name = "svc"\n[promote]\nsource = "tree"\n', root=src)
+        self.write("f.txt", "x", root=src)
+        return src
+
+    def test_a_fifo_is_no_part_of_a_release_and_does_not_hold_the_command(self):
+        """A dev server's fifo in the source blocked the open that hashes the tree, with no bound: promote, its
+        preflight and status never came back. `_copy` never copied one into a release either, so the hash and
+        the snapshot now agree on what a file is."""
+        src = self.tree()
+        os.mkfifo(os.path.join(src, "dev.sock"))
+        rc, out, err = self.pp(src, "-n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.pp(src)[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.sb.data, "releases", "svc", "current", "dev.sock")))
+        self.assertEqual(self.pp("status")[0], 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "root may read every file")
+    def test_an_unreadable_file_is_a_blocker_and_leaves_the_other_rows_standing(self):
+        """A file pp may not read raised a traceback out of the hash, in the preflight that promises every
+        blocker and in the status of every other target with it."""
+        src = self.tree()
+        self.write("secret.key", "s3cret", root=src)
+        self.assertEqual(self.pp(src)[0], 0)
+        os.chmod(os.path.join(src, "secret.key"), 0)
+        rc, out, err = self.pp(src, "-n")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("pp cannot read it", out)
+        self.assertIn("exclude", out)
+        self.assertEqual(self.pp(src)[0], 2)
+        rc, out, err = self.pp("status")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("svc", out)
+        self.assertIn("pp cannot read it", err)
+
+    def test_an_exclude_pattern_takes_the_file_pp_cannot_read(self):
+        """What the blocker offers works: the file named in `exclude` is no part of the release, and the
+        promotion goes through."""
+        src = self.tree()
+        os.mkfifo(os.path.join(src, "dev.sock"))
+        self.write(".pp.toml", 'name = "svc"\n[promote]\nsource = "tree"\nexclude = ["dev.sock"]\n', root=src)
+        rc, out, err = self.pp(src)
+        self.assertEqual(rc, 0, out + err)
+        rel = os.path.join(self.sb.data, "releases", "svc", "current")
+        self.assertEqual(sorted(os.listdir(rel)), [".pp-release.json", ".pp.toml", "f.txt"])
+
+
 class TestRollingBackAndForward(Base):
     """The journey the whole command exists for: release, find it bad, go back, fix forward. What the user is
     running is then not the newest release."""
