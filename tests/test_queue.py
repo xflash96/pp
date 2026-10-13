@@ -5190,6 +5190,62 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         jobq.worker_for("default").tick()
         self.assertEqual(os.listdir(d), [])
 
+    def the_run_ends_with_no_code(self, jid: int) -> None:
+        """End job jid's run the way a machine that went down does: its group is SIGKILLed, so its wrapper
+        writes no exit code and the claim its run held is free."""
+        h = jobcore._group_handle(jobstore.find(jid))
+        self.assertIsNotNone(h, f"job {jid}'s record names no group")
+        proc.signal_group(h, signal.SIGKILL)
+        self.the_run_is_over(jid)
+
+    def a_running_job_whose_stop_is_a_command(self, where: str, gate: str = "go") -> tuple:
+        """A running job of this test's whose project stops it with a command that appends a line to `where`.
+        -> the job's id and this test's worker."""
+        j = self.add(cmd=self.gated(gate))
+        w = jobq.worker_for("default")
+        w.tick()
+        self.the_run_is_live(j)
+        self.nothing_of_the_job_is_left(w, j)
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = f"echo x >> {where}"
+            s.save(cur)
+        return j, w
+
+    def test_a_sweep_runs_the_projects_stop_command_once_for_a_run_that_wrote_no_code(self):
+        """I25. A run that is over having written no exit code of its own was lost or died of a signal, so
+        whatever its runner started elsewhere is still out there: the sweep runs the project's stop command
+        once, started after the decision's scope. Nobody asked for that stop, so nothing is recorded for it
+        and the outcome is the one the attempt earned.
+
+        A stop whose command has already gone out is not run a second time: that command has done its work,
+        and a second run would say one stop happened twice."""
+        ran = self.sb.path("what-the-stop-command-did")
+        j, w = self.a_running_job_whose_stop_is_a_command(ran)
+        self.the_run_ends_with_no_code(j)
+        w.tick()
+        rec = jobstore.find(j)
+        # this worker started the attempt, so it holds the signal it died of; a worker that did not reads the
+        # same case as `lost`, and either way the attempt wrote no exit code of its own
+        self.assertEqual((rec["state"], rec["reason"], rec.get("rc")), ("failed", "signal 9", None))
+        self.assertIsNone(rec.get("stop"), "the sweep's stop was recorded as one somebody asked for")
+        journey.until(lambda: self.ran(ran) == 1, timeout=30, what="the stop command the sweep ran")
+        for _ in range(3):
+            w.tick()
+        self.assertEqual(self.ran(ran), 1)
+        # a kill whose stop command went out at the stop site: its code is recorded, and the sweep runs none
+        k, w2 = self.a_running_job_whose_stop_is_a_command(ran, gate="go2")
+        self.a_kill_asks(k, grace=30.0)
+        w2.tick()
+        journey.until(lambda: self.ran(ran) == 2, timeout=30, what="the stop command the kill ran")
+        journey.until(lambda: jobstore.find(k)["stop"].get("rc") == 0, timeout=30,
+                      what="the exit code that command had, on the stop it carried out")
+        self.the_run_ends_with_no_code(k)
+        for _ in range(3):
+            w2.tick()
+        self.assertEqual(jobstore.find(k)["reason"], "killed")
+        self.assertEqual(self.ran(ran), 2, "the sweep ran a stop command that had already gone out")
+
     def test_a_sweep_runs_once_per_attempt_whose_run_is_over(self):
         """The sweep of a stopped job's group runs where its run is over: the SIGKILL goes out inside the
         decision's scope, once for that attempt, so a process the job left behind does not outlive it. It
