@@ -157,6 +157,55 @@ class TestCli(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "config/commands/__pycache__")))
 
 
+class TestTheFloor(unittest.TestCase):
+    """The oldest Python pp supports. A wheel is py3-none-any and installs anywhere, so the floor is pp's to
+    state, and it is the floor of the one command that needs it, `pp promote`."""
+
+    def imported_as(self, pretending: str) -> subprocess.CompletedProcess:
+        """pp's entry point, imported on a Python that says it is another version."""
+        code = (f"import sys\n{pretending}\nsys.path.insert(0, {ROOT!r})\n"
+                "from pp.cli import main\nraise SystemExit(main([]))\n")
+        return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+
+    def test_a_python_below_the_floor_is_one_line_and_not_a_traceback(self):
+        """tarfile's data filter, which `pp promote` unpacks a release with, arrived in 3.11.4. bin/pp refuses
+        an older one, and `python -m pp` and the installed `pp` command reach no bin/pp, so the floor is
+        stated in the module every way of running pp comes through."""
+        r = self.imported_as("sys.version_info = (3, 11, 3)")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("pp needs Python >= 3.11.4 (tarfile's data filter); this is ", r.stderr)
+        self.assertEqual(len(r.stderr.splitlines()), 1, r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_this_machine_runs_pp(self):
+        r = self.imported_as("pass")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("usage: pp <command>", r.stdout)
+
+    def test_one_python_floor(self):
+        """pyproject, pp/cli.py and bin/pp say the same version. An installer reads pyproject, a run reads the
+        check in the module it comes through, and a clone reads bin/pp's own, so the three are one statement
+        or a machine pip refuses is one pp would have run."""
+        with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
+            floor = tomllib.load(f)["project"]["requires-python"].removeprefix(">=")
+        for rel in (("bin", "pp"), ("pp", "cli.py")):
+            with open(os.path.join(ROOT, *rel)) as f:
+                self.assertIn(f"sys.version_info < ({', '.join(floor.split('.'))})", f.read(), rel)
+
+    def test_the_checks_name_the_floor_they_promise(self):
+        """`ci/check 3.11` resolves to the newest 3.11, so a matrix naming the series never runs the patch
+        pyproject promises: ci/check's header offers that patch, and so does the matrix that calls it. A tree
+        without the workflow is a published subset, which runs ci/check all the same."""
+        with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
+            floor = tomllib.load(f)["project"]["requires-python"].removeprefix(">=")
+        for rel in (("ci", "check"), (".github", "workflows", "ci.yml")):
+            path = os.path.join(ROOT, *rel)
+            if not os.path.exists(path):
+                continue
+            with open(path) as f:
+                self.assertIn(floor, f.read(), rel)
+
+
 def module_level_imports(node):
     """The imports that run when the module is imported: everything outside a function body."""
     for child in ast.iter_child_nodes(node):

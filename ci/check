@@ -4,9 +4,9 @@
 # the whole test suite, journeys included.
 #
 #   ci/check            the suite on the python3 on PATH (pp promote's gate, in the release it is about to flip)
-#   ci/check 3.11       on a uv-managed CPython 3.11, the oldest pp supports (installed by uv on first use)
+#   ci/check 3.11.4     on a uv-managed CPython 3.11.4, the oldest pp supports (installed by uv on first use)
 #   ci/check 3.14       ... the newest CI runs
-#   ci/check --cpus 2 3.11   ... on 2 CPUs (taskset) and with its own process table (unshare), like a CI runner:
+#   ci/check --cpus 2 3.11.4 ... on 2 CPUs (taskset) and with its own process table (unshare), like a CI runner:
 #                       a test that passes only because its worker or server always gets a CPU at once, or because
 #                       a scan of /proc is slow on a busy machine, fails here too
 #

@@ -7,8 +7,10 @@ so a running pp stays on the release it started from even if `current` flips und
 import os
 import sys
 
-if sys.version_info < (3, 11):
-    sys.exit(f"pp needs Python >= 3.11 (tomllib); this is {sys.version.split()[0]} at {sys.executable}")
+if sys.version_info < (3, 11, 4):      # pp/cli.py says it too, for `python -m pp` and the installed command
+    print(f"pp needs Python >= 3.11.4 (tarfile's data filter); this is {sys.version.split()[0]} at "
+          f"{sys.executable}", file=sys.stderr)
+    raise SystemExit(2)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 

@@ -6,7 +6,7 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "The pp Authors" }]
-requires-python = ">=3.11"
+requires-python = ">=3.11.4"  # tarfile's data filter, which pp promote extracts with; bin/pp checks it too
 dependencies = []
 keywords = ["cli", "job queue", "gpu", "agents", "toolkit"]
 classifiers = [

@@ -26,8 +26,17 @@ import sys
 import traceback
 from dataclasses import dataclass, field
 
-from pp import TAGLINE, __version__
-from pp.lib import config, paths, proc, ui
+# pp is 3.11.4's: tarfile's data filter, which `pp promote` unpacks a release with, arrived there. Every way of
+# running pp comes through this module, bin/pp and `python -m pp` and the ppkit command alike, so the floor is
+# stated here, before the first import that may need it. bin/pp states it again, since it must refuse before
+# importing pp at all.
+if sys.version_info < (3, 11, 4):
+    print(f"pp needs Python >= 3.11.4 (tarfile's data filter); this is {sys.version.split()[0]} at "
+          f"{sys.executable}", file=sys.stderr)
+    raise SystemExit(2)
+
+from pp import TAGLINE, __version__      # noqa: E402
+from pp.lib import config, paths, proc, ui      # noqa: E402
 
 BUILTIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "commands")
 ORIGINS = ("builtin", "user", "plugin", "path", "external")
