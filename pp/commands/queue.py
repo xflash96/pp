@@ -90,8 +90,10 @@ Campaign files
     --from FILE (- for stdin) queues one job per line, and a line is the rest of an `add` command line: its own flags,
     then --, then the command.
 
-        --tag s3_L00 --gpu-gb 36 -- python -m lab.run --layer 0      # one job per layer, 36 GB each
-        python -m lab.smoke                                          # only a command still works
+        # one job per layer, 36 GB each: a comment is a line of its own, since a # inside a line is a word
+        --tag s3_L00 --gpu-gb 36 -- python -m lab.run --layer 0
+        # a line that is only a command still works
+        python -m lab.smoke
 
     Flags on the `add` itself are the defaults for every line, and a line's own flags win: --env and --need merge key
     by key, every other flag is replaced. The queue, the file, --hold and --no-start are the `add`'s own, and a line
