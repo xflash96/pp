@@ -81,7 +81,8 @@ Order, and a stage after another
     and the ids are kept, so nothing added later joins it, an id no job has is an error that queues nothing, and a
     dropped job counts as ended. A job waiting on --after is skipped rather than waited for, so it never becomes the
     head of its queue and never blocks the jobs behind it. `wait` counts a held job as not ended: a wait over a stage
-    still held says so and then waits for ever, so wait for the stage before it and release this one.
+    still held says so and then waits for ever, so wait for the stage before it and release this one. A stage spread
+    over two queues is one wait for each (`wait -q grid --prefix s1_`), since a prefix that spans two is an error.
 
         IDS=$(pp queue add --from stage1.txt)                         # one id per line on stdout
         pp queue add --from stage2.txt --after "$(echo "$IDS" | tr '\n' ',')"
