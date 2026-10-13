@@ -469,9 +469,9 @@ class TestWhatAHooksStreamsAre(Base):
 
     def test_a_hook_that_reopens_its_own_output_leaves_the_runs_log_whole(self):
         """`> /dev/stdout` in a hook is /proc/self/fd/1 opened again, with O_TRUNC. Handed the run's log, a
-        hook doing that threw away the lines naming the project, the revision and the new release, and pp's
-        reader was then past the end of a file that had shrunk, so none of the hook's output was shown
-        either. What such a hook truncates now is its own output file."""
+        hook doing that would throw away the lines naming the project, the revision and the new release, and
+        pp's reader would be past the end of a file that had shrunk. What such a hook truncates is its own
+        output file."""
         head = self.make_repo('build = "echo before; echo HELLO > /dev/stdout; echo after"\n')
         rc, out, err = self.pp(self.repo)
         self.assertEqual(rc, 0, out + err)
@@ -594,8 +594,8 @@ class TestARemoveThatCannotFinish(Base):
 
 class TestAWordThatIsNoVerb(Base):
     def test_a_mistyped_verb_does_not_release_the_project_in_the_cwd(self):
-        """Every other word is a PATH, and a path that is not there resolves to the project of the cwd: a typo
-        for a read-only verb used to snapshot, gate, flip `current` and run `after`."""
+        """Every other word is a PATH, and a path that is not there would resolve to the project of the cwd: a
+        typo for a read-only verb would snapshot, gate, flip `current` and run `after`."""
         self.make_repo()
         self.assertEqual(self.pp(self.repo)[0], 0)
         first = self.current()
@@ -710,9 +710,9 @@ class TestATreeProjectPpCannotRead(Base):
         return src
 
     def test_a_fifo_is_no_part_of_a_release_and_does_not_hold_the_command(self):
-        """A dev server's fifo in the source blocked the open that hashes the tree, with no bound: promote, its
-        preflight and status never came back. `_copy` never copied one into a release either, so the hash and
-        the snapshot now agree on what a file is."""
+        """A dev server's fifo in the source would block the open that hashes the tree, with no bound, and
+        promote, its preflight and status would never come back. `_copy` copies no fifo into a release, so the
+        hash and the snapshot agree on what a file is."""
         src = self.tree()
         os.mkfifo(os.path.join(src, "dev.sock"))
         rc, out, err = self.pp(src, "-n")
@@ -789,8 +789,8 @@ class TestRollingBackAndForward(Base):
 
 class TestABadValue(Base):
     """config.py promises a loud error naming the file, and `_checked` promises that a misspelt key does not
-    release with nothing gating it. A value of the wrong type is the same mistake: it used to pass preflight
-    and reach the code that uses it, where it dropped files from the release or raised a traceback."""
+    release with nothing gating it. A value of the wrong type is the same mistake: past preflight, it would
+    reach the code that uses it, and drop files from the release or raise a traceback."""
 
     def bad(self, line: str, says: str):
         src = os.path.join(self.tmp, "bad")
@@ -804,8 +804,8 @@ class TestABadValue(Base):
         self.assertFalse(os.path.exists(os.path.join(self.sb.data, "releases", "bad")), line)
 
     def test_a_string_where_a_list_belongs_is_not_a_list_of_characters(self):
-        """`exclude = "*.log"` used to become the patterns * . l o g, and `*` drops every file: the release was
-        empty and status called it level with the source."""
+        """Read as a list, `exclude = "*.log"` is the patterns * . l o g, and `*` drops every file: the release
+        would be empty and status would call it level with the source."""
         self.bad('exclude = "*.log"', "exclude")
 
     def test_every_value_is_checked_by_its_key(self):
@@ -833,8 +833,8 @@ class TestABadValue(Base):
         self.assertEqual(sorted(os.listdir(self.sb.data)) if os.path.isdir(self.sb.data) else [], [])
 
     def test_a_registry_name_that_is_not_one_path_component_is_acted_on_by_nothing(self):
-        """0.1.0 checked no name, so a registry it wrote holds keys like `..`, whose releases directory is the
-        data directory itself: `gc` of that target removed every other target's releases."""
+        """A registry can hold a key like `..`, whose releases directory is the data directory itself, and
+        `gc` of that target would remove every other target's releases."""
         for n in ("alpha", "beta"):
             src = os.path.join(self.tmp, n)
             self.write(".pp.toml", f'name = "{n}"\n[promote]\nsource = "tree"\n', root=src)

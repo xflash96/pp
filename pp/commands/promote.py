@@ -212,7 +212,7 @@ def _registry_file(create: bool = False) -> str:
 
 def _registry(unusable: list | None = None) -> dict:
     """Every promoted target: its name, and where its project is. A key no releases path can be built from is
-    no target to act on, and 0.1.0 wrote such a key, so it is dropped here: a verb over the registry then acts
+    no target to act on, and a registry can hold such a key, so it is dropped here: a verb over the registry acts
     on the targets around it, and `pp promote` in that project refuses naming the file and the key, which is
     where the name is fixed. `unusable` collects the keys dropped, for `status` to say once: it is the one verb
     that surveys the registry, and a target it never lists is one to say something about."""

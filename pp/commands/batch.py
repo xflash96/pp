@@ -443,7 +443,7 @@ def _place(frames: tuple, shown: str, number: bool) -> str | None:
     that works.
 
     number says the value is one of pp's own ({n}, {N}, {i}, {mtime}): what is in it is pp's own digits and
-    the template's own format, and nothing off the disk, so every position takes it as 0.1.0 took it."""
+    the template's own format, and nothing off the disk, so it may sit in any position."""
     no = None if number else next((f for f in frames if isinstance(f, _No)), None)
     if no:
         raise TemplateError(f"{{{shown}}} sits {no.why}; {REMEDY}")
