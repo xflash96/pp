@@ -429,15 +429,18 @@ class Worker:
         self._note(*p.blocked)
 
     @staticmethod
-    def _claim(s: jobstore.Txn, j: dict, gpu: int | None):
-        """In a transaction: the job, as read in it, becomes running, with the file this attempt writes its exit
-        code to. Its run claim is held before this, so no reader ever sees it running with nothing holding its
-        claim unless its run has ended."""
-        j.update(started=time.time(), gpu=gpu, state="running", rcfile=_new_rcfile(j))
+    def _claim(s: jobstore.Txn, j: dict, card: int | None):
+        """In a transaction: the job, as read in it, becomes running, with the names and files this attempt
+        alone has: where it writes its exit code, where its runner reads its environment, the name whatever
+        that runner starts elsewhere carries, and the cards pp reserved for it. Its run claim is held before
+        this, so no reader ever sees it running with nothing holding its claim unless its run has ended."""
+        rc = _new_rcfile(j)
+        j.update(started=time.time(), cards=[] if card is None else [card], state="running", rcfile=rc,
+                 envfile=rc + ".env", container=policy.container(j))
         j.pop("not_before", None)
         s.save(j)
 
-    def _spawn(self, j: dict, gpu: int | None, claim: lock.Claim) -> dict | None:
+    def _spawn(self, j: dict, card: int | None, claim: lock.Claim) -> dict | None:
         """Start the attempt's wrapper, and hand it the run claim as its stdin: it holds that claim for exactly
         as long as the attempt lives. pp closes its own copy here, so nothing but the wrapper holds it.
 
@@ -445,14 +448,18 @@ class Worker:
         log that cannot be opened, an environment name the kernel will not take. The pass that got here has
         marked every job it admitted `running` already, so one job that cannot start must not end the pass
         for the others: they would be left with no process, and read as lost."""
-        jid, q = j["id"], self.queue
+        jid = j["id"]
         argv = list(j.get("runner") or []) + list(j["cmd"])
-        env = policy.job_env(j, gpu)
+        env = policy.job_env(j)
+        at = 0
         try:
+            # the environment file the runner is handed, readable by this user alone, before anything starts
+            paths.write_text(j["envfile"], policy.env_file(j), mode=0o600)
             os.makedirs(os.path.dirname(j["log"]), exist_ok=True)
             with open(j["log"], "a") as f:
                 f.write(policy.banner(j, shlex.join(argv), f"{datetime.now():%Y-%m-%d %H:%M:%S}"))
                 f.flush()
+                at = f.tell()   # where this attempt's own output begins, which is what --retry-if reads from
                 p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
                                env="scrubbed", add_env=env, cwd=j["cwd"], stdout=f, stderr=proc.STDOUT)
         except Exception as e:
@@ -470,7 +477,7 @@ class Worker:
             cur = s.job(jid, must_be=("running",))
             if cur:
                 cur.update(pid=p.pid, pgid=p.pid, pstart=p.handle.start if p.handle else None,
-                           boot=proc.boot_id())
+                           boot=proc.boot_id(), log_at=at)
                 s.save(cur)
         if cur is None:
             # its record no longer says running, which only something outside pp can do to a job this worker is
@@ -478,7 +485,7 @@ class Worker:
             p.end(signal.SIGTERM)
             self.say("ended-elsewhere", j, {"pid": p.pid})
         self.children[jid] = p
-        self.say("start", j, {"card": gpu})
+        self.say("start", j, {"card": card})
         return cur
 
     def _note(self, j: dict | None, why: str = ""):

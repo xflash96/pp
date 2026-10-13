@@ -322,7 +322,7 @@ class TestResources(QueueJourney):
         cmd = ["--", "sh", "-c", "echo card=$CUDA_VISIBLE_DEVICES; sleep 30"]
         g1, g2, g3 = self.add("--gpu-gb", "20", *cmd), self.add("--gpu-gb", "10", *cmd), self.add("--gpu-gb", "10", *cmd)
         self.until(lambda: self.state(g2) == "running")
-        self.assertEqual((self.show(g1)["gpu"], self.show(g2)["gpu"]), (0, 1))
+        self.assertEqual((self.show(g1)["cards"], self.show(g2)["cards"]), ([0], [1]))
         self.assertIn("card=1", self.until(lambda: "card=1" in (s := self.pp("queue", "log", g2).stdout) and s))
         st = self.status()
         self.assertIn("GPU0 0% 2.0/24G  GPU1 0% 1.0/12G", st)

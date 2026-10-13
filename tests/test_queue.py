@@ -750,6 +750,9 @@ class TestWorker(QueueCase):
         self.assertTrue([p for p in left if p.endswith(f"{j}.run")], left)              # its run claim
         self.assertTrue([p for p in left if p.startswith(f"rc{os.sep}")], left)         # attempt 1's exit code
         self.assertTrue([p for p in left if p.startswith(f"logs{os.sep}")], left)       # and its log
+        # the environment file that attempt's runner was handed is the attempt's too, and nobody else's to read
+        was = jobstore.find(j)["history"][0]["envfile"]
+        self.assertEqual(os.stat(was).st_mode & 0o777, 0o600)
         hlog = jobstore.find(done)["hooks"][0]["log"]
         self.assertTrue(os.path.exists(hlog))
         self.assertEqual(self.call("drop", str(j))[0], 0)
@@ -757,6 +760,7 @@ class TestWorker(QueueCase):
         self.assertEqual((jobstore.find(j), jobstore.find(done)), (None, None))
         self.assertEqual({p for p in self.files() - before if p != "FORMAT"}, set())
         self.assertFalse(os.path.exists(hlog))      # the hook's log too: the record was the last to name it
+        self.assertFalse(os.path.exists(was))       # and the environment file of an attempt that is over
 
     def test_adoption_reads_rc_from_file(self):
         j = self.add(cmd="sleep 0.3; exit 4")
@@ -1077,7 +1081,7 @@ class TestGpu(QueueCase):
         w.tick()
         self.assertEqual((self.state(a), self.state(b)), ("running", "queued"))
         self.assertIn("does not fit", self.why(w))
-        self.assertEqual(jobstore.find(a)["gpu"], 0)
+        self.assertEqual(jobstore.find(a)["cards"], [0])
 
     def test_reservation_counts_every_queue(self):
         jobq._cards = lambda: [card(total=24)]
@@ -1130,7 +1134,7 @@ class TestGpu(QueueCase):
         w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "done")
         rec = jobstore.find(j)
-        self.assertEqual(rec["gpu"], 1)
+        self.assertEqual(rec["cards"], [1])
         with open(rec["log"]) as f:
             self.assertIn("dev=1", f.read())
 
@@ -3191,7 +3195,8 @@ class TestTheDecision(unittest.TestCase):
             at = self.NOW if ended is None else ended
             delay = min(self.DELAY * 2 ** (r["attempt"] - 1), jobpolicy.RETRY_DELAY_CAP)
             was = {"attempt": r["attempt"], "rc": rc, "reason": reason, "started": self.started_at(r),
-                   "ended": at, "seconds": at - self.started_at(r), "rcfile": None}
+                   "ended": at, "seconds": at - self.started_at(r),
+                   **dict.fromkeys(jobpolicy.KEPT)}     # the files and names this attempt had, and none here
             return jobpolicy.Action(jobpolicy.AGAIN, rc=rc, reason=reason, ended=at, sweep=sweep,
                                attempt=r["attempt"] + 1, not_before=at + delay, history=was,
                                clear=jobpolicy.ATTEMPT)
@@ -3510,27 +3515,53 @@ class TestThePolicyTables(unittest.TestCase):
 
     # -- job_env and hook_env: what a job and a hook run with ------------------------------------------------
     def test_what_one_attempt_of_a_job_runs_with(self):
-        """The order the layers merge in: the shell that queued the job, then the project's env and the job's
-        own, then pp's own names, which no job can write over, and then the card it was given."""
+        """The layers of one attempt's environment, in the order they merge: what the shell that queued the
+        job was in, the project's env and the job's own, and then the names pp sets, which nothing overrides.
+        Every layer present or absent, with a card reserved or none.
+
+        The attempt's own names are read off its record, where the launch wrote them, so the environment of a
+        job and the file its runner reads are one answer and not two."""
         rows = 0
         for shell in ({}, {"PATH": "/sh", "CONDA_PREFIX": "/c"}):
-            for env in ({}, {"HF": "1"}, {"PATH": "/mine"}, {"PP_QUEUE": "theirs", "PP_QUEUE_JOB": "9"}):
-                for card_i in (None, 3):
-                    rows += 1
-                    job = {"id": 5, "queue": "dl", "rcfile": "/rc/5.1.ab", "shell_env": shell, "env": env}
-                    got = jobpolicy.job_env(job, card_i)
-                    with self.subTest(shell=bool(shell), env=sorted(env), card=card_i):
-                        self.assertEqual(got["PP_QUEUE"], "dl")         # pp's own names, whatever a job asks
-                        self.assertEqual(got["PP_QUEUE_JOB"], "5")
-                        self.assertEqual(got["PP_QUEUE_RCFILE"], "/rc/5.1.ab")
-                        self.assertEqual(got.get("CUDA_VISIBLE_DEVICES"), None if card_i is None else "3")
-                        for k, v in env.items():                        # the job's own, over the shell's
-                            if not k.startswith("PP_QUEUE"):
-                                self.assertEqual(got[k], v)
-                        for k, v in shell.items():
-                            if k not in env:
-                                self.assertEqual(got[k], v)
-        self.assertEqual(rows, 16)
+            for project in ({}, {"HF": "1"}):
+                for own in ({}, {"SEED": "0", "PATH": "/mine"}):
+                    for container in (None, "pp-dl-5-1"):
+                        for envfile in (None, "/rc/5.1.ab.env"):
+                            for cards in ([], [3]):
+                                rows += 1
+                                job = {"id": 5, "queue": "dl", "rcfile": "/rc/5.1.ab", "shell_env": shell,
+                                       "env": {**project, **own}, "cards": cards,
+                                       "container": container, "envfile": envfile}
+                                got = jobpolicy.job_env(job)
+                                with self.subTest(shell=bool(shell), project=bool(project), own=bool(own),
+                                                  container=container, envfile=envfile, cards=cards):
+                                    self.assertEqual(got["PP_QUEUE"], "dl")
+                                    self.assertEqual(got["PP_QUEUE_JOB"], "5")
+                                    self.assertEqual(got["PP_QUEUE_RCFILE"], "/rc/5.1.ab")
+                                    self.assertEqual(got.get("PP_QUEUE_CONTAINER"), container)
+                                    self.assertEqual(got.get("PP_QUEUE_ENVFILE"), envfile)
+                                    self.assertEqual(got.get("CUDA_VISIBLE_DEVICES"),
+                                                     "3" if cards else None)
+                                    for k, v in {**project, **own}.items():
+                                        self.assertEqual(got[k], v)       # the job's own, over the shell's
+                                    for k, v in shell.items():
+                                        if k not in {**project, **own}:
+                                            self.assertEqual(got[k], v)
+                                    # the file the runner reads: those layers, and nothing of this machine's
+                                    text = jobpolicy.env_file(job)
+                                    lines = [ln for ln in text.splitlines() if ln]
+                                    want = [f"{k}={v}" for k, v in {**project, **own}.items()]
+                                    want += [f"CUDA_VISIBLE_DEVICES={','.join(map(str, cards))}"] if cards else []
+                                    want += [f"PP_QUEUE=dl", "PP_QUEUE_JOB=5"]
+                                    want += [f"PP_QUEUE_CONTAINER={container}"] if container else []
+                                    self.assertEqual(lines, [ln for ln in want
+                                                             if ln.split("=")[0] not in jobpolicy.NEVER_IN_ENVFILE])
+                                    for never in jobpolicy.NEVER_IN_ENVFILE:
+                                        self.assertNotIn(never + "=", text)
+        self.assertEqual(rows, 64)
+        # every card it reserved, as the comma-separated list a runtime and a library both read
+        two = jobpolicy.job_env({"id": 5, "queue": "dl", "rcfile": "/rc/x", "cards": [1, 2]})
+        self.assertEqual(two["CUDA_VISIBLE_DEVICES"], "1,2")
 
     def test_what_a_hook_of_a_job_runs_with(self):
         """A hook reads how the job ended from its environment, so every name is there even where the record
@@ -3763,7 +3794,7 @@ class TestThePolicyTables(unittest.TestCase):
                                 {"backfill": False, "now": now})
             self.assertEqual([(j["id"], c) for j, c in p.starts], [(1, 1)])
         with self.subTest("a card another job has reserved"):
-            on = [{**self.job(9, state="running", needs={"gpu_gb": 20}), "gpu": 1, "started": 100.0}]
+            on = [{**self.job(9, state="running", needs={"gpu_gb": 20}), "cards": [1], "started": 100.0}]
             p = jobpolicy.admit({"queued": [want], "running": on}, self.seen(pools, cards=cards),
                                 {"backfill": False, "now": now})
             self.assertEqual(p.starts, ())
@@ -3773,7 +3804,7 @@ class TestThePolicyTables(unittest.TestCase):
             # needs 16 does not fit, though the pool's own number leaves room for it
             wide = [{**self.pool(name="gpu_gb", mx=24, settle=30.0), "where": "[resources] gpu_gb"}]
             big = self.job(1, needs={"gpu_gb": 16})
-            on = [{**self.job(9, state="running", needs={"gpu_gb": 8}), "gpu": 1, "started": 1990.0}]
+            on = [{**self.job(9, state="running", needs={"gpu_gb": 8}), "cards": [1], "started": 1990.0}]
             p = jobpolicy.admit({"queued": [big], "running": on},
                                 self.seen(wide, cards=[card(0, total=24, used=24), card(1, total=24, used=4)],
                                           cards_t=1980.0), {"backfill": False, "now": now})
@@ -3811,7 +3842,7 @@ class TestThePolicyTables(unittest.TestCase):
                                     sort_keys=True), before)
         job = {"id": 5, "queue": "dl", "rcfile": "/rc/x", "env": {"A": "1"}, "shell_env": {}}
         was = json.dumps(job, sort_keys=True)
-        self.assertEqual(jobpolicy.job_env(job, 0), jobpolicy.job_env(job, 0))
+        self.assertEqual(jobpolicy.job_env(job), jobpolicy.job_env(job))
         self.assertEqual(json.dumps(job, sort_keys=True), was)
 
 

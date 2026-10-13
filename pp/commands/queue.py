@@ -49,15 +49,26 @@ second time, while a selection that matches no job at all is an error. kill, dro
 of more than one job and ask first (-y: do not ask, -n: only show).
 
 Lower --prio runs first (default 10), ties by id. Each queue is strict head-of-line unless its own backfill
-is on, so a big job is never starved by small ones. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV
-are captured at add time, so `python` means what it meant in your shell.
+is on, so a big job is never starved by small ones.
+PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what it
+meant in your shell.
 
 A job's environment, later entries winning: the worker's (that of the `pp queue add` that started it, without an
 agent session's identity); PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job;
-the project's [queue] env; add's --env; then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE and CUDA_VISIBLE_DEVICES. A
-variable you export before `pp queue add` reaches the job only through the worker that add started, so pass a
-token or a secret with --env or the project's env. `--json` gives the names of a job's own variables with every
-value as ***, and `show` prints neither, so a secret you pass stays in the job's record and in the job.
+the project's [queue] env; add's --env; then the six pp sets, which nothing overrides: PP_QUEUE,
+PP_QUEUE_JOB, PP_QUEUE_RCFILE (where this attempt writes its exit code), PP_QUEUE_CONTAINER (a name for
+whatever the runner starts elsewhere, one per attempt, beginning pp-<queue>-<id>-), PP_QUEUE_ENVFILE (a file
+of KEY=VALUE lines, readable by you alone, for a runner to hand to a container) and CUDA_VISIBLE_DEVICES, the
+cards --gpu-gb reserved as a comma-separated list, unset where the job reserved none. A variable you export
+before `pp queue add` reaches the job only through the worker that add started, so pass a token or a secret
+with --env or the project's env. `--json` gives the names of a job's own variables with every value as ***,
+and `show` prints neither, so a secret you pass stays in the job's record and in the job.
+
+PP_QUEUE_ENVFILE holds the project's [queue] env, the job's --env, CUDA_VISIBLE_DEVICES where a card was
+reserved, PP_QUEUE, PP_QUEUE_JOB and PP_QUEUE_CONTAINER, and nothing else of this machine's: no PATH,
+VIRTUAL_ENV, CONDA_PREFIX, CONDA_DEFAULT_ENV or PP_QUEUE_RCFILE, which would shadow an image's own python or
+name a host path inside a container. A container runner passes it with --env-file and deletes any -e line for
+a variable the file carries, since docker ranks -e above --env-file. It goes with the job's record.
 
 Timeouts and retries
     --timeout DUR      the worker SIGTERMs the job's process group after DUR (90s, 30m, 2h, 1d) and SIGKILLs

@@ -106,8 +106,10 @@ class Action:
 # What one attempt of a job holds that the next one does not: the process it ran as, the stop it carried, the
 # files it wrote and the names it was given. A requeue takes each off the record and the history entry it
 # writes keeps them, so a job that ran three times names three sets of files and claims none of them twice.
-ATTEMPT = ("pid", "pgid", "pstart", "boot", "started", "gpu", "stop", "rcfile")
-KEPT = ("rcfile",)      # of those, the ones the history entry carries by name
+ATTEMPT = ("pid", "pgid", "pstart", "boot", "started", "stop", "rcfile", "envfile", "container", "log_at",
+           "cards")
+KEPT = ("rcfile", "envfile", "container", "log_at", "cards")     # of those, the ones the entry carries by name
+FILES = ("rcfile", "envfile")       # of those, the ones that are a file of the attempt's own
 
 
 def attempt_of(job: dict, rc: int | None, reason: str | None, ended: float) -> dict:
@@ -363,7 +365,7 @@ def fits(job: dict, running: list[dict], seen: dict) -> tuple[bool, str, int | N
     whys = []
     for c in sorted(seen["cards"], key=lambda c: -c["free_gb"]):
         i = c["index"]
-        on = [r for r in running if r.get("gpu") == i]
+        on = [r for r in running if i in (r.get("cards") or [])]
         why = None
         for p in ps:
             reserved, budget = sum(need(r, "gpu_gb") for r in pool_jobs(p, on)), gpu_budget(p, c)
@@ -408,7 +410,7 @@ def admit(state: dict, seen: dict, settings: dict) -> Pass:
         starts.append((job, card))
         # what this pass has taken counts against the next job in it, as the record it is about to become:
         # on the card it took, and launched now, which is inside every settle window a reading has
-        running.append({**job, "started": settings["now"], "gpu": card})
+        running.append({**job, "started": settings["now"], "cards": [] if card is None else [card]})
     return Pass(tuple(starts), blocked)
 
 
@@ -485,15 +487,54 @@ def next_tick(settings: dict, serving: int, woken: bool, idle_since: float | Non
 
 # ---- what a job and a hook run with -------------------------------------------------------------------
 
-def job_env(job: dict, card: int | None) -> dict:
+def container(job: dict) -> str:
+    """The name this attempt of the job gives whatever its runner starts elsewhere: one no other run on the
+    machine has, and one per attempt rather than one per job.
+
+    A retry of an attempt whose container outlived its worker would otherwise die at once on a name that is
+    taken, which is the case retries exist for. The `pp-<queue>-<id>-` part is what names the job in a
+    runtime's own listing; the spelling past that is not interface."""
+    return f"pp-{job['queue']}-{job['id']}-{int(job.get('attempt', 1))}"
+
+
+# What the environment file never holds, whatever a job asks for: the four that would shadow an image's own
+# python and misroute every import, and the two host paths nothing inside a container can use.
+NEVER_IN_ENVFILE = ("PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PP_QUEUE_RCFILE",
+                    "PP_QUEUE_ENVFILE")
+# and what it does hold, in this order, after the project's env and the job's own
+IN_ENVFILE = ("CUDA_VISIBLE_DEVICES", "PP_QUEUE", "PP_QUEUE_JOB", "PP_QUEUE_CONTAINER")
+
+
+def job_env(job: dict) -> dict:
     """The environment one attempt of a job runs in, in the order it is merged: what the shell that queued it
-    was in, the project's env and the job's own, pp's own names for this queue and this job, and the card it
-    was given."""
+    was in, the project's env and the job's own, and then the six names pp sets, which nothing overrides.
+
+    The attempt's own four are read off its record, where the launch wrote them: the file it writes its exit
+    code to, the file its runner reads its environment from, the name whatever that runner starts elsewhere
+    carries, and the cards pp reserved for it. CUDA_VISIBLE_DEVICES is those cards as a comma-separated list
+    of indices, and is unset rather than empty where the job reserved none, since an empty value hides every
+    card from a library that reads it."""
     env = {**(job.get("shell_env") or {}), **(job.get("env") or {}),
            "PP_QUEUE": job["queue"], "PP_QUEUE_JOB": str(job["id"]), "PP_QUEUE_RCFILE": job["rcfile"]}
-    if card is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(card)
+    for name, field in (("PP_QUEUE_CONTAINER", "container"), ("PP_QUEUE_ENVFILE", "envfile")):
+        if job.get(field):
+            env[name] = job[field]
+    if job.get("cards"):
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(c) for c in job["cards"])
     return env
+
+
+def env_file(job: dict) -> str:
+    """What pp writes to the file PP_QUEUE_ENVFILE names, one KEY=VALUE line per variable: the project's
+    `[queue] env`, the job's own `--env`, the cards it reserved, and the three of pp's names that mean
+    something wherever the runner starts the work.
+
+    It holds nothing else of this machine's (NEVER_IN_ENVFILE), so a runner may hand the whole file to a
+    container without shadowing the image's python or naming a host path inside it. A name holding `=` or NUL
+    and a value holding a newline are refused when the job is added, so no value can corrupt the file."""
+    env = job_env(job)
+    names = [k for k in (job.get("env") or {})] + list(IN_ENVFILE)
+    return "".join(f"{k}={env[k]}\n" for k in names if k in env and k not in NEVER_IN_ENVFILE)
 
 
 def banner(job: dict, cmd: str, stamp: str) -> str:

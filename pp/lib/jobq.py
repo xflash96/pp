@@ -881,10 +881,15 @@ def public(j: dict) -> dict:
     """A job as JSON consumers (`show/status --json`) see it: every stored field, with the job's environment
     masked.
 
-    Fields others rely on: id (int), state, queue, tag, project, cwd, cmd (argv), runner (argv, maybe []), needs,
-    prio, owner {session, cwd} or None, timeout, retries, attempt, rc, reason, seconds, log,
-    notes [{t, by, text}], reported [{t, by, session}], stop {by, t, grace, timeout, sent, kill9, denied, was}
-    on a job asked to stop, and from `show` also jobcore.watchers [{pid, verb, session}].
+    Fields others rely on: id (int), state, queue, tag (or null), project, cwd, cmd (argv), runner (argv,
+    maybe []), stop_cmd ("group" or the command that reaches what the runner started), needs, prio, owner
+    {session, cwd} or None, timeout, grace, retries, attempt, rc, reason, seconds, log, log_at (where this
+    attempt's own output begins), cards (the card indices it reserved), container (the name whatever its
+    runner started elsewhere carries), envfile (the file that runner reads its environment from),
+    notes [{t, by, text}], reported [{t, by, session}], history (one entry per attempt that ended, each with
+    that attempt's own rcfile, envfile, container, log_at and cards), stop {by, t, grace, timeout, sent,
+    kill9, denied, was, cmd, rc} on a job asked to stop, and from `show` also jobcore.watchers
+    [{pid, verb, session}].
 
     `env` and `shell_env` keep their keys and give every value as "***". A token or a secret is what the help
     says to pass with --env, and an agent reads `--json` to see how its jobs are getting on, so the values
@@ -1114,7 +1119,8 @@ def cmd_status(a, scope: list[str] | None) -> int:
                                              _latest_note(j)) if x)
                 row = [j["id"], _name(j), f"[{_text(j.get('project'))}]",
                        ui.human_duration(now - (j.get("started") or now)),
-                       _needs_str(j.get("needs")) + (f" on GPU{j['gpu']}" if j.get("gpu") is not None else "")]
+                       _needs_str(j.get("needs"))
+                       + (" on GPU" + ",".join(str(c) for c in j["cards"]) if j.get("cards") else "")]
                 rows.append(row + [extra])
                 lasts.append(_last_line(j.get("log"), max(width - 8, 20)))
             for line, last in zip(_section(rows, 1, width), lasts):

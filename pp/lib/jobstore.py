@@ -366,12 +366,14 @@ def run_claim(q: str, jid: int) -> str:
 def _forget_job(s: Txn, job: dict) -> None:
     """In a transaction: take a job's record away, and with it every file that belongs to that job alone.
 
-    The record goes first, so no reader finds a job whose files are gone. Then the exit code each attempt
-    wrote, the job's log, the log of each hook that ran for it, and the claim its runs held. Only files under
-    the queue's own directories, never one pp did not write. What `drop` and `clean` both take away, so
+    The record goes first, so no reader finds a job whose files are gone. Then the files each attempt of it
+    wrote, which are its exit code and the environment its runner was handed, the job's log, the log of each
+    hook that ran for it, and the claim its runs held. Each attempt's are taken from the record and from
+    `history` alike, so a job that ran three times leaves no file of an earlier attempt behind. Only files
+    under the queue's own directories, never one pp did not write. What `drop` and `clean` both take away, so
     neither leaves a file behind that nothing names any more: once the record is gone, nothing names them."""
     q, jid = job["queue"], job["id"]
-    files = [p for p in [job.get("rcfile")] + [h.get("rcfile") for h in job.get("history") or []]
+    files = [p for att in [job] + list(job.get("history") or []) for p in (att.get(k) for k in policy.FILES)
              if p and os.path.dirname(p) == qroot(q, "rc", create=False)]
     if job.get("log") and os.path.dirname(job["log"]) == qroot(q, "logs", create=False):
         files.append(job["log"])

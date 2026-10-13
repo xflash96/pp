@@ -98,13 +98,16 @@ def write_json(path: str, data, **dump) -> None:
         json.dump(data, f, **dump)
 
 
-def write_text(path: str, s: str) -> None:
-    """Replace path with s in one step, the way write_json replaces a record. The file keeps the mode it had,
-    so rewriting one a person edits does not change who can read it; a new file is 0644."""
-    try:
-        mode = os.stat(path).st_mode & 0o7777
-    except OSError:
-        mode = 0o644
+def write_text(path: str, s: str, mode: int | None = None) -> None:
+    """Replace path with s in one step, the way write_json replaces a record. Without a mode the file keeps
+    the one it had, so rewriting one a person edits does not change who can read it, and a new file is 0644;
+    with one, the file is written and left with exactly that mode, which is how a file holding a job's own
+    environment is readable by its owner alone."""
+    if mode is None:
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except OSError:
+            mode = 0o644
     with _replacing(path) as f:
         os.fchmod(f.fileno(), mode)
         f.write(s)
