@@ -794,6 +794,25 @@ class TestWorker(QueueCase):
         self.assertEqual([jobstore.find(i)["retry_of"] for i in new], [ok, bad])
         self.assertEqual(self.state(held), "held")      # the one the verb does not suit is left as it is
 
+    def test_several_ids_in_a_state_the_verb_does_not_suit_are_refused(self):
+        """A job named by its own id and in a state the verb does not suit is exit 2, whether it was named
+        alone or beside another one. A plan over ids none of which suits the verb re-queues, stops and
+        removes nothing, so an `&&` chain never reads exit 0 as the verb having done its work. A selection
+        that swept those jobs up is exit 0 instead, since a driver that re-runs it must not stop the second
+        time. retry, kill and drop answer this through the one construct the three share."""
+        a, b = self.add(cmd="true"), self.add(cmd="true")
+        before = sorted(j["id"] for j in jobstore.jobs())
+        self.assertEqual(self.call("retry", str(a), str(b), "--no-start", "-y")[0], 2)
+        self.assertEqual(self.call("kill", str(a), str(b), "-y")[0], 2)
+        self.assertEqual(self.call("retry", f"{a}-{b}", "--no-start", "-y")[0], 0)      # swept up, not named
+        self.assertEqual(self.call("kill", f"{a}-{b}", "-y")[0], 0)
+        self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
+        self.assertEqual([self.state(x) for x in (a, b)], ["queued", "queued"])
+        self.run_until(jobq.worker_for("default"), lambda: self.state(a) == "done" and self.state(b) == "done")
+        self.assertEqual(self.call("drop", str(a), str(b), "-y")[0], 2)         # ended: clean removes them
+        self.assertEqual(self.call("drop", f"{a}-{b}", "-y")[0], 0)
+        self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
+
     def test_a_retry_is_owned_by_the_session_that_asked_for_it(self):
         """The new job is this session's, not the session's that queued the job it repeats, so `wait --mine`
         in the session that asked for the retry hears how it ends."""

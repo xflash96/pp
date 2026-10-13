@@ -778,16 +778,22 @@ def _left(skipped: list[dict]) -> None:
 
 
 def _gate(a, jobs: list[dict], verb: str, ok: tuple) -> int | None:
-    """kill and drop: a selection naming one job is acted on at once; one naming more is shown first and asked
-    about (-y: do not ask). -n only shows. None to go ahead, else the exit code."""
+    """kill, drop and retry: a selection naming one job is acted on at once; one naming more is shown first
+    and asked about (-y: do not ask). -n only shows. None to go ahead, else the exit code.
+
+    A plan over jobs none of which suits the verb asks nothing, since there is nothing to do. It is still
+    the verb's own pass that answers for them: a job a selection swept over is left as it is (exit 0), and
+    one named by its own id is refused with the verb that does suit it (exit 2)."""
     if not a.dry_run and len(jobs) < 2:
         return None
     hits = [j for j in jobs if j["state"] in ok]
     print(f"{verb} {len(hits)} job(s): "
           + (", ".join(f"{j['id']} {_name(j)}" for j in hits) or "none"))
     _left([j for j in jobs if j["state"] not in ok])
-    if a.dry_run or not hits:
+    if a.dry_run:
         return 0
+    if not hits:
+        return None if any(not j["_bulk"] for j in jobs) else 0
     return None if ui.confirm(f"{verb} them?", a.yes) else 2
 
 
