@@ -142,11 +142,12 @@ Containers, and anything else a runner starts elsewhere
     CONDA_DEFAULT_ENV or PP_QUEUE_RCFILE of this machine's, which would name a python or a path outside the image.
     It is readable by you alone.
         A stop command runs detached in the job's directory with the job's environment, its output in the job's log.
-    `docker stop -t 10 $PP_QUEUE_CONTAINER` waits for the container and `docker rm -f` does not, so keep a -t inside
-    the job's grace (--grace, 10s by default): the SIGKILL follows the grace whatever the stop command is doing. The
-    command is read when the job is queued and kept on the record, so a worker that comes back carries out the same
-    stop on the same container. A --no-runner job's stop is its own process group whatever the project says, and
-    nothing in pp names docker: a runner and a stop are commands.
+    `docker stop -t 5 $PP_QUEUE_CONTAINER` waits for the container and `docker rm -f` does not, so keep a -t below the
+    job's grace (--grace, 10s by default): the SIGKILL follows the grace whatever the stop command is doing, and a -t
+    of the whole grace takes the client with it, leaving the container it was waiting for behind. The command is read
+    when the job is queued and kept on the record, so a worker that comes back carries out the same stop on the same
+    container. A --no-runner job's stop is its own process group whatever the project says, and nothing in pp names
+    docker: a runner and a stop are commands.
 
 Settings: one default, one key, one flag, one order
     Every setting has a built-in default. Where one has more than one source, the first of these that gives it wins,
