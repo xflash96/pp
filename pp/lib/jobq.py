@@ -635,11 +635,8 @@ def _cards() -> list[dict] | None:
     try:
         out = proc.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
                         "--format=csv,noheader,nounits"], group="own", stdin="none", env="inherit", timeout=10)
-    except FileNotFoundError:
-        CARDS_WHY = "nvidia-smi is not installed"
-        return None
     except OSError as e:
-        CARDS_WHY = f"nvidia-smi: {e}"
+        CARDS_WHY = "nvidia-smi is not installed" if isinstance(e, FileNotFoundError) else f"nvidia-smi: {e}"
         return None
     if out.timed_out:
         CARDS_WHY = "nvidia-smi did not answer in 10s"
