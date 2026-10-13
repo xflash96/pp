@@ -4898,6 +4898,44 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         self.assertEqual(stop["rc"], 127)
         self.assertFalse(os.path.exists(ran), "a command that could not start ran")
 
+    def test_a_code_written_while_the_stop_goes_out_is_that_stops_outcome(self):
+        """A stop decides the reason, and what an exit code is late against is the time that stop went out.
+        That time is read before anything goes out for it, so the window in which the project's stop command
+        is starting belongs to the stop: a container runner writing the code of the container that command
+        ended (137) inside it is that stop's outcome, with the code kept, and not the job's own failure.
+
+        The window is driven by a named step, the start of the project's stop command, so the test says
+        which window it is about instead of hoping a sleep lands in it."""
+        j, w = self.a_job_whose_run_is_live()
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = "true"        # the project's command, whose start is the step below
+            s.save(cur)
+        real, wrote = jobcore.Worker._stop, []
+
+        def the_code_lands_as_the_command_starts(wk, job, cmd):
+            # a file's timestamp is coarser than the clock a stop is recorded with, so the code lands a
+            # moment into the window instead of at its first instant. What puts it inside is the step.
+            time.sleep(0.05)
+            with open(job["rcfile"], "w") as f:
+                f.write("137\n")
+            wrote.append(os.stat(job["rcfile"]).st_mtime)
+            return real(wk, job, cmd)
+        self.a_kill_asks(j, grace=60.0)
+        with mock.patch.object(jobcore.Worker, "_stop", the_code_lands_as_the_command_starts):
+            w.carry_out()
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual(len(wrote), 1)
+        self.assertIsNotNone(stop["sent"])
+        self.assertLessEqual(stop["sent"], wrote[0])    # read before the stop went out, recorded once it had
+        # the run ends with no code of its own, so the code written inside the window is the one that is read
+        proc.signal_group(jobcore._group_handle(jobstore.find(j)), signal.SIGKILL)
+        self.the_run_is_over(j)
+        w.carry_out()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["reason"], rec["rc"]), ("failed", "killed", 137))
+        self.assertIsNone(rec.get("history"), "a job a kill has touched was retried")
+
     def test_a_grace_that_is_up_escalates_once_and_only_once(self):
         """The SIGKILL of a stop whose grace is up goes out once. A worker that ends between the grace being
         up and that signal leaves a stop with no SIGKILL marked, the next worker sends it, and no pass after

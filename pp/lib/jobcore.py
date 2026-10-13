@@ -288,8 +288,12 @@ class Worker:
         job's processes, so a kill, a timeout and a reap never cross.
 
         The signal goes out first and is recorded after, so a record that says a signal went out is one that
-        did, which is all the decision about this job has to go on."""
+        did, which is all the decision about this job has to go on. The time recorded with it is read before
+        it goes out, because that time is what an exit code is late against (I10): a code the attempt wrote
+        while this stop was on its way out is that stop's outcome, and a time read afterwards would leave the
+        window the stop command takes to start reading as the job's own end."""
         sig, mark = (signal.SIGTERM, "sent") if a.do == policy.TERM else (signal.SIGKILL, "kill9")
+        now = time.time()       # before anything goes out for this stop, and recorded once it has
         # the project's command in place of the SIGTERM, where the job carries one. pp's own grace and SIGKILL
         # follow it either way, and a command that could not start sent nothing: pp's own signal goes out for
         # that stop instead, so the job is left no worse off than 0.1.1
@@ -299,7 +303,6 @@ class Worker:
         outcome = "alive" if h is not None else self._signal_group(job, sig)
         if outcome is None or outcome == "gone":
             return          # nothing to signal: its run is starting, or it is over and the next pass says how
-        now = time.time()
         with jobstore.txn() as s:
             cur = s.job(job["id"], must_be=("running",))
             if cur is None or not cur.get("stop"):

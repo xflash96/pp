@@ -219,7 +219,10 @@ def after(stop: dict, rc_at: float | None) -> bool:
     A stop decides the reason: a container runner writes the code of a container the stop command ended (137),
     so without this a kill or a timeout of a container job would read as the job's own failure. The code is
     kept either way, and what it decides is the reason (I10). A stop nothing has gone out for has no time to
-    compare against, so no code is ever late for one."""
+    compare against, so no code is ever late for one.
+
+    The time to compare against is read before the stop goes out and recorded once it has (`Worker._send`),
+    so the window in which a stop command is starting belongs to that stop and not to the job."""
     went = stop.get("sent") or stop.get("kill9")
     return went is not None and rc_at is not None and rc_at >= went
 
