@@ -357,12 +357,10 @@ def find(jid: int) -> dict | None:
     return None
 
 
-
 def run_claim(q: str, jid: int) -> str:
     """The file whose claim one run of job jid holds. Taking it is how a worker says it is starting that job,
     and the job's own wrapper holds it from then on, so a held claim means a run of this job is live."""
     return os.path.join(qroot(q, "jobs"), f"{jid}.run")
-
 
 
 def _forget_job(s: Txn, job: dict) -> None:
@@ -388,7 +386,6 @@ def _forget_job(s: Txn, job: dict) -> None:
             pass
     # its record is gone and its run is over, so nothing holds this claim and this id never takes that name again
     lock.Claim.forget(run_claim(q, jid))
-
 
 
 def _finish(s: Txn, job: dict, state: str, rc: int | None, reason: str | None = None,

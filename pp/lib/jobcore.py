@@ -98,7 +98,6 @@ def _group_handle(j: dict) -> proc.Handle | None:
     return proc.Handle.recorded(j.get("pgid"), j.get("pstart"), group=True)
 
 
-
 class Wait:
     """The wait a worker does between its ticks, and the one thing that shortens it. `waking()` hands one out.
 
@@ -150,7 +149,6 @@ def waking():
         signal.signal(WAKE, was_handler)
         os.close(r)
         os.close(w)
-
 
 
 class Worker:
@@ -540,7 +538,6 @@ def _start_worker(q: str) -> proc.Child:
                           cwd="/", stdout=log, stderr=proc.STDOUT, ready=True)
 
 
-
 # ---- whether a queue's worker is up: one construct -------------------------------------------------
 #
 # Only a worker ever holds a queue's worker claim, and `work()` is the one place that takes it. So two things
@@ -765,7 +762,6 @@ def _settings(read_settings) -> dict:
         return read_settings()
     except Exception as e:
         return {"error": str(e)}
-
 
 
 # ---- watchers: the pull side ----------------------------------------------------------------------

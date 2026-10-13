@@ -361,6 +361,7 @@ def admit(state: dict, seen: dict, settings: dict) -> Pass:
         running.append({**job, "started": settings["now"], "gpu": card})
     return Pass(tuple(starts), blocked)
 
+
 # ---- the worker's own two numbers, and one look at its claim -------------------------------------------
 
 UP = "up"               # a worker holds the claim and has recorded itself
@@ -451,6 +452,7 @@ def select(records: list[dict], selection) -> list[int]:
             hits = [j["id"] for j in records if j.get("tag") == spec]
         out += [jid for jid in sorted(hits) if jid not in out]
     return out
+
 
 # ---- the settings a rule is handed ------------------------------------------------------------------
 
