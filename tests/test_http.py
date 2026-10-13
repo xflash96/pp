@@ -202,6 +202,43 @@ class TestPages(Served):
         c.close()
 
 
+class TestANameThatIsNotUTF8(unittest.TestCase):
+    """A POSIX name is bytes, and one that is not valid UTF-8 (a zip unpacked from another code page, a scraped
+    download) comes back from the filesystem with surrogate escapes. One encoder makes every URL from those
+    bytes, so such a file is listed, linked and served like any other, and one of them anywhere under any tab
+    cannot take down the Recent page the whole machine starts at. What cannot be shown is the text: a page
+    says ? where the bytes are no character."""
+
+    def setUp(self):
+        self.sb = sandbox.enter(self)
+        tab = self.sb.dir("tab")
+        touch(os.path.join(tab, os.fsdecode(b"caf\xe9.md")), "the body\n")
+        touch(os.path.join(tab, "ok.md"), "fine\n")
+        app = pphttp.App(pphttp.Settings(), [("tab", tab)], [], quiet=True)
+        self.server = self.sb.serving(pphttp.make_server(app, "127.0.0.1", 0))
+        self.port = self.server.server_address[1]
+
+    def get(self, path):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", path)
+        r = c.getresponse()
+        body = r.read().decode("utf-8", "replace")
+        c.close()
+        return r.status, body
+
+    def test_it_is_listed_linked_and_served(self):
+        href = "/t/tab/" + urllib.parse.quote(b"caf\xe9.md", safe="")
+        for page in ("/", "/t/tab/"):
+            status, body = self.get(page)
+            self.assertEqual(status, 200, page)
+            self.assertIn(f'href="{href}"', body)
+            self.assertIn("caf?.md", body)                                  # no character to show, so a ?
+        self.assertEqual(self.get(href)[0], 200)
+        self.assertEqual(self.get(href.replace("/t/", "/raw/", 1)), (200, "the body\n"))
+        items = json.loads(self.get("/_pp/recent")[1])["items"]
+        self.assertEqual({x["path"] for x in items}, {"caf?.md", "ok.md"})
+
+
 class TestDiscovery(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

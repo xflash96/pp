@@ -424,7 +424,14 @@ def esc(s) -> str:
 
 
 def q(s: str) -> str:
-    return urllib.parse.quote(s, safe="")
+    """The one encoder for every name that reaches a URL. A POSIX name is bytes, and one that is not valid
+    UTF-8 comes back from the filesystem with surrogate escapes, so what is quoted is the bytes."""
+    return urllib.parse.quote(os.fsencode(s), safe="")
+
+
+def unq(s: str) -> str:
+    """The name a URL segment stands for: `q` the other way round, so a name pp was given round-trips."""
+    return os.fsdecode(urllib.parse.unquote_to_bytes(s))
 
 
 def turl(root: str, segs: list[str], is_dir: bool = False, kind: str = "t") -> str:
@@ -472,7 +479,7 @@ def page(app: App, title: str, active: str | None, body: str, data: dict, src: s
         + (_json_script("pp-src", src) if src is not None else "")
         + f"<script>{JS}</script></body></html>"
     )
-    return doc.encode("utf-8")
+    return doc.encode("utf-8", "replace")        # a name that is no text is shown as ?, and its links still work
 
 
 def crumbs(root: str, segs: list[str], is_dir: bool) -> str:
@@ -671,7 +678,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _json(self, obj, code: int = 200):
-        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace"),
+                   "application/json; charset=utf-8")
 
     def _redirect(self, loc: str):
         self.send_response(301)
@@ -725,8 +733,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/_pp/recent":
                 return self._recent_json(qs)
             if raw[0] in ("t", "raw") and len(raw) >= 2 and raw[1]:
-                root = urllib.parse.unquote(raw[1])
-                segs = [urllib.parse.unquote(s) for s in raw[2:] if s != ""]
+                root = unq(raw[1])
+                segs = [unq(s) for s in raw[2:] if s != ""]
                 if raw[0] == "t":
                     return self._view(root, segs, u.path.endswith("/") and len(raw) > 2, qs)
                 return self._raw(root, segs, qs)
