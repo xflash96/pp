@@ -120,7 +120,7 @@ def _voice(q: str, log=None):
 
     def voice(kind, job, f):
         jid = None if job is None else job["id"]
-        tag = None if job is None else job.get("tag")
+        tag = None if job is None else _name(job)
         if kind == "timeout":
             say(f"timeout {jid} {tag} after {ui.human_duration(float(job['timeout']))}: stopping it")
         elif kind == "again":
@@ -336,6 +336,15 @@ def _dur_flag(unit: str = "s"):
         except ValueError as e:
             raise argparse.ArgumentTypeError(str(e)) from None
     return read
+
+
+def _tag_flag(raw: str) -> str:
+    """--tag's value, checked where it is read. A tag is an argument of `add` and not a setting (section 2),
+    so it has one flag and no key, and `jobpolicy.tag` is its one rule."""
+    try:
+        return policy.tag(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _flag_override(p, row: policy.Setting, says: str) -> None:
@@ -597,9 +606,12 @@ def _tail(src, n: int) -> list[str]:
     return src.read().decode(errors="replace").splitlines()[-n:] if n > 0 else []
 
 
-def default_tag(cmd: list[str]) -> str:
-    """The tag of a job added without --tag."""
-    return shlex.join(cmd)[:40]
+def _name(j: dict) -> str:
+    """How a view names one job: its own name, or the command it runs where it has none.
+
+    A job added without --tag has no name (`jobpolicy.tag`): its id selects it, and what a person reads in
+    that column is the work itself."""
+    return _text(j["tag"]) if j.get("tag") else _text(shlex.join(list(j.get("cmd") or [])), 40)
 
 
 def _text(v, cut: int | None = None) -> str:
@@ -701,7 +713,7 @@ def _gate(a, jobs: list[dict], verb: str, ok: tuple) -> int | None:
         return None
     hits = [j for j in jobs if j["state"] in ok]
     print(f"{verb} {len(hits)} job(s): "
-          + (", ".join(f"{j['id']} {_text(j.get('tag'))}" for j in hits) or "none"))
+          + (", ".join(f"{j['id']} {_name(j)}" for j in hits) or "none"))
     _left([j for j in jobs if j["state"] not in ok])
     if a.dry_run or not hits:
         return 0
@@ -782,9 +794,9 @@ def _section(rows: list[list], tag: int, width: int) -> list[str]:
     """One section of `pp queue status` as its lines: one table, so every row of it lines up, with the column
     at `tag` cut until the widest row fits a terminal `width` wide.
 
-    A job's tag is its command cut to 40 characters unless it was named, so that is the column with something
-    to give; the rest of a row is pp's own, and a row whose other columns alone are wider than the terminal
-    keeps eight characters of tag and runs past the edge. Empty cells at the end of a row are left out, so no
+    That column holds the job's own name, or its command where it has none, so it is the column with
+    something to give; the rest of a row is pp's own, and a row whose other columns alone are wider than the
+    terminal keeps eight characters of it and runs past the edge. Empty cells at the end of a row are left out, so no
     row ends in the padding of a column nothing filled."""
     rows = [_without_empty_tail(r) for r in rows]
     keep = max((ui.width(str(r[tag])) for r in rows), default=0)
@@ -840,7 +852,7 @@ def _ended_line(j: dict | None, jid: int) -> str:
         return f"dropped {jid}"
     word = "done" if j["state"] == "done" else ui.c("FAILED", "red")
     why = f" ({j['reason']})" if j.get("reason") else ""
-    return f"{word} {jid} rc={_rc(j)}{why} {ui.human_duration(j.get('seconds'))}  {_text(j.get('tag'))}"
+    return f"{word} {jid} rc={_rc(j)}{why} {ui.human_duration(j.get('seconds'))}  {_name(j)}"
 
 
 def _rc(j: dict):
@@ -887,9 +899,6 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     cwd = paths.expand(a.cwd) if a.cwd else os.getcwd()
     if not os.path.isdir(cwd):
         ui.die(f"{_PROG} add: no directory {cwd}", 2)
-    if a.tag and re.fullmatch(r"\d+(-\d+)?", a.tag):
-        ui.die(f"{_PROG} add: --tag {a.tag} reads as a job id or a range, so it could not select its jobs; "
-               "use a word", 2)
     # every per-job row, resolved here and nowhere else: the flag, then this project's [queue], then the
     # queue's table, then the row's own default. What they come to goes on the record, so a config edit
     # after this never changes the job
@@ -907,7 +916,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     named = project_name(cwd)
     records = []
     for c in cmds:
-        job = {"queue": q, "tag": a.tag or default_tag(c), "project": named, "cwd": cwd, "cmd": c, "runner": [],
+        job = {"queue": q, "tag": a.tag, "project": named, "cwd": cwd, "cmd": c, "runner": [],
                "shell_env": shell_env, "needs": needs, "owner": owner, "attempt": 1,
                **{r.on_record: gave[r.name] for r in JOB_ROWS if r.on_record != "needs"}}
         if prepare_job:
@@ -1047,7 +1056,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
                 extra = " ".join(x for x in (_attempt_str(j),
                                              f"STOPPING ({_text(j['stop']['by'])})" if j.get("stop") else "",
                                              _latest_note(j)) if x)
-                row = [j["id"], _text(j.get("tag")), f"[{_text(j.get('project'))}]",
+                row = [j["id"], _name(j), f"[{_text(j.get('project'))}]",
                        ui.human_duration(now - (j.get("started") or now)),
                        _needs_str(j.get("needs")) + (f" on GPU{j['gpu']}" if j.get("gpu") is not None else "")]
                 rows.append(row + [extra])
@@ -1068,7 +1077,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
                 nb = j.get("not_before") or 0
                 extra = " ".join(x for x in (_attempt_str(j), f"retry in {_in_delay(nb, now)}" if nb > now else "",
                                              ui.c("waiting: " + why, "yellow") if why else "", _latest_note(j)) if x)
-                row = [j["id"], f"p{j.get('prio')}", _text(j.get("tag")), f"[{_text(j.get('project'))}]",
+                row = [j["id"], f"p{j.get('prio')}", _name(j), f"[{_text(j.get('project'))}]",
                        _needs_str(j.get("needs"))]
                 rows.append(row + [extra])
             print("\n".join(_section(rows, 2, width)))
@@ -1080,13 +1089,13 @@ def cmd_status(a, scope: list[str] | None) -> int:
                 print(ui.c("  a worker is starting; it launches them", "yellow"))
         if data["held"]:
             print(ui.c("held", "bold"))
-            rows = [[j["id"], f"p{j.get('prio')}", _text(j.get("tag")), f"[{_text(j.get('project'))}]",
+            rows = [[j["id"], f"p{j.get('prio')}", _name(j), f"[{_text(j.get('project'))}]",
                      _latest_note(j)] for j in data["held"]]
             print("\n".join(_section(rows, 2, width)))
         if s["recent"]:
             print(ui.c("recent", "bold"))
             rows = [[j["id"], "done" if j["state"] == "done" else ui.c("FAILED", "red"), f"rc={_rc(j)}",
-                     ui.human_duration(j.get("seconds")), _text(j.get("tag")), f"[{_text(j.get('project'))}]",
+                     ui.human_duration(j.get("seconds")), _name(j), f"[{_text(j.get('project'))}]",
                      ui.human_age(j.get("ended"), now) + (f"  {j['reason']}" if j.get("reason") else "")
                      + (f"  {_latest_note(j)}" if j.get("notes") else "")] for j in s["recent"][:a.n]]
             print("\n".join(_section(rows, 4, width)))
@@ -1122,7 +1131,7 @@ def cmd_show(a) -> int:
         head += f"  rc={_rc(j)}" + (f" ({j['reason']})" if j.get("reason") else "")
     print(ui.c(head, "bold"))
     owner = j.get("owner")
-    rows = [["tag", _text(j.get("tag"))], ["project", _text(j.get("project"))], ["cwd", _text(j.get("cwd"))],
+    rows = [["tag", _text(j.get("tag")) or "-"], ["project", _text(j.get("project"))], ["cwd", _text(j.get("cwd"))],
             ["command", _text(shlex.join(list(j.get("runner") or []) + list(j.get("cmd") or [])))],
             ["needs", _needs_str(j.get("needs")) or "slots 1"], ["prio", j.get("prio")],
             ["attempt", f"{j.get('attempt', 1)}/{int(j.get('retries') or 0) + 1}"
@@ -1265,7 +1274,7 @@ def cmd_kill(a) -> int:
             continue
         if out["did"] == "killed":
             # it went back to its queue for a retry: no process exists, so that is where it ended
-            print(f"killed {jid} (it was {out['was']}, with no process to stop)  {_text(j.get('tag'))}")
+            print(f"killed {jid} (it was {out['was']}, with no process to stop)  {_name(j)}")
             continue
         asked.append((j, out["t"], grace))
     for q in sorted({j["queue"] for j, _t, _g in asked}):
@@ -1338,7 +1347,7 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
         # went out after, not the one this kill asked for
         how = (f"SIGKILL after {float(stop.get('grace') or 0):g}s" if stop.get("kill9")
                else "stopped on SIGTERM")
-        print(f"killed {jid} ({how})  {_text(cur.get('tag'))}")
+        print(f"killed {jid} ({how})  {_name(cur)}")
     return 0
 
 
@@ -1364,7 +1373,7 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
             ui.warn(f"{_PROG}: job {j['id']} is {cur['state']}; {verb} works on {'/'.join(src)} jobs{hint}")
             rc = 2
             continue
-        print(f"{done} {j['id']}  {_text(j.get('tag'))}")
+        print(f"{done} {j['id']}  {_name(j)}")
         if dst == "queued":
             started.add(j["queue"])
     _left(skipped)
@@ -1450,7 +1459,7 @@ def _event(prev: dict | None, j: dict | None, jid: int) -> str | None:
     st, k, was = j["state"], j.get("attempt", 1), prev["state"]
     if (st, k) == (was, prev.get("attempt", 1)):
         return None
-    tag = _text(j.get("tag"))
+    tag = _name(j)
     started = f"{jid} started{' ' + _attempt_str(j) if _attempt_str(j) else ''}  {tag}"
     lines = [f"{jid} released  {tag}"] if was == "held" and st != "held" else []
     if st in jobstore.ENDED:
@@ -1672,8 +1681,9 @@ def _parser(prog: str, doc: str, add_args=None):
         return p
 
     p = sp("add", help="queue a command (after --)")
-    p.add_argument("--tag", help="a name to select it by, alone or with the other jobs that share it "
-                                 "(default: the command, cut to 40 characters)")
+    p.add_argument("--tag", type=_tag_flag,
+                   help="a name to select it by, alone or with the other jobs that share it: at most 64 of "
+                        "letters, digits and . _ - : (default: none, and its id names it)")
     for row in JOB_ROWS:            # one flag per per-job row, from the one declaration
         _flag(p, row)
     p.add_argument("--cwd", help="run there (default: here); also picks the project")

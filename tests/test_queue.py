@@ -1550,13 +1550,16 @@ class TestHooks(QueueCase):
 
 class TestShowNote(QueueCase):
     def test_a_jobs_own_text_cannot_redraw_the_terminal(self):
-        """A queued command, its tag, a note and the job's own output are all text from elsewhere, and a
-        reader of `pp queue` may be an agent whose terminal is its own output. Every place pp prints a job's
-        text puts it through ui.printable, so an escape sequence in it is shown rather than acted on."""
+        """A queued command, a note and the job's own output are all text from elsewhere, and a reader of
+        `pp queue` may be an agent whose terminal is its own output. Every place pp prints a job's text puts
+        it through ui.printable, so an escape sequence in it is shown rather than acted on. A job's name is
+        letters, digits and . _ - : alone, so no escape ever reaches a view through it."""
         esc = "\x1b[2J"             # clear the screen
         osc = "\x1b]0;PWNED\x07"    # retitle the terminal, which the CSI pattern alone does not catch
         ris = "\x1bc"               # reset it
-        rc, out, err = self.call("add", "--no-start", "--cwd", self.work, "--tag", "tag" + esc, "--",
+        self.assertEqual(self.call("add", "--no-start", "--cwd", self.work, "--tag", "tag" + esc,
+                                   "--", "true")[0], 2)
+        rc, out, err = self.call("add", "--no-start", "--cwd", self.work, "--",
                                  "sh", "-c", f"printf '{osc}oops\\n{ris}'; echo start{esc}; exit 1")
         j = int(out.split()[-1])
         self.assertEqual(rc, 0, err)
@@ -1568,7 +1571,7 @@ class TestShowNote(QueueCase):
                 _rc, out, err = self.call(*argv)
                 self.assertNotIn("\x1b", out + err, f"{argv[0]} printed an escape sequence of the job's")
                 self.assertIn("\\x1b", out + err, f"{argv[0]} printed none of the job's text")
-        self.assertEqual(jobstore.find(j)["tag"], "tag" + esc)      # the record keeps what was asked for
+        self.assertIsNone(jobstore.find(j)["tag"])      # it was added without --tag, so it has no name
 
     def test_note_and_show(self):
         j = self.add("--tag", "noted", "--timeout", "90s", cmd="echo out-line; exit 2")
@@ -1659,13 +1662,13 @@ class TestStatusWait(QueueCase):
         fits, and the queue's counts move to a line of their own where the header does not fit beside them.
         A row that wrapped lost its shape altogether, with its last two characters on a line of their own."""
         self.config("slots = 1")
-        d = self.add("--tag", "d" * 70, cmd="echo done")
+        d = self.add("--tag", "d" * 64, cmd="echo done")
         w = self.as_the_worker()                    # a worker is up, so the header carries its pid
         self.run_until(w, lambda: self.state(d) == "done")
-        a = self.add("--tag", "a" * 70, cmd="echo this-is-a-fairly-ordinary-long-output-line-of-a-job; sleep 30")
+        a = self.add("--tag", "a" * 64, cmd="echo this-is-a-fairly-ordinary-long-output-line-of-a-job; sleep 30")
         w.tick()
-        self.add("--tag", "q" * 70, cmd="sleep 30")
-        self.add("--hold", "--tag", "h" * 70, cmd="sleep 30")
+        self.add("--tag", "q" * 64, cmd="sleep 30")
+        self.add("--hold", "--tag", "h" * 64, cmd="sleep 30")
         journey.until(lambda: jobq._last_line(jobstore.find(a)["log"], 200), timeout=10, what="the job's output")
         self.sb.setenv(COLUMNS="80")
         rc, out, _ = self.call("status")
@@ -3536,6 +3539,26 @@ class TestThePolicyTables(unittest.TestCase):
                         want = reason or (f"exit {rc}" if event == "failed" and rc is not None else "")
                         self.assertEqual(got["PP_QUEUE_REASON"], want)
         self.assertEqual(rows, 12)
+
+    # -- tag: what a job may be named --------------------------------------------------------------------
+    def test_what_a_job_may_be_named(self):
+        """A name is at most 64 characters of letters, digits and . _ - : , holds no `..`, is not `.` alone,
+        and never reads as an id or a range. Every class of value, and the boundary of the length."""
+        rows = [("a word", "c3_recall", True), ("dots, colons and dashes", "c3.recall:s0-1", True),
+                ("64 characters", "a" * 64, True), ("65 characters", "a" * 65, False),
+                ("one character", "a", True), ("nothing", "", False),
+                ("a space", "c3 recall", False), ("a slash", "c3/recall", False),
+                ("an escape sequence", "c3\x1b[2J", False), ("a newline", "c3\n", False),
+                ("two dots", "c3..recall", False), ("two dots at the end", "c3..", False),
+                ("a dot on its own", ".", False), ("a dot with a word", ".c3", True),
+                ("an id", "12", False), ("a range", "12-15", False),
+                ("a number in a word", "c3-15", True), ("not a string", 12, False)]
+        for what, value, ok in rows:
+            with self.subTest(what):
+                if ok:
+                    self.assertEqual(jobpolicy.tag(value), value)
+                else:
+                    self.assertRaises(ValueError, jobpolicy.tag, value)
 
     # -- select: the forms a selection takes -----------------------------------------------------------------
     def test_which_jobs_a_selection_names(self):

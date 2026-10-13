@@ -38,8 +38,9 @@ Agents: run `pp queue wait ID` in the background (or `pp queue watch ID` under a
 how the job ended, without polling and without anything typed into your terminal; `add` prints this hint to
 an agent.
 
-IDs are numbers, ranges (12-15) or a tag (add --tag NAME; without one, the tag is the command, cut to 40
-characters). -q narrows a selection to one queue. A job named by its id must suit the verb, or it is an error; a
+IDs are numbers, ranges (12-15) or a tag (add --tag NAME: at most 64 of letters, digits and . _ - :). A job
+added without --tag has no tag, and its id names it. -q narrows a selection to one queue. A job named by its
+id must suit the verb, or it is an error; a
 range, or a tag several jobs share, leaves the jobs it does not suit as they are, and kill and drop show such a
 selection and ask first (-y: do not ask, -n: only show). Lower --prio runs first (default 10), ties by id. Each
 queue is strict head-of-line unless its own backfill is on, so a big job is never starved by small

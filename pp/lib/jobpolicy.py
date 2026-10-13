@@ -443,6 +443,25 @@ def hook_env(job: dict, event: str) -> dict:
 
 # ---- which jobs a selection names ----------------------------------------------------------------------
 
+NAME = re.compile(r"[A-Za-z0-9._:-]{1,64}")     # what a job's own name may be made of, and how long
+
+
+def tag(v: str) -> str:
+    """A job's name, as it is read on the command line: at most 64 characters of letters, digits and . _ - :,
+    never holding `..`, never `.` alone, and never a word that reads as an id or a range.
+
+    A name that read as an id could not select its own jobs, and one holding `..` could not be put in a path
+    (section 6's `{tag}`). A job added without --tag has no name: its id selects it and its command is what a
+    view shows for it."""
+    if not isinstance(v, str) or not NAME.fullmatch(v):
+        raise ValueError(f"'{str(v)[:80]}': a name of at most 64 letters, digits, '.', '_', '-' and ':'")
+    if ".." in v or v == ".":
+        raise ValueError(f"'{v}': a name holds no '..' and is not '.' on its own")
+    if kind(v) != "tag":
+        raise ValueError(f"'{v}' reads as a job id or a range, so it could not select its jobs; use a word")
+    return v
+
+
 def kind(spec: str) -> str:
     """Which form of the selection grammar this is: an id, a range (12-15), or a tag matched whole."""
     if re.fullmatch(r"\d+-\d+", spec):
