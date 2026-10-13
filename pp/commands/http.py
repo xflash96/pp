@@ -23,8 +23,8 @@ Config: ~/.config/pp/config.toml (every key optional)
     exclude_dirs = ["target"]       # folders Recent and discovery skip (still listed and served; deny hides),
                                     #   ADDED to the defaults (node_modules .git .venv __pycache__ dist build ...)
     deny = ["*.secret"]             # ADDED to the defaults (.env .env.* *.pem *.key *.p12 *.pfx id_rsa* id_ed25519*
-                                    #   id_ecdsa* id_dsa* *.sqlite credentials* .netrc .git-credentials .pgpass
-                                    #   .pypirc .npmrc); never listed, never served, hidden or not
+                                    #   id_ecdsa* id_dsa* *.sqlite credentials* .netrc .git .git-credentials
+                                    #   .pgpass .pypirc .npmrc); never listed, never served, hidden or not
     follow_symlinks = false         # true: serve symlinks that leave their root
     hosts = ["box.tailnet.ts.net"]  # Host names a proxy in front may pass through (loopback names always work)
 
@@ -81,7 +81,7 @@ EXCLUDE_DIRS = ["node_modules", ".git", ".venv", "venv", "__pycache__", ".cache"
                 "build", ".shadow-cljs", ".cpcache", ".mypy_cache", ".pytest_cache", ".tox", "target", ".next",
                 "site-packages", "bazel-out", "bazel-bin", "bazel-testlogs"]
 DENY = [".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", "*.p12", "*.pfx",
-        "*.sqlite", "credentials*", ".netrc", ".git-credentials", ".pgpass", ".pypirc", ".npmrc"]
+        "*.sqlite", "credentials*", ".netrc", ".git", ".git-credentials", ".pgpass", ".pypirc", ".npmrc"]
 
 CDNJS = "https://cdnjs.cloudflare.com/ajax/libs"
 CDN = {

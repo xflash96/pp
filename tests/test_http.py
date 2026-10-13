@@ -42,6 +42,7 @@ class Served(unittest.TestCase):
         touch(os.path.join(cls.A, ".hidden", "y.md"), "dot dir", now)
         touch(os.path.join(cls.A, ".notes.md"), "dot file", now - 50)
         touch(os.path.join(cls.A, ".env"), "SECRET=1")
+        touch(os.path.join(cls.A, ".git", "config"), '[remote "origin"]\n\turl = https://u:tok@host.invalid/x\n')
         touch(os.path.join(cls.A, "code.py"), "print('hi')\n")
         touch(os.path.join(cls.A, "page.html"), "<h1>x</h1>")
         touch(os.path.join(cls.A, "筆記 one.md"), "unicode body", now - 100)
@@ -166,6 +167,14 @@ class TestPages(Served):
         self.assertEqual(st, 200)
         self.assertNotIn(".env", html)
         for p in ("/t/A/.env", "/t/A/.env?hidden=1", "/raw/A/.env", "/raw/A/envlink.txt", "/_pp/stat?root=A&path=.env"):
+            self.assertEqual(self.get(p)[0], 404, p)
+
+    def test_a_git_directory_is_neither_listed_nor_served(self):
+        """A repository holds every byte it ever committed, so a secret the deny list refuses by name is in
+        .git as well, and a remote's URL there can carry a token. It is a deny default, so no endpoint reads
+        it; discovery still finds a project by its .git, which it tests for by name."""
+        self.assertNotIn(".git", self.get("/t/A/?hidden=1")[2])
+        for p in ("/t/A/.git/", "/t/A/.git/config", "/raw/A/.git/config", "/_pp/stat?root=A&path=.git"):
             self.assertEqual(self.get(p)[0], 404, p)
 
     def test_hidden_toggle(self):
