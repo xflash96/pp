@@ -146,8 +146,9 @@ Containers, and anything else a runner starts elsewhere
     job's grace (--grace, 10s by default): the SIGKILL follows the grace whatever the stop command is doing, and a -t
     of the whole grace takes the client with it, leaving the container it was waiting for behind. The command is read
     when the job is queued and kept on the record, so a worker that comes back carries out the same stop on the same
-    container. A --no-runner job's stop is its own process group whatever the project says, and nothing in pp names
-    docker: a runner and a stop are commands.
+    container. A --no-runner job's stop is its own process group whatever the project says, so a job that starts a
+    container of its own names it $PP_QUEUE_CONTAINER for a stop to reach it; nothing in pp names docker: a runner and
+    a stop are commands.
 
 Settings: one default, one key, one flag, one order
     Every setting has a built-in default. Where one has more than one source, the first of these that gives it wins,
