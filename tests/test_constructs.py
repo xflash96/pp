@@ -143,6 +143,7 @@ def _spawn(node, path, qual):
 
 
 _STORE = "pp/lib/jobstore.py"       # the store's own code, which is the `job` rule's home
+_CORE = "pp/lib/jobcore.py"         # the worker, the claims and the processes: the core, and three rules' home
 _JOB_FILES = {"_jpath", "_job_ids", "_read_job", "_write_job", "_stage_job", "_remove_job"}
 _JOB_MODULES = ("jobq", "jobstore", "store")    # the store's module, however the file that reads it names it
 _RECORD_FILE = {"open", "os.open", "os.replace", "os.remove", "os.rename", "os.unlink"}
@@ -255,9 +256,7 @@ def _claim_file(node, path, qual):
 
 
 _CLAIM_READS = ("worker",)          # the read of the worker claim's holder: the construct's own, nobody's else
-# the construct's own code in pp/lib/jobq.py, and `work`, which is the one place that takes the claim
-_WORKER_CLAIM_HOME = {"worker", "worker_now", "work"}
-_THROUGH_JOBQ = _through({"jobq": _CLAIM_READS})
+_THROUGH_THE_CORE = _through({"jobq": _CLAIM_READS, "jobcore": _CLAIM_READS})
 
 
 def _names_the_worker_claim(node) -> bool:
@@ -269,34 +268,31 @@ def _names_the_worker_claim(node) -> bool:
 
 
 def _the_worker_claim(node, path, qual):
-    """A queue's worker claim: `work()` takes it, and the construct in pp/lib/jobq.py reads its holder.
-    Nothing else does either. A verb asks the construct and prints from the one answer it gets, so no verb
-    acts on a look it took outside the scope that acted, and only a worker ever holds the claim
+    """A queue's worker claim: `work()` takes it, and the construct beside it in the core reads its holder.
+    Nothing outside the core does either. A verb asks the core and prints from the one answer it gets, so no
+    verb acts on a look it took outside the scope that acted, and only a worker ever holds the claim
     (CONTRIBUTING.md, "Who stops a job").
 
-    Three homes: `worker`, which reads the holder, `worker_now`, which says what the holder is, and `work`,
-    the worker's own loop, which takes the claim.
+    The home is the core's own file, pp/lib/jobcore.py: `worker` reads the holder, `worker_now` says what
+    that holder is, and `work` takes the claim.
 
-    Every way in counts, as for a job's record: the read called by name in jobq.py, through the module however
-    that is spelled, imported out of it, under an alias, through the module renamed, and as a string in a
-    getattr. A take or a read through lock.Claim counts too, where the path it is given is a worker claim's:
-    `lock.Claim.holder(_worker_claim(q))` is the same look taken by hand, and a path spelled out is the same
-    claim."""
-    if path == "pp/lib/jobq.py" and qual.split(".")[0] in _WORKER_CLAIM_HOME:
-        return False
+    Every way in counts, as for a job's record: the read called by name in the core, through the module
+    however that is spelled, imported out of it, under an alias, through the module renamed, and as a string
+    in a getattr. A take or a read through lock.Claim counts too, where the path it is given is a worker
+    claim's: `lock.Claim.holder(_worker_claim(q))` is the same look taken by hand, and a path spelled out is
+    the same claim."""
     if isinstance(node, ast.Name):
-        return path == "pp/lib/jobq.py" and node.id in _CLAIM_READS
+        return node.id in _CLAIM_READS
     if isinstance(node, ast.Call) and _dotted(node.func).split(".")[-2:-1] == ["Claim"]:
         args = list(node.args) + [k.value for k in node.keywords]
         if any(_names_the_worker_claim(a) for a in args):
             return True
-    return _THROUGH_JOBQ(node, path, qual)
+    return _THROUGH_THE_CORE(node, path, qual)
 
 
-_SIGNAL_FILES = ("pp/lib/proc.py", "pp/commands/kill.py")
-# the two functions in pp/lib/jobq.py that are not the Worker's own code: `cmd_worker`, which signals the
-# worker itself for `worker stop`, and `work`, the worker's own loop, which is the one caller of a tick
-_SIGNALS_THE_WORKER = ("cmd_worker", "work")
+# where a job's signal and its reap live: proc defines the signalling, `pp kill` signals the processes a
+# person names, and the core is the queue's worker, which is the one actor that signals that queue's jobs
+_SIGNAL_FILES = ("pp/lib/proc.py", "pp/commands/kill.py", _CORE)
 
 
 # the Worker's own way into a job's signal and its reap: the tick that runs a pass, the pass itself, the step
@@ -316,19 +312,16 @@ def _job_process(node, path, qual):
     methods, and nothing else does. A verb writes a stop on the job and wakes that worker, so one actor ends
     a job and records how it ended (CONTRIBUTING.md, "Who stops a job").
 
-    Five homes under `pp/`, and no sixth. `pp/lib/proc.py` defines the signalling. `pp/commands/kill.py` is
-    `pp kill`, which signals the processes a person names. The Worker class in `pp/lib/jobq.py` is where a
-    job's signal and its reap live: `carry_out` is the worker's own pass over its running jobs, and the wake
-    a verb sends a worker is `Worker.wake`. `cmd_worker` is the fourth: `worker stop` signals the worker
-    itself, never a job. `work` is the fifth: the worker's own loop is the one caller of `Worker.tick`.
+    Three homes under `pp/`, and no fourth. `pp/lib/proc.py` defines the signalling. `pp/commands/kill.py`
+    is `pp kill`, which signals the processes a person names. `pp/lib/jobcore.py` is the queue's worker: the
+    Worker class is where a job's signal and its reap live, `carry_out` is the worker's own pass over its
+    running jobs, the wake a verb sends a worker is `Worker.wake`, `worker_stop` signals the worker itself,
+    and `work` is the one caller of `Worker.tick`. So a verb that would signal a job, or the worker, goes
+    through the core's API instead, which is the boundary this rule holds.
 
     Every way in counts, as for a job's record: the function through the module, out of an import, under an
     alias, through the module renamed, and as a string in a getattr. A Worker method reached on anything but
     `self` is one of those ways, so another class's method of the same name is not."""
-    if path in _SIGNAL_FILES:
-        return False
-    if path == "pp/lib/jobq.py" and qual.split(".")[0] in ("Worker",) + _SIGNALS_THE_WORKER:
-        return False
     if isinstance(node, ast.Name):
         return _signals_a_job(node.id)
     if isinstance(node, ast.Attribute):
@@ -592,11 +585,11 @@ RULES = {
     "alive": Rule("judges a process alive by its pid: a claim or a handle does that",
                   _through({"proc": ("alive",)}), ("pp",)),
     "job-process": Rule("signals or reaps a job's processes: the queue's worker does that",
-                        _job_process, ("pp",)),
+                        _job_process, ("pp",), home=_SIGNAL_FILES),
     "claim": Rule("opens a claim's file itself: lock.Claim does that", _claim_file, ("pp", "tests"),
                   home=("pp/lib/lock.py",)),
     "worker-claim": Rule("takes a queue's worker claim or reads its holder: work() takes it, and one construct "
-                         "reads it", _the_worker_claim, ("pp",)),
+                         "reads it", _the_worker_claim, ("pp",), home=(_CORE,)),
     "by-name": Rule("decides on a served file by its name: act on the open file", _by_name_in_a_request, ("pp",)),
     "sleep": Rule("sleeps in a test: wait for the state instead", _through({"time": ("sleep",)}), ("tests",),
                   home=("tests/journey.py",)),
@@ -632,6 +625,7 @@ KNOWN: dict[str, set[str]] = {
 # for the child, and a second store scope would wait for a lock this one holds.
 _SLOW_IN_A_TXN = ("spawn", "run", "git", "git_child", "signal_and_wait", "reading", "_cards", "sleep",
                   "txn", "listing")
+_OPENS_A_TXN = (_STORE, _CORE)      # the two files that open a scope of the store's transaction
 
 # The decision about a job, and the helpers it is made of: pure, so the table that covers every combination
 # of the facts needs no process, no thread and no clock (pp/lib/jobpolicy.py, `decide`).
@@ -654,14 +648,15 @@ class TestContracts(unittest.TestCase):
         """`txn` holds the one store lock, so every reader of every queue waits for the scope. A probe,
         nvidia-smi, a process start, a sleep or a second store scope inside one would hold them all."""
         bad = []
-        for qual, node in _walk("pp/lib/jobq.py"):
-            if not isinstance(node, ast.With):
-                continue
-            if not any(isinstance(i.context_expr, ast.Call) and _last(_dotted(i.context_expr.func)) == "txn"
-                       for i in node.items):
-                continue
-            bad += [f"pp/lib/jobq.py:{line} ({qual}) {name}" for stmt in node.body
-                    for line, name in _calls_under(stmt) if _last(name) in _SLOW_IN_A_TXN]
+        for path in _OPENS_A_TXN:
+            for qual, node in _walk(path):
+                if not isinstance(node, ast.With):
+                    continue
+                if not any(isinstance(i.context_expr, ast.Call) and _last(_dotted(i.context_expr.func)) == "txn"
+                           for i in node.items):
+                    continue
+                bad += [f"{path}:{line} ({qual}) {name}" for stmt in node.body
+                        for line, name in _calls_under(stmt) if _last(name) in _SLOW_IN_A_TXN]
         self.assertEqual(bad, [], "these can block, and a reader of any queue waits for the scope")
 
     def test_the_decision_reaches_no_clock_store_or_process(self):
@@ -709,12 +704,17 @@ def _in_a_txn(tree) -> list:
 
 def _reached(tree, nodes: list) -> list:
     """(line, the dotted callee) for every call these nodes make, and for every call made by a function of
-    this tree that they reach. A function is followed once, so two that call each other end the walk."""
+    this tree that they reach. A function is followed once, so two that call each other end the walk.
+
+    A call is followed into this file where it names a function of this file: a bare name, or one on `self`.
+    A call through another module is not, since a name it happens to share with one here is another
+    function (`lock.Claim.forget` and the store's own `forget`)."""
     fns, out, todo, seen = _functions(tree), [], list(nodes), set()
     while todo:
         for line, name in _calls_under(todo.pop()):
             out.append((line, name))
-            fn = fns.get(_last(name))
+            root = name.split(".")[0]
+            fn = fns.get(_last(name)) if root in (name, "self") else None
             if fn is not None and fn.name not in seen:
                 seen.add(fn.name)
                 todo.append(fn)
@@ -732,11 +732,13 @@ class TestWhatAScopeAndADecisionReach(unittest.TestCase):
     def test_nothing_slow_runs_inside_the_transaction(self):
         """`txn` holds the one store lock, so every reader of every queue waits for the scope. Nothing it
         reaches may block: a probe, nvidia-smi, a process start, a sleep or a second scope."""
-        tree = _source("pp/lib/jobq.py")
-        inside = _in_a_txn(tree)
-        self.assertGreater(len(inside), 0, "no scope of the store's transaction was found to read")
-        bad = [f"pp/lib/jobq.py:{line} {name}" for line, name in _reached(tree, inside)
-               if _last(name) in _SLOW_IN_A_TXN]
+        bad = []
+        for path in _OPENS_A_TXN:
+            tree = _source(path)
+            inside = _in_a_txn(tree)
+            self.assertGreater(len(inside), 0, f"{path} opens no scope of the store's transaction")
+            bad += [f"{path}:{line} {name}" for line, name in _reached(tree, inside)
+                    if _last(name) in _SLOW_IN_A_TXN]
         self.assertEqual(bad, [], "these can block, and a reader of every queue waits for the scope")
 
     def test_the_decision_and_every_helper_it_reaches_are_pure(self):
@@ -812,7 +814,7 @@ class TestConstructs(unittest.TestCase):
                  "environ": ("os.environ['X'] = '1'", "del os.environ['X']", "os.environ.pop('X', None)",
                              "os.environ.update(env)", "os.environ.setdefault('X', '1')",
                              "mock.patch.dict(os.environ, env)", "mock.patch.dict('os.environ', env)"),
-                 "worker-claim": ("jobq.worker(q)", "lock.Claim.holder(_worker_claim(q))",
+                 "worker-claim": ("jobcore.worker(q)", "lock.Claim.holder(_worker_claim(q))",
                                   "lock.Claim.take(os.path.join(qroot(q), 'worker.lock'), rec)"),
                  "claim": ("open(_worker_claim(q))", "paths.write_json(run_claim(q, jid), rec)",
                            "p = os.path.join(qroot(q), 'worker.lock')",
@@ -987,7 +989,7 @@ class TestConstructs(unittest.TestCase):
                     "getattr(proc, 'signal_group')(h, 15)",     # the name as a string
                     "signal_group(h, 15)",                      # the function on its own, once imported
                     "Worker(q).carry_out()",                    # and the Worker's own, every way too
-                    "jobq.Worker(q).carry_out()",
+                    "jobcore.Worker(q).carry_out()",
                     "w.carry_out()",
                     "again = w.carry_out",
                     "getattr(w, 'carry_out')()",
@@ -995,24 +997,18 @@ class TestConstructs(unittest.TestCase):
                     "w._send(j, a)",
                     "w._signal_group(j, 15)",
                     "w.tick()",                             # one tick does the whole of the reserved work
-                    "jobq.Worker(q).tick()",
+                    "jobcore.Worker(q).tick()",
                     "getattr(w, 'tick')()")
         for line in bypasses:
             for path in ("pp/lib/jobq.py", "pp/commands/queue.py"):
                 with self.subTest(line=line, path=path):
                     self.assertTrue(any(RULES["job-process"].match(n, path, "cmd_kill")
                                         for n in ast.walk(ast.parse(line))))
-        # and none of them counts in the four homes: proc defines the signalling, `pp kill` signals the
-        # processes a person names, the Worker's own methods are the worker's own pass over its jobs, and
-        # `worker stop` signals the worker itself
-        for path, qual in (("pp/lib/proc.py", "signal_group"), ("pp/commands/kill.py", "cmd_kill"),
-                           ("pp/lib/jobq.py", "Worker._step"), ("pp/lib/jobq.py", "Worker._send"),
-                           ("pp/lib/jobq.py", "Worker.carry_out"), ("pp/lib/jobq.py", "Worker.wake"),
-                           ("pp/lib/jobq.py", "cmd_worker"), ("pp/lib/jobq.py", "work")):
-            for line in bypasses:
-                with self.subTest(path=path, qual=qual, line=line):
-                    self.assertFalse(any(RULES["job-process"].match(n, path, qual)
-                                         for n in ast.walk(ast.parse(line))))
+        # and none of them is reported in the three homes: proc defines the signalling, `pp kill` signals
+        # the processes a person names, and the core is the worker's own pass over its jobs, the stop of a
+        # worker and the loop that runs a tick
+        self.assertEqual(RULES["job-process"].home, set(_SIGNAL_FILES))
+        self.assertFalse({x.split(":")[0] for x in RULES["job-process"].sites()} & set(_SIGNAL_FILES))
         for ok in ("from pp.lib import proc", "from . import proc", "proc.read(pid)", "signal.signal(15, h)",
                    "p.wait()", "getattr(proc, 'read')(pid)", "Worker.wake(w.handle)",
                    "self._send(404, body, 'text/html')"):     # another class's method of the same name
@@ -1020,26 +1016,21 @@ class TestConstructs(unittest.TestCase):
                 self.assertFalse(any(RULES["job-process"].match(n, "pp/commands/queue.py", "f")
                                      for n in ast.walk(ast.parse(ok))))
 
-    def test_the_five_homes_of_a_jobs_signal_are_the_ones_that_signal(self):
-        """Three of this rule's homes are functions of pp/lib/jobq.py, not whole files, so they are checked
-        here rather than in `test_every_home_does_the_thing`. Each of the five does call one of these, and
-        `_job_process` above says what the five are. Inside the Worker, `_signal_group` is where a signal to
-        a job goes out, `wake` signals a worker, as `worker stop` does, and `work` is where a tick is run.
-
-        The home sets themselves are pinned here, so letting the rule off a sixth place fails this test."""
-        self.assertEqual(set(_SIGNAL_FILES), {"pp/lib/proc.py", "pp/commands/kill.py"})
-        self.assertEqual(set(_SIGNALS_THE_WORKER), {"cmd_worker", "work"})
+    def test_the_three_homes_of_a_jobs_signal_are_the_ones_that_signal(self):
+        """The home set itself is pinned here, so letting the rule off a fourth file fails this test, and
+        each of the three is read for what it is let off for. In the core, `_signal_group` is where a signal
+        to a job goes out, `wake` signals a worker, `worker_stop` stops one, and `work` is where a tick is
+        run; nothing outside the core does any of it, which is what the rule holds."""
+        self.assertEqual(set(_SIGNAL_FILES), {"pp/lib/proc.py", "pp/commands/kill.py", _CORE})
         did: dict[str, list[str]] = {}
-        for path in ("pp/lib/proc.py", "pp/commands/kill.py", "pp/lib/jobq.py"):
+        for path in _SIGNAL_FILES:
             for qual, node in _walk(path):
                 if _job_process(node, "pp/x.py", "f"):      # the same node, read outside every home
                     did.setdefault(path, []).append(qual)
         self.assertTrue(did.get("pp/lib/proc.py"), "proc no longer signals: take it off the rule's homes")
         self.assertTrue(did.get("pp/commands/kill.py"), "`pp kill` no longer signals: take it off the homes")
-        tops = {q.split(".")[0] for q in did.get("pp/lib/jobq.py", [])}
-        self.assertEqual(tops, {"Worker", "cmd_worker", "work"})
-        for method in ("Worker._signal_group", "Worker.wake"):
-            self.assertIn(method, did["pp/lib/jobq.py"])
+        for method in ("Worker._signal_group", "Worker.wake", "worker_stop", "work"):
+            self.assertIn(method, did[_CORE])
 
     def test_the_worker_claim_rule_sees_every_way_to_the_claim(self):
         """A second look at a queue's worker claim, and a second holder of it, are what the one construct
@@ -1047,52 +1038,40 @@ class TestConstructs(unittest.TestCase):
         module, the module renamed, the read imported by name, an alias of it, the name as a string, the bare
         name in the file that defines it, and a take or a read through lock.Claim with a worker claim's path,
         spelled out as well as from the helper."""
-        bypasses = ("jobq.worker(q)",                           # the read through the module
-                    "from pp.lib.jobq import worker",           # out of it, into any file
-                    "from pp.lib.jobq import worker as live",
-                    "from pp.lib import jobq as q",             # the module renamed: q.worker is hidden
-                    "import pp.lib.jobq as q",
-                    "ask = jobq.worker",                        # an alias of it
-                    "getattr(jobq, 'worker')(q)",               # the name as a string
+        bypasses = ("jobcore.worker(q)",                        # the read through the module
+                    "from pp.lib.jobcore import worker",        # out of it, into any file
+                    "from pp.lib.jobcore import worker as live",
+                    "from pp.lib import jobcore as q",          # the module renamed: q.worker is hidden
+                    "import pp.lib.jobcore as q",
+                    "ask = jobcore.worker",                     # an alias of it
+                    "getattr(jobcore, 'worker')(q)",            # the name as a string
+                    "worker(q)",                                # the function on its own, once imported
                     "lock.Claim.holder(_worker_claim(q))",      # and the same look taken by hand
-                    "jobq.lock.Claim.holder(jobq._worker_claim(q))",
-                    "lock.Claim.holder(os.path.join(_qroot(q), 'worker.lock'))",
+                    "jobq.lock.Claim.holder(jobcore._worker_claim(q))",
+                    "lock.Claim.holder(os.path.join(qroot(q), 'worker.lock'))",
                     "lock.Claim.take(_worker_claim(q), rec)",   # or a second holder of it
-                    "lock.Claim.take(path=os.path.join(_qroot(q), 'worker.lock'))")
+                    "lock.Claim.take(path=os.path.join(qroot(q), 'worker.lock'))")
         for line in bypasses:
             for path in ("pp/lib/jobq.py", "pp/commands/queue.py"):
                 with self.subTest(line=line, path=path):
                     self.assertTrue(any(RULES["worker-claim"].match(n, path, "cmd_add")
                                         for n in ast.walk(ast.parse(line))))
-        with self.subTest(bare="worker(q)"):    # a bare name is the function itself in the file that defines it
-            self.assertTrue(any(RULES["worker-claim"].match(n, "pp/lib/jobq.py", "cmd_add")
-                                for n in ast.walk(ast.parse("worker(q)"))))
-        for qual in sorted(_WORKER_CLAIM_HOME):     # and none of them counts inside the construct
-            for line in bypasses + ("worker(q)",):
-                with self.subTest(home=qual, line=line):
-                    self.assertFalse(any(RULES["worker-claim"].match(n, "pp/lib/jobq.py", qual)
-                                         for n in ast.walk(ast.parse(line))))
-        for ok in ("from pp.lib import jobq", "jobq.worker_now(q)", "jobq.worker_up(q)",
-                   "lock.Claim.holder(_run_claim(q, jid))",
+        # and none of them is reported in the core's own file, which is the rule's home
+        self.assertNotIn(_CORE, {x.split(":")[0] for x in RULES["worker-claim"].sites()})
+        for ok in ("from pp.lib import jobcore", "jobcore.worker_now(q)", "jobcore.worker_up(q)",
+                   "lock.Claim.holder(run_claim(q, jid))",
                    "lock.Claim.take(_probe_claim(p))", "w.worker"):
             with self.subTest(ok=ok):
                 self.assertFalse(any(RULES["worker-claim"].match(n, "pp/commands/queue.py", "f")
                                      for n in ast.walk(ast.parse(ok))))
 
-    def test_the_homes_of_the_worker_claim_rule_are_the_ones_that_use_it(self):
-        """The homes this rule names are functions of pp/lib/jobq.py, not whole files, so they are checked
-        here rather than in `test_every_home_does_the_thing`. Each of the three does what it is let off for:
-        `worker` reads the claim's holder, `worker_now` says what that holder is, and `work` takes the
-        claim.
-
-        The home set itself is pinned here, so letting the rule off a fourth place fails this test."""
-        self.assertEqual(_WORKER_CLAIM_HOME, {"worker", "worker_now", "work"})
-        did: dict[str, list[str]] = {}
-        for qual, node in _walk("pp/lib/jobq.py"):
-            # the same node, read as a verb of the same file: a bare name is the function itself there
-            if _the_worker_claim(node, "pp/lib/jobq.py", "cmd_add"):
-                did.setdefault(qual.split(".")[0], []).append(qual)
-        self.assertEqual(set(did), _WORKER_CLAIM_HOME)
+    def test_the_home_of_the_worker_claim_rule_holds_the_ones_that_use_it(self):
+        """The rule's one home is the core's file, and these are the functions in it that do what it is let
+        off for: `worker` reads the claim's holder, `worker_now` says what that holder is, and `work` takes
+        the claim. Nothing outside that file does any of the three, which is what the rule holds."""
+        self.assertEqual(RULES["worker-claim"].home, {_CORE})
+        did = {qual for qual, node in _walk(_CORE) if _the_worker_claim(node, "pp/x.py", "f")}
+        self.assertEqual({q.split(".")[0] for q in did}, {"worker", "worker_now", "work"})
 
     def test_every_home_does_the_thing(self):
         """A home is let off its rule, so it is no exemption on paper: each file a rule lets off does what it

@@ -215,8 +215,8 @@ this table, and each rule's own docstring is its contract.
 | `lock` | taking a lock | `locked`, and `deferring` for a scope with no lock | `pp/lib/lock.py` |
 | `claim` | opening a claim's file | `Claim` | `pp/lib/lock.py` |
 | `job` | reading or writing a job's file | `txn`, `listing`, `find` | `pp/lib/jobstore.py` |
-| `worker-claim` | taking a queue's worker claim, or reading its holder | `worker`, `worker_now`, `work` | `pp/lib/jobq.py` |
-| `job-process` | signalling or reaping a job's processes | the `Worker` class, `cmd_worker`, `work` | `pp/lib/jobq.py`, `pp/lib/proc.py`, `pp/commands/kill.py` |
+| `worker-claim` | taking a queue's worker claim, or reading its holder | `worker`, `worker_now`, `work` | `pp/lib/jobcore.py` |
+| `job-process` | signalling or reaping a job's processes | the `Worker` class, `worker_stop`, `work` | `pp/lib/jobcore.py`, `pp/lib/proc.py`, `pp/commands/kill.py` |
 | `by-name` | deciding on a served file by its name | act on the open file | `pp/commands/http.py` |
 | `sleep` | sleeping in a test | `until` | `tests/journey.py` |
 | `once` | a once-flag of a test's own | `Gate` | `tests/journey.py` |

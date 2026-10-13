@@ -37,32 +37,18 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
-import select
 import shlex
 import shutil
 import signal
 import sys
 import time
-import traceback
-from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime
 
-from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, session, ui
+from pp.lib import config, jobcore, jobpolicy as policy, jobstore, lock, paths, proc, session, ui
 
 CAPTURED_ENV = ("PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV")
-# What a job runs as. Its stdin is the job's run claim, which this `sh` holds for exactly as long as the attempt
-# lives; it writes its own pid in there first, so the claim names it even if the worker that started it died
-# before recording it. The command itself reads /dev/null, so neither it nor anything it leaves behind holds the
-# claim: the attempt is over when this `sh` is over. The exit code goes to another name and is renamed into
-# place, so whoever reads it finds a whole code or none.
-WRAP = ('printf \'{"pid": %d}\' "$$" >&0; "$@" 0</dev/null; r=$?; '
-        'echo "$r" > "$PP_QUEUE_RCFILE.part" && mv "$PP_QUEUE_RCFILE.part" "$PP_QUEUE_RCFILE"')
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 LAUNCH_BANNER = re.compile(r"\[pp queue\] \S+ \S+ job \d+ \(")     # the line _spawn writes before each attempt
-WAKE = signal.SIGUSR1       # what a verb sends a worker to end its wait between ticks, so a stop is served now
-STOP_PERIOD = 0.1           # how long a woken worker waits between ticks while a stop of its queue is in flight
 KILL_POLL = 0.1             # how often `kill` looks for the outcome that is recorded
 # how long `kill` waits for that outcome, past the grace it asked for. Every pass of that wait wakes the
 # worker that is up, so its next tick is that pass. What this bounds is the job's own exit time, and not the
@@ -70,48 +56,8 @@ KILL_POLL = 0.1             # how often `kill` looks for the outcome that is rec
 # waits for each start in it to say it is ready, so such a pass can carry the wait past this bound by that
 # round's ready waits; `kill` says how long it really waited.
 KILL_WAIT = 120.0
-# how often one process starts a worker again for a queue whose last round of starts brought none up
-START_EVERY = 5.0
-STOP_WAIT = 300.0           # how long `worker stop` waits for a worker inside a slow tick
 
 _PROG = "queue"             # the command running the CLI: names it in messages and starts its workers
-
-
-def _new_rcfile(j: dict) -> str:
-    """The file this attempt of job j writes its exit code to. One name per attempt, chosen as the attempt
-    starts and kept on the record, so no attempt can read the code another wrote and nothing has to be removed
-    before a launch."""
-    return os.path.join(jobstore.qroot(j["queue"], "rc"), f"{j['id']}.{j.get('attempt', 1)}.{secrets.token_hex(4)}")
-
-
-def ended_on_its_own(job: dict) -> tuple[int, float] | None:
-    """(the exit code this attempt wrote, when it wrote it), or None when it wrote none. The one reader of an
-    attempt's exit code.
-
-    The job's own wrapper writes it, under the name the record names, after the command has returned and before
-    the wrapper exits. So a code means the command ran to its end, whatever else was on its way, and its time
-    is when the job really ended, however late a worker reaps it. A signal that ends the wrapper leaves no code.
-    Both come from one open file, so the code and its time are the same attempt's."""
-    path = job.get("rcfile")
-    if not path:
-        return None
-    try:
-        with open(path) as f:
-            return int(f.read().strip()), os.fstat(f.fileno()).st_mtime
-    except (OSError, ValueError):
-        return None
-
-
-def _group_handle(j: dict) -> proc.Handle | None:
-    """The job's process group, as the handle every signal to it goes through: the group id, the start time
-    recorded with it, and the boot both were read in.
-
-    None while the job has no process yet, for a record that holds no start time, and for a record from
-    another boot, which names no process here. `Worker._signal_group` then falls back to the pid in the job's
-    run claim, which is held by a live process and so is always this boot's."""
-    if j.get("boot") != proc.boot_id():
-        return None
-    return proc.Handle.recorded(j.get("pgid"), j.get("pstart"), group=True)
 
 
 def _by() -> str:
@@ -124,6 +70,134 @@ def add_note(jid: int, text: str, by: str | None = None) -> dict | None:
     """Append a note to a job in any state; the updated job, or None when there is no such job."""
     note = {"t": time.time(), "text": text, "by": _by() if by is None else by}
     return jobstore.amend(jid, {"notes": [note]})
+
+
+# ---- the worker, as this command wires it up -----------------------------------------------------------
+#
+# The core (pp/lib/jobcore.py) holds the claims, the processes and the loop, and it reads no config and writes
+# no sentence. So three things are read and said here: the settings one pass of the loop runs under, the
+# admission of one launch pass, and the words for what the worker did.
+
+def _starting(q: str) -> str:
+    """What a person is told while a worker holds q's claim and has not recorded itself yet."""
+    return f"the {q} worker is starting and has not recorded itself yet"
+
+
+def _read_settings(q: str, backfill: bool | None, poll: float | None):
+    """What one pass of q's worker loop runs under: {poll, idle_exit, backfill}, read once per pass, so a
+    queue's limits change under its running jobs with no restart. A config that cannot be read comes back as
+    `error` beside the defaults, which is what stops that pass launching anything."""
+    def read():
+        try:
+            cfg = _qcfg(q)
+        except config.ConfigError as e:
+            return {"poll": float(poll or 2), "idle_exit": 600.0, "backfill": bool(backfill), "error": str(e)}
+        return {"poll": float(poll or cfg.get("poll", 2)), "idle_exit": float(cfg.get("idle_exit", 600)),
+                "backfill": bool(cfg.get("backfill", False)) if backfill is None else bool(backfill)}
+    return read
+
+
+def _admit_for(q: str):
+    """The admission of one launch pass: the readings are taken here, outside the store lock, and the pass
+    asks the callable they are in about each job it is about to start."""
+    def admit_for(kinds):
+        return Resources(q, kinds, empty_ok=False).admit
+    return admit_for
+
+
+def _voice(q: str, log=None):
+    """The sink the worker tells what it did, worded: one line of the queue's log per event, and for a retry
+    one line in the job's own log too. Every sentence a worker says is here, and none of it in the core.
+
+    log is where a line goes; a worker nobody gave one to says nothing, which is what a test that drives a
+    tick by hand wants."""
+    say = log or (lambda line: None)
+
+    def voice(kind, job, f):
+        jid = None if job is None else job["id"]
+        tag = None if job is None else job.get("tag")
+        if kind == "timeout":
+            say(f"timeout {jid} {tag} after {ui.human_duration(float(job['timeout']))}: stopping it")
+        elif kind == "again":
+            _append_log(job, _retry_line(f))        # the job's own log, before the queue's
+            say(f"retry {jid} {tag}: attempt {job['attempt']}/{int(job.get('retries') or 0) + 1} "
+                f"in {_in_delay(job['not_before'])}")
+        elif kind == "ended":
+            why = f" ({job['reason']})" if job.get("reason") else ""
+            say(f"{'done' if job['state'] == 'done' else 'FAILED'} {jid} {tag} "
+                f"rc={job.get('rc')}{why} {ui.human_duration(job.get('seconds'))}")
+        elif kind == "stop":
+            word = ("SIGTERM to its group" if f["sig"] == signal.SIGTERM else
+                    f"SIGKILL after {ui.human_duration(float(f['grace'] or 0))}")
+            say(f"stop {jid} {tag} ({(job.get('stop') or {}).get('by')}): "
+                + (f"not allowed to signal its group {f['group']}" if f["outcome"] == "denied" else word))
+        elif kind == "group-gone":
+            say(f"nothing to signal in job {jid}'s group {f['group']}: it is gone")
+        elif kind == "adopted":
+            say(f"adopted {jid} {tag}: its run is pid {f['pid']}, from its claim")
+        elif kind == "hook-failed":
+            say(f"hook {f['event']} of {jid} could not start: {f['error']}")
+        elif kind == "hook":
+            say(f"hook {f['event']} of {jid}: {f['cmd']} (log {f['log']})")
+        elif kind == "launch-failed":
+            say(f"FAILED {jid} {tag}: launch failed: {f['error']}")
+        elif kind == "ended-elsewhere":
+            say(f"job {jid} ended elsewhere while it started; stopped its process {f['pid']}")
+        elif kind == "start":
+            retries = int(job.get("retries") or 0)
+            attempt = f" attempt {job.get('attempt', 1)}/{retries + 1}" if retries else ""
+            say(f"start {jid} {tag} [{job.get('project')}] {_needs_str(job.get('needs'))}"
+                + (f" on GPU{f['card']}" if f["card"] is not None else "") + attempt)
+        elif kind == "waiting":
+            say(f"waiting: {jid} {tag} for {f['why']}")
+        elif kind == "up":
+            say(f"worker up, pid {f['pid']}" + (", backfill" if f["backfill"] else "")
+                + (f", adopting {f['adopting']} running job(s)" if f["adopting"] else ""))
+        elif kind == "backfill":
+            say(f"backfill {'on' if f['on'] else 'off'} (config)")
+        elif kind == "tick-failed":
+            say("tick failed:\n" + f["trace"])
+        elif kind == "config":
+            say(f"bad config, nothing launches until it is fixed: {f['error']}" if f["error"] else "config fixed")
+        elif kind == "idle":
+            say(f"idle for {f['idle_exit']:g}s, exiting")
+        elif kind == "stopped":
+            say("stopped; running jobs keep running and the next worker adopts them")
+        elif kind == "busy":    # another worker holds the claim, so this one is not the queue's
+            print(f"pp {_PROG}: the {q} worker is already running (pid {f['pid']})" if f["how"] == jobcore.UP
+                  else f"pp {_PROG}: {_starting(q)}, so this worker is not the one" if f["how"] == jobcore.STARTING
+                  else f"pp {_PROG}: another worker held the {q} worker's claim and has let it go")
+    return voice
+
+
+def worker_for(q: str, backfill: bool = False, log=None) -> jobcore.Worker:
+    """Queue q's worker, wired: the admission of a pass, the tail a retry is matched against, and the sink it
+    says what it did to. The one place a Worker is built."""
+    return jobcore.Worker(q, backfill, _voice(q, log), lambda job, n: "\n".join(log_tail(job, n)), _admit_for(q))
+
+
+def cmd_work(q: str, backfill: bool | None = None, poll: float | None = None) -> int:
+    """`work`: queue q's worker in this process. The loop is the core's; the settings, the admission and the
+    words are read and said here."""
+    def log(msg):
+        print(f"[{q} {datetime.now():%m-%d %H:%M:%S}] {msg}", flush=True)
+    return jobcore.work(q, _read_settings(q, backfill, poll), _admit_for(q), _voice(q, log),
+                        lambda job, n: "\n".join(log_tail(job, n)))
+
+
+def _worker_up(q: str, wake: bool = False, quiet: bool = False) -> jobcore.Holder:
+    """Make sure q has a worker and say what came of it: the one place the core's answer is worded. A caller
+    that asked quietly says it itself, from the answer it was given."""
+    w = jobcore.worker_up(q, wake=wake)
+    if quiet:
+        return w
+    if w.how == jobcore.STARTED:
+        print(f"pp {_PROG}: started the {q} worker (pid {w.pid}; log {jobcore.worker_log(q)})", file=sys.stderr)
+    elif w.how == jobcore.STARTING:
+        print(f"pp {_PROG}: {_starting(q)}", file=sys.stderr)
+    elif w.tried:
+        ui.warn(f"{_PROG}: {w.why or f'the {q} worker did not come up'}; its log: {jobcore.worker_log(q)}")
+    return w
 
 
 # ---- durations, small parsing ------------------------------------------------------------------------
@@ -524,770 +598,6 @@ def _append_log(job: dict, line: str):
         pass
 
 
-class Wait:
-    """The wait a worker does between its ticks, and the one thing that shortens it. `waking()` hands one out.
-
-    `wait(seconds)` waits that long, ends the moment a signal arrives, and says whether one did. Nothing in a
-    worker's loop sleeps: a stop, a Ctrl-C and a `worker stop` all reach it through the same wait."""
-
-    def __init__(self, fd: int):
-        self.fd = fd
-
-    def wait(self, seconds: float) -> bool:
-        """-> whether a signal ended the wait, rather than the time being up."""
-        if self._took():
-            return True         # one arrived while the tick ran: it ends this wait, and is not waited out
-        left = max(float(seconds), 0.0)
-        if not left or not select.select([self.fd], [], [], left)[0]:
-            return False
-        self._took()
-        return True
-
-    def _took(self) -> bool:
-        """Take whatever the wakeup pipe holds. -> whether it held anything."""
-        try:
-            return bool(os.read(self.fd, 4096))
-        except BlockingIOError:
-            return False
-
-
-@contextmanager
-def waking():
-    """The scope a worker's loop runs in: inside it, a signal ends the wait `Wait.wait` does, at once.
-
-    Python's own wakeup pipe is what ends it (signal.set_wakeup_fd): the C handler writes the number of every
-    signal this process takes into that pipe, so a wake sent while a tick runs is a byte waiting in the pipe
-    when the next wait begins, and no wake is lost. The Python handlers run as they always do, so the same
-    SIGTERM that ends a wait sets the stop flag work() reads. The wake's own handler does nothing: it is there
-    so that a wake cannot end a worker that is not waiting.
-
-    Only the main thread may hold the wakeup pipe, and one process has one: this is the scope of the worker in
-    it, entered before it claims its queue, so a wake can never reach a worker that is not in this scope."""
-    r, w = os.pipe()
-    os.set_blocking(r, False)
-    os.set_blocking(w, False)
-    was_handler = signal.signal(WAKE, lambda *_: None)
-    was_fd = signal.set_wakeup_fd(w, warn_on_full_buffer=False)
-    try:
-        yield Wait(r)
-    finally:
-        signal.set_wakeup_fd(was_fd)
-        signal.signal(WAKE, was_handler)
-        os.close(r)
-        os.close(w)
-
-
-class Worker:
-    """One queue's worker. One tick = one pass over its running jobs (`carry_out`: the facts about each, the
-    decision, the action), then launch what fits. work() loops it; tests drive it tick by tick."""
-
-    def __init__(self, queue: str, backfill: bool = False, log=None):
-        me = proc.read(os.getpid())
-        self.queue = queue
-        self.children: dict[int, proc.Child] = {}    # jobs this worker launched; others are adopted
-        self.hooks: list[proc.Child] = []            # kept only to reap them
-        self.backfill = backfill
-        self.pstart = me.start if me else None
-        self.waiting: dict | None = None    # {id, tag, why, t}: what the head of the queue waits for
-        self.said = None                    # (id, reason) last logged, without the detail after ';'
-        self.serving = 0        # stops of this queue in flight at the last tick: while any is, the wait is short
-        self.claim: lock.Claim | None = None    # where it records itself; work() sets it once it has taken it
-        self.log = log or (lambda msg: None)
-        self.stopping = lambda: False   # work() points it at its stop flag: a stopping worker launches nothing new
-
-    def record(self) -> dict:
-        """What this worker says about itself while it holds its claim, which is where `status` reads it."""
-        return {"pid": os.getpid(), "pstart": self.pstart, "waiting": self.waiting}
-
-    def _publish(self):
-        if self.claim is not None:
-            self.claim.write(self.record())
-
-    def tick(self):
-        self.carry_out()        # the one actor that signals this queue's jobs and records how one ended
-        watchers()              # and the leases of the waits a signal ended, swept where the queue is read
-        self.hooks = [h for h in self.hooks if h.poll() is None]
-        if not self.stopping():
-            self.launch()   # last: a broken config raises here, after ended jobs are recorded
-
-    # -- one pass over the running jobs: the facts, the decision, the action
-
-    def carry_out(self):
-        """One pass over this queue's running jobs: gather the facts about each, ask `decide` once, and do the
-        one thing it says. The whole of a tick apart from launching, and the worker's own: the worker is the
-        one actor that signals this queue's jobs.
-
-        A timeout, a kill and a reap are not three passes over the queue with three views of a job. They are
-        facts about one job and one decision made from all of them, so no part of it can be wrong about what
-        another part did."""
-        now = time.time()
-        with jobstore.listing() as s:    # one pass: the jobs to decide about, and the hooks the queue still owes
-            jobs = list(s.jobs(("running",) + jobstore.ENDED, self.queue))
-        owed = [j for j in jobs if j["state"] in jobstore.ENDED and j.get("hook_due")]
-        in_flight = 0
-        for j in [x for x in jobs if x["state"] == "running"]:
-            stop = j.get("stop") or {}
-            action = self._step(j, self._facts(j, now))
-            if action.do in (policy.TERM, policy.KILL9, policy.TIME_UP) or (action.do == policy.NOTHING and stop
-                                                       and not stop.get("denied") and not stop.get("kill9")):
-                in_flight += 1          # a stop with something still to go out for it
-        # while a stop is in flight, and a verb is waking this worker for it, the loop's wait is STOP_PERIOD
-        # and not the poll (work()). A stop whose SIGKILL has gone out has nothing left to carry out, so it is
-        # not one: the worker waits for the kernel to end a job that is slow to die, at its poll or at the
-        # next wake of whoever is waiting, and the reap sees the run claim go like any other
-        self.serving = in_flight
-        for j in owed:
-            self.fire(j, j["hook_due"])     # owed by a worker that did not get to fire it
-        # a child of this worker's whose record no longer says running: something outside pp ended the job
-        # while it was starting, and `_spawn` stopped the process it had started. Reap the zombie
-        for jid, p in list(self.children.items()):
-            if p.poll() is not None and (jobstore.find(jid) or {}).get("state") != "running":
-                del self.children[jid]
-
-    def _facts(self, j: dict, now: float) -> policy.Facts:
-        """What is true of this running job besides its record, all of it read here and nothing decided:
-        whether a run of it is live, the exit code that run wrote and when, the signal its own child died of,
-        and the log tail --retry-if matches against.
-
-        Read before the transaction, since none of it is store state and a log tail can be long."""
-        held = lock.Claim.holder(jobstore.run_claim(self.queue, j["id"]))
-        p = self.children.get(j["id"])
-        if held is not None or (p is not None and p.poll() is None):
-            # a run of it is live, whatever its record holds: it is never lost, and never started again. Its
-            # exit code is not read at all here: while the run is live it says nothing (Facts). A wrapper this
-            # worker started is live until this worker reaps it: a process closes its files, the claim among
-            # them, before its parent can read how it ended.
-            if held is not None:
-                self._adopt(j, held)
-            return policy.Facts(held=True, now=now)
-        self.children.pop(j["id"], None)
-        code = p.poll() if p is not None else None
-        rc, ended = ended_on_its_own(j) or (None, None)
-        tail = "\n".join(log_tail(j, 200)) if rc != 0 and j.get("retry_if") else ""
-        return policy.Facts(held=False, rc=rc, rc_at=ended, sig=-code if code is not None and code < 0 else None,
-                     now=now, tail=tail)
-
-    def _step(self, j: dict, facts: policy.Facts) -> policy.Action:
-        """The one decision about one job, and the action it names, carried out: what is store state in one
-        transaction, the signal through the job's Handle, the log line and the hook after the scope.
-        -> the action, which says whether a stop of this job is still in flight.
-
-        The decision is made inside the transaction, on the record the store holds and the facts read before
-        it: a stop another actor wrote since those facts were read is part of it, so a job a kill has touched
-        is never retried past its stop."""
-        jid = j["id"]
-        with jobstore.txn() as s:
-            cur = s.job(jid, must_be=("running",))
-            if cur is None:
-                return policy.Action(policy.NOTHING)      # nothing else records a running job: there is nothing to record
-            a = policy.decide(cur, facts)
-            if a.sweep:
-                # the leader of this job's group is gone and its run is over, so anything left in that group
-                # goes too: a command that held the signal back does not outlive the job
-                self._signal_group(cur, signal.SIGKILL)
-            if a.do == policy.TIME_UP:
-                cur["stop"] = {"by": "timeout", "timeout": True, "t": a.t, "grace": a.grace}
-                s.save(cur)
-            elif a.do == policy.AGAIN:
-                said = jobstore._requeue(s, cur, a)
-            elif a.do == policy.ENDED_AS:
-                jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
-        if a.do in (policy.TERM, policy.KILL9):
-            self._send(cur, a)
-            return a
-        if a.do == policy.TIME_UP:
-            self.log(f"timeout {jid} {cur.get('tag')} after {ui.human_duration(float(cur['timeout']))}: "
-                     "stopping it")
-        elif a.do == policy.AGAIN:
-            _append_log(cur, _retry_line(said))     # after the scope: a job's log is not the store
-            self.log(f"retry {jid} {cur.get('tag')}: attempt {cur['attempt']}/{int(cur.get('retries') or 0) + 1} "
-                     f"in {_in_delay(cur['not_before'])}")
-        elif a.do == policy.ENDED_AS:
-            why = f" ({cur['reason']})" if cur.get("reason") else ""
-            self.log(f"{'done' if cur['state'] == 'done' else 'FAILED'} {jid} {cur.get('tag')} "
-                     f"rc={cur.get('rc')}{why} {ui.human_duration(cur.get('seconds'))}")
-            if a.hook:
-                self.fire(cur, a.hook)
-        return a
-
-    def _send(self, job: dict, a: policy.Action) -> None:
-        """The signal one stop asks for next, and what it did on the record: a SIGTERM marked `sent`, a
-        SIGKILL marked `kill9`, a refusal marked `denied`. The queue's worker is the one actor that signals a
-        job's processes, so a kill, a timeout and a reap never cross.
-
-        The signal goes out first and is recorded after, so a record that says a signal went out is one that
-        did, which is all the decision about this job has to go on."""
-        stop = job.get("stop") or {}
-        sig, mark, word = ((signal.SIGTERM, "sent", "SIGTERM to its group") if a.do == policy.TERM else
-                           (signal.SIGKILL, "kill9",
-                            f"SIGKILL after {ui.human_duration(float(stop.get('grace') or 0))}"))
-        outcome = self._signal_group(job, sig)
-        if outcome is None or outcome == "gone":
-            return          # nothing to signal: its run is starting, or it is over and the next pass says how
-        now = time.time()
-        with jobstore.txn() as s:
-            cur = s.job(job["id"], must_be=("running",))
-            if cur is None or not cur.get("stop"):
-                return
-            cur["stop"]["denied" if outcome == "denied" else mark] = now
-            s.save(cur)
-        self.log(f"stop {job['id']} {job.get('tag')} ({stop.get('by')}): "
-                 + (f"not allowed to signal its group {cur.get('pgid')}" if outcome == "denied" else word))
-
-    def _adopt(self, j: dict, held: dict):
-        """Complete the record of a running job from its claim. The wrapper writes its own pid in there, so a
-        job whose worker died between the start and the record is named again, and can be timed out, killed and
-        reported like any other. The claim is held, so that pid is that wrapper's."""
-        if j.get("pid") or not held.get("pid"):
-            return
-        p = proc.read(int(held["pid"]))
-        if p is None:
-            return              # it ended as this was read; the next look reaps it
-        with jobstore.txn() as s:
-            cur = s.job(j["id"], must_be=("running",))
-            if cur is None or cur.get("pid"):
-                return
-            cur.update(pid=p.pid, pgid=p.pgid, pstart=p.start, boot=proc.boot_id())
-            s.save(cur)
-        self.log(f"adopted {j['id']} {j.get('tag')}: its run is pid {p.pid}, from its claim")
-
-    def fire(self, job: dict, event: str):
-        """Run the job's on_fail / on_done hook, detached; record it on the job, and that the job no longer
-        owes it.
-
-        The outcome and the hook owed for it are written in one transaction (`_finish`); `hook_due` is cleared
-        here, once the hook has run. A hook that could not start is reported and cleared too, so a queue is
-        never left trying to start it again every tick."""
-        spec = policy.hook_spec(job.get("on_fail" if event == "failed" else "on_done"))
-        argv = policy.hook_argv(spec)
-        q, jid = job["queue"], job["id"]
-        hlog = os.path.join(jobstore.qroot(q, "hooks"), f"{jid}-{event}.log")
-        ran = False
-        if argv:
-            env = {"PP_QUEUE": q, "PP_QUEUE_JOB": str(jid), "PP_QUEUE_EVENT": event,
-                   "PP_QUEUE_RC": "" if job.get("rc") is None else str(job["rc"]), "PP_QUEUE_REASON": job.get("reason") or (f"exit {job['rc']}" if event == "failed" and job.get("rc") is not None else ""),
-                   "PP_QUEUE_LOG": job.get("log") or "", "PP_QUEUE_CWD": job.get("cwd") or "", "PP_QUEUE_TAG": job.get("tag") or ""}
-            cwd = job.get("cwd") if job.get("cwd") and os.path.isdir(job["cwd"]) else "/"
-            try:
-                with open(hlog, "a") as f:
-                    f.write(f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} {event} hook of job {jid}: {shlex.join(argv)}\n")
-                    f.flush()
-                    h = proc.spawn(argv, group="own", stdin="none", env="scrubbed", add_env=env, cwd=cwd, stdout=f,
-                                   stderr=proc.STDOUT)
-                self.hooks.append(h)
-                ran = True
-            except OSError as e:
-                self.log(f"hook {event} of {jid} could not start: {e}")
-        with jobstore.txn() as s:        # it has run: the job owes it no longer, whether or not it could start
-            cur = s.job(jid)
-            if cur is not None:
-                if ran:
-                    cur.setdefault("hooks", []).append({"event": event, "cmd": spec, "t": time.time(), "log": hlog})
-                if cur.pop("hook_due", None) is not None or ran:
-                    s.save(cur)
-        if ran:
-            self.log(f"hook {event} of {jid}: {spec} (log {hlog})")
-
-    # -- stopping a job: a `kill`, and a timeout, which is a stop the worker writes on the job itself
-
-    @staticmethod
-    def wake(h: proc.Handle | None) -> None:
-        """End the wait of the worker this handle names, so it ticks now instead of when its period is up. The
-        handle comes from the look `worker_up` has already taken (`Holder.handle`), so waking a worker costs no
-        second look at the claim.
-
-        The wake is a signal to a worker, never to a job: a worker inside `waking` takes it from its own
-        wakeup pipe, so one sent while a tick runs ends the next wait rather than being lost. It is the
-        worker's own, like the signalling above it, which is why it lives here and not in the verb that
-        sends it. No verb holds the worker claim: a verb writes its stop, wakes the worker or starts one, and
-        waits for the record."""
-        if h is not None:
-            proc.signal_pid(h, WAKE)
-
-    def _signal_group(self, job: dict, sig: int) -> str | None:
-        """Signal the job's process group, and say how that went (proc.signal_group's outcomes), or None while
-        the job has no group to signal yet.
-
-        The record names the group with the start time read beside it, so a group id that belongs to another
-        process by now is not signalled. Where the record names none, or names one without that start time, the
-        job's claim names its wrapper, which leads that group and holds the claim, so that pid is still its own.
-        One of the two names the group, unless the wrapper has not written its pid yet, which is the first
-        moment of a launch."""
-        h = _group_handle(job)
-        if h is None:
-            held = lock.Claim.holder(jobstore.run_claim(job["queue"], job["id"])) or {}
-            h = proc.Handle.live(int(held["pid"]), group=True) if held.get("pid") else None
-        if h is None:
-            return None
-        outcome = proc.signal_group(h, sig)
-        if outcome == "gone":
-            self.log(f"nothing to signal in job {job['id']}'s group {h.id}: it is gone")
-        return outcome
-
-    # -- launching
-
-    def launch(self):
-        queued = jobstore.jobs("queued", self.queue)
-        now = time.time()
-        ready = [j for j in queued if (j.get("not_before") or 0) <= now]     # a retry's delay never blocks the line
-        if not ready:
-            self._note(None)
-            return
-        res = Resources(self.queue, {k for j in ready for k in (j.get("needs") or {})}, empty_ok=False)
-        if self.stopping():
-            return          # told to stop while the readings were taken
-        taken: list = []        # (record, card, claim) for each job this pass admitted
-        blocked: tuple = (None, "")     # the first job that did not fit, and why
-        try:
-            # one transaction for the whole pass: it reads the running jobs it admits against once, and reads
-            # each job it is about to start again in that same scope, since another queue's worker may be
-            # admitting from a shared pool and a verb may have changed the job since it was listed (prio, a note)
-            with jobstore.txn() as s:
-                running = s.jobs("running")
-                for j in ready:
-                    cur = s.job(j["id"], must_be=("queued",))
-                    if cur is None:
-                        continue        # held, dropped or started meanwhile
-                    ok, why, card = res.admit(cur, running)
-                    if not ok:
-                        if blocked[0] is None:
-                            blocked = (cur, why)
-                        if self.backfill:
-                            continue
-                        break
-                    # the run claim before the record says running, so a reader never sees a running job with
-                    # nothing holding its claim unless its run has ended. Taking one is two calls that never
-                    # wait, which is why it belongs in here; nothing under the store lock may wait either.
-                    claim = lock.Claim.take(jobstore.run_claim(self.queue, cur["id"]))
-                    if claim is None:
-                        continue        # a run of this job is live already
-                    taken.append((cur, card, claim))    # before the rest of it, which can raise
-                    self._claim(s, cur, card)
-                    running.append(cur)     # what this pass has taken counts against the next job in it
-            for cur, card, claim in taken:  # outside the transaction: starting a process is not store work
-                self._spawn(cur, card, claim)
-        finally:
-            # pp's own copy of every claim this pass took, however it ended: a wrapper that was started holds
-            # the claim through the file description it was given, so releasing this copy frees nothing of
-            # its; one for a job no `_spawn` reached is freed here, and that job is reaped like any other
-            # whose run is over. Releasing twice is not an error.
-            for _cur, _card, claim in taken:
-                claim.release()
-        self._note(*blocked)
-
-    @staticmethod
-    def _claim(s: jobstore.Txn, j: dict, gpu: int | None):
-        """In a transaction: the job, as read in it, becomes running, with the file this attempt writes its exit
-        code to. Its run claim is held before this, so no reader ever sees it running with nothing holding its
-        claim unless its run has ended."""
-        j.update(started=time.time(), gpu=gpu, state="running", rcfile=_new_rcfile(j))
-        j.pop("not_before", None)
-        s.save(j)
-
-    def _spawn(self, j: dict, gpu: int | None, claim: lock.Claim) -> dict | None:
-        """Start the attempt's wrapper, and hand it the run claim as its stdin: it holds that claim for exactly
-        as long as the attempt lives. pp closes its own copy here, so nothing but the wrapper holds it.
-
-        Whatever stopped this start is this job's launch failure, recorded on it: a directory that is gone, a
-        log that cannot be opened, an environment name the kernel will not take. The pass that got here has
-        marked every job it admitted `running` already, so one job that cannot start must not end the pass
-        for the others: they would be left with no process, and read as lost."""
-        jid, q = j["id"], self.queue
-        argv = list(j.get("runner") or []) + list(j["cmd"])
-        env = {**(j.get("shell_env") or {}), **(j.get("env") or {}),
-               "PP_QUEUE": q, "PP_QUEUE_JOB": str(jid), "PP_QUEUE_RCFILE": j["rcfile"]}
-        if gpu is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-        retries = int(j.get("retries") or 0)
-        attempt = f" attempt {j.get('attempt', 1)}/{retries + 1}" if retries else ""
-        try:
-            os.makedirs(os.path.dirname(j["log"]), exist_ok=True)
-            with open(j["log"], "a") as f:
-                f.write(f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} job {jid} ({q}){attempt} in {j['cwd']}: {shlex.join(argv)}\n")
-                f.flush()
-                p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
-                               env="scrubbed", add_env=env, cwd=j["cwd"], stdout=f, stderr=proc.STDOUT)
-        except Exception as e:
-            with jobstore.txn() as s:
-                cur = s.job(jid, must_be=("running",))
-                if cur:
-                    jobstore._finish(s, cur, "failed", None, f"launch failed: {e}", hook=policy.hook_due(cur, "failed"))
-            claim.release()     # after the record says it ended, so no reader sees it running with a free claim
-            self.log(f"FAILED {jid} {j.get('tag')}: launch failed: {e}")
-            if cur:
-                self.fire(cur, "failed")
-            return None
-        claim.release()         # pp's own copy of it; the wrapper's keeps the claim
-        with jobstore.txn() as s:        # amend the record as it is now, not the copy launch read: a note added meanwhile stays
-            cur = s.job(jid, must_be=("running",))
-            if cur:
-                cur.update(pid=p.pid, pgid=p.pid, pstart=p.handle.start if p.handle else None,
-                           boot=proc.boot_id())
-                s.save(cur)
-        if cur is None:
-            # its record no longer says running, which only something outside pp can do to a job this worker is
-            # starting; its process must not run on under a record that has ended
-            p.end(signal.SIGTERM)
-            self.log(f"job {jid} ended elsewhere while it started; stopped its process {p.pid}")
-        self.children[jid] = p
-        self.log(f"start {jid} {j.get('tag')} [{j.get('project')}] {_needs_str(j.get('needs'))}"
-                 + (f" on GPU{gpu}" if gpu is not None else "") + attempt)
-        return cur
-
-    def _note(self, j: dict | None, why: str = ""):
-        """Record what the head of the queue waits for, in this worker's own claim where `status` reads it,
-        whenever it changes; log it only when its reason changes, not its detail after ';'."""
-        now = None if j is None else {"id": j["id"], "tag": j.get("tag"), "why": why, "t": time.time()}
-        if (self.waiting or {}).get("id") == (now or {}).get("id") \
-                and (self.waiting or {}).get("why") == (now or {}).get("why"):
-            return              # the same job, waiting for the same thing
-        self.waiting = now
-        self._publish()
-        key = None if j is None else (j["id"], why.split(";")[0])
-        if key is not None and key != self.said:
-            self.log(f"waiting: {j['id']} {j.get('tag')} for {why}")
-        self.said = key
-
-
-def _worker_claim(q: str) -> str:
-    return os.path.join(jobstore.qroot(q, create=False), "worker.lock")
-
-
-def _worker_log(q: str, create: bool = False) -> str:
-    """Where queue q's worker writes what it does. Naming it creates nothing: a verb that only reports
-    (`worker status`) leaves no directory behind for a queue name that was a typo. create: the worker
-    about to open it for writing makes the queue's directories."""
-    return os.path.join(jobstore.qroot(q, create=create), "worker.log")
-
-
-def worker(q: str) -> dict | None:
-    """Queue q's live worker as it records itself: {pid, pstart, waiting}. None when the queue has no live
-    worker.
-
-    Only a worker ever holds the claim on worker.lock, and it holds it for as long as it runs: that is what
-    being up means. A worker that was killed leaves it free at once, and one that is alive holds it however
-    long a tick takes. The record is what it is doing, written under the claim. A record that names no live
-    process is a worker in its first moment, which has not recorded itself yet (`worker_now`). Asking never
-    waits for it.
-
-    `worker_now` is the one place that asks this, and every verb asks `worker_now` or `worker_up`."""
-    return lock.Claim.holder(_worker_claim(q))
-
-
-def _start_worker(q: str) -> proc.Child:
-    """A detached worker for q, with no session identity in its environment (the caller may be an agent), once
-    it is ready: it says so when it holds its claim, has recorded itself and handles a stop."""
-    with open(_worker_log(q, create=True), "a") as log:
-        return proc.spawn(paths.self_cmd() + [_PROG, "work", "-q", q], group="own", stdin="none", env="scrubbed",
-                          cwd="/", stdout=log, stderr=proc.STDOUT, ready=True)
-
-
-# ---- whether a queue's worker is up: one construct -------------------------------------------------
-#
-# Only a worker ever holds a queue's worker claim, and `work()` is the one place that takes it. So two things
-# can be true of that claim, and one of them at a time: a worker holds it, or nobody does.
-#
-#   a worker holds the claim      it is up, and its record says what it is doing
-#   nobody holds the claim        the queue has no worker, and a verb that needs one starts it here
-#
-# A worker in its first moment is neither: it has the claim and the record in it names no process, since a take
-# writes that record in the call after the lock. Such a look is no answer, so the construct looks again, a
-# bounded number of times, and says a worker is starting where the record still names nobody.
-#
-# A verb asks `worker_now`, which reports, or `worker_up`, which makes sure a worker is up, and prints from the
-# one answer it gets back. So no verb acts on a look it took outside the scope that acted.
-
-UP = "up"               # a worker holds the claim and has recorded itself
-STARTED = "started"     # the claim was free, and the worker this start brought up holds it
-DOWN = "down"           # nobody holds the claim
-STARTING = "starting"   # a worker holds the claim and has not recorded itself yet
-
-WORKER_STARTS = 3       # workers `worker_up` starts at most, each one asked about after it
-STARTING_LOOKS = 25     # looks it takes at a claim whose holder has not recorded itself ...
-STARTING_PAUSE = 0.02   # ... and how long apart, which is many times the one write that ends that moment
-
-
-@dataclass(frozen=True)
-class Holder:
-    """What one look at a queue's worker claim came to, and the one thing every verb prints from.
-
-    how     up, started, down or starting, as above.
-    rec     the record of the worker that holds the claim. None where nobody holds it.
-    why     why a round of starts brought no worker up, where this answer came from such a round. None
-            otherwise. A start that times out is the one reason the worker's own log cannot carry, since a
-            worker that hung before it said it was ready has logged nothing, so a caller that asked quietly
-            says this itself.
-    """
-
-    how: str
-    rec: dict | None = None
-    why: str | None = None
-
-    @property
-    def up(self) -> bool:
-        """Whether a worker is up: the one answer, so nothing has to read a record to find out."""
-        return self.how in (UP, STARTED)
-
-    @property
-    def pid(self) -> int | None:
-        """The pid of the queue's worker. None where nobody holds the claim, and while a worker that holds it
-        has not recorded itself yet."""
-        return (self.rec or {}).get("pid") if self.up else None
-
-    @property
-    def handle(self) -> proc.Handle | None:
-        """The worker as the handle a signal to it goes through: a wake, or the SIGTERM of `worker stop`. None
-        where this look found no worker. A worker that is up has recorded itself, so both halves are there."""
-        return proc.Handle.recorded(self.pid, (self.rec or {}).get("pstart")) if self.up else None
-
-
-def _starting(q: str) -> str:
-    """What a person is told while a worker holds q's claim and has not recorded itself yet."""
-    return f"the {q} worker is starting and has not recorded itself yet"
-
-
-def worker_now(q: str) -> Holder:
-    """What q's worker is: the one look at the claim's holder. It writes nothing and starts nothing.
-
-    A worker that holds the claim and has not recorded itself yet is no state to report, so this looks again,
-    a bounded number of times. A holder that never records itself comes back as a worker starting, for the
-    verb to say so rather than name it as up.
-
-    Whether the record is the holder's own is the process it names being alive. A take locks the claim file,
-    empties it and writes the record in that order (`lock.Claim.take`), so for that moment a reader finds the
-    file empty, or holding the record a worker that was killed left; a release empties the file, and a
-    worker's record names itself, so those bytes name a process that is gone. Either way a record that names
-    no process of its own, or one that names a process that is not running, is a worker in its first
-    moment."""
-    for _ in range(STARTING_LOOKS):
-        rec = worker(q)
-        if rec is None:
-            return Holder(DOWN)
-        if proc.Handle.running(rec.get("pid"), rec.get("pstart")) is not None:
-            return Holder(UP, rec=rec)
-        time.sleep(STARTING_PAUSE)      # its first moment: look again rather than decide from it
-    return Holder(STARTING, rec=rec)
-
-
-# When a round of starts of this process last brought no worker up, per queue. A loop that asks on every pass
-# waits START_EVERY out before it starts another round, so a worker that cannot come up is not started over
-# and over. The entry goes as soon as a worker is found up, so a queue that recovers is not held off.
-_none_came_up: dict[str, float] = {}
-
-
-def _no_worker_came_up(q: str, quiet: bool, w: Holder, why: str | None = None) -> Holder:
-    """This process's round of starts brought no worker up: hold off from starting another for START_EVERY,
-    and say why unless the caller asked quietly, which is the reason a start gave or that none came up.
-    -> that answer, carrying why on it for a quiet caller to say.
-
-    The clock is read here, after the starts, and not before them: a round can take longer than START_EVERY
-    (a start waits for the worker to say it is ready), and a reading from before it would already be past."""
-    _none_came_up[q] = time.time()
-    if not quiet:
-        ui.warn(f"{_PROG}: {why or f'the {q} worker did not come up'}; its log: {_worker_log(q)}")
-    return Holder(w.how, rec=w.rec, why=why)
-
-
-def worker_up(q: str, quiet: bool = False, wake: bool = False) -> Holder:
-    """Make sure q has a worker, and say what it is: what `add`, `kill`, `release`, `retry`, a wait loop and
-    `worker start` all ask, and the one answer they print from.
-
-    A worker that is up comes back as it is, woken where wake asks, so a job this verb made ready launches now
-    and not at the worker's next tick. Where nobody holds the claim this starts a worker and waits for it: the
-    new worker says it is ready once it holds its claim, has recorded itself and has its stop handler in
-    place, so a `worker stop` or a status right after this sees it. A start whose worker found the claim taken
-    meanwhile brings up no worker, and then this asks again rather than guessing, WORKER_STARTS starts at
-    most. Every answer is a decision taken after the last start this made, so no verb reports a state from
-    before the act it reports on.
-
-    A worker in its first moment holds the claim, so no start can take it: this says a worker is starting and
-    leaves it at that. Where a round of starts brought no worker up, the answer is a queue with no worker, and
-    this process starts another round only once START_EVERY has passed, so a loop that asks on every pass does
-    not start workers it cannot bring up ten times a second. A caller that is not quiet is told when its own
-    round brought no worker up. An ask that lands inside the hold-off of an earlier round starts nothing and
-    says nothing. Every answer from a round that brought none up carries the reason in `why`, so a caller
-    that asked quietly, `worker start` and a watch loop among them, says it itself."""
-    starts: list[int | None] = []       # the workers this started, which the look after each asks about
-    while True:
-        w = worker_now(q)
-        if w.up:
-            _none_came_up.pop(q, None)      # it is up: nothing to hold the next start off for
-            if w.pid is not None and w.pid in starts:
-                if not quiet:
-                    print(f"pp {_PROG}: started the {q} worker (pid {w.pid}; log {_worker_log(q)})",
-                          file=sys.stderr)
-                return Holder(STARTED, rec=w.rec)
-            if wake:
-                Worker.wake(w.handle)
-            return w
-        if w.how == STARTING:
-            if not quiet:   # the same thing every verb says about this state, from the answer it got
-                print(f"pp {_PROG}: {_starting(q)}", file=sys.stderr)
-            return w
-        if not starts and time.time() < _none_came_up.get(q, 0.0) + START_EVERY:
-            return w        # a round of this process's brought none up that recently: not another yet
-        if len(starts) == WORKER_STARTS:
-            return _no_worker_came_up(q, quiet, w)      # the claim's next holder shut this many out
-        try:
-            starts.append(_start_worker(q).pid)     # starting a process is not store work: no lock is held
-        except TimeoutError as e:
-            return _no_worker_came_up(q, quiet, w, why=str(e))
-
-
-def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int:
-    jobstore.writing_queue(q)    # a queue this pp cannot read is refused here too; the worker's own queue says its format
-    from_cfg = backfill is None       # `work --backfill` fixes it; otherwise it follows the config, like the rest
-    if from_cfg:
-        try:
-            backfill = bool(_qcfg(q).get("backfill", False))
-        except config.ConfigError:
-            backfill = False
-
-    def log(msg):
-        print(f"[{q} {datetime.now():%m-%d %H:%M:%S}] {msg}", flush=True)
-
-    w = Worker(q, bool(backfill), log)
-    # the wake is held for the whole of this worker's life, before it claims the queue: a wake can only ever
-    # reach a worker that takes it from its own wakeup pipe
-    with waking() as waits:
-        claim = lock.Claim.take(_worker_claim(q), w.record())
-        if claim is None:       # one worker per queue, and holding the claim is being that worker
-            held = worker_now(q)
-            if held.up:
-                print(f"pp {_PROG}: the {q} worker is already running (pid {held.pid})")
-            elif held.how == STARTING:
-                print(f"pp {_PROG}: {_starting(q)}, so this worker is not the one")
-            else:
-                print(f"pp {_PROG}: another worker held the {q} worker's claim and has let it go")
-            return 0
-        w.claim = claim
-        stop: list = []
-        signal.signal(signal.SIGTERM, lambda *_: stop.append(1))    # a flag, never an exception mid-move
-        proc.say_ready()    # it holds its claim, it is recorded, a stop is handled and a wake is taken
-        w.stopping = lambda: bool(stop)
-        adopted = jobstore.jobs("running", q)
-        log(f"worker up, pid {os.getpid()}" + (", backfill" if backfill else "")
-            + (f", adopting {len(adopted)} running job(s)" if adopted else ""))
-        idle_since = None
-        bad_cfg = None
-        woken = False
-        try:
-            while not stop:
-                period, idle_exit, bad = poll or 2.0, 600.0, None
-                try:
-                    cfg = _qcfg(q)
-                    period = float(poll or cfg.get("poll", 2))
-                    idle_exit = float(cfg.get("idle_exit", 600))
-                    if from_cfg and bool(cfg.get("backfill", False)) != w.backfill:
-                        w.backfill = bool(cfg.get("backfill", False))
-                        log(f"backfill {'on' if w.backfill else 'off'} (config)")
-                except config.ConfigError as e:
-                    bad = str(e)
-                try:
-                    w.tick()    # reaping and timeouts go on under a broken config; only launching needs it
-                except config.ConfigError as e:
-                    bad = str(e)
-                except Exception:
-                    log("tick failed:\n" + traceback.format_exc())
-                if bad != bad_cfg:
-                    log(f"bad config, nothing launches until it is fixed: {bad}" if bad else "config fixed")
-                    bad_cfg = bad
-                with jobstore.listing() as s:
-                    if s.jobs(("queued", "running"), q):
-                        idle_since, spent = None, False
-                    else:
-                        idle_since = idle_since or time.time()
-                        spent = time.time() - idle_since >= idle_exit
-                        if spent:
-                            # let the claim go inside the scope that read the store, which is the one order
-                            # that leaves no job behind: a job stored after this finds the claim free and
-                            # starts the next worker, and one stored before it was read here, so this worker
-                            # stays
-                            claim.release()
-                if spent:
-                    log(f"idle for {idle_exit:g}s, exiting")
-                    break
-                # one wait, ended by the period or by a signal: a stop in flight is carried out in the next
-                # tick, and a wake or a SIGTERM is acted on as it arrives. The short period goes with the
-                # wake: a verb waiting for a stop wakes this worker on every pass of its own wait, so the
-                # tick after that wake is this worker's next one. A stop nobody waits for, a timeout's, is
-                # carried out at the queue's poll, and the store lock is not taken ten times a second for a
-                # job the kernel is slow to end
-                woken = waits.wait(min(period, STOP_PERIOD) if w.serving and woken else period)
-        except KeyboardInterrupt:
-            stop.append(1)
-        finally:
-            if stop:
-                log("stopped; running jobs keep running and the next worker adopts them")
-            claim.release()
-    return 0
-
-
-# ---- watchers: the pull side ----------------------------------------------------------------------
-#
-# `wait` and `watch` hold a lease (watchers/<pid>-<pstart>.claim) while they run and stamp each outcome they print on the job
-# (`reported`). An agent that runs one in the background hears the outcome from it.
-#
-# The stamp: job["reported"] = [{t, by: "wait pid N", session}], written only by _stamp_reported (wait/watch; never
-# `log -f` or a hook). session is the caller's agent session, None for a person. Readers:
-#   wait --mine    collects the session's ended jobs that carry no stamp of that session, so a job that fails
-#                  between `add` and `wait --mine` is still reported and the wait does not exit 0. Cost: the first
-#                  --mine of a session that never waited prints every outcome it never heard, old ones included; a
-#                  per-session cursor would avoid that with more state.
-#   show           "reported to" rows
-
-def _watcher_claim(pid: int, pstart: int) -> str:
-    """The file one `wait` or `watch` holds its lease on. The name is that process's own, so nobody else ever
-    takes it and the file goes with the lease."""
-    return os.path.join(jobstore.top("watchers"), f"{pid}-{pstart}.claim")
-
-
-@contextmanager
-def watching(ids: list[int] | None, scope: list[str] | None, verb: str):
-    """Hold a lease on these jobs (ids None: every job of scope; scope None: every queue) while the block runs."""
-    me, who = proc.read(os.getpid()), session.caller()
-    # the lease is a claim this process holds while it waits, under a name that is this process's own: the
-    # kernel lets it go when the process ends, however it ends, so no reader has to judge whether it is alive.
-    # It is locked before that name is visible (lock.Claim.make), so the sweep below can never take it from a
-    # wait that is taking it: a lease that is there is held, and one that is not held has lost its holder.
-    claim = lock.Claim.make(_watcher_claim(os.getpid(), me.start if me else 0),
-                            {"pid": os.getpid(), "ids": ids, "scope": scope, "verb": verb,
-                             "session": who["session"] if who else None, "t": time.time()})
-    try:
-        yield
-    finally:
-        claim.release()
-        lock.Claim.forget(claim.path)   # nobody else ever takes this name, so this frees nothing of theirs
-
-
-def watchers(job: dict | None = None) -> list[dict]:
-    """The live `wait` / `watch` processes holding a lease on this job, and none when job is None, which is
-    the sweep on its own.
-
-    A lease nobody holds is removed wherever this is asked. A wait ended by a signal runs no finally of its
-    own: the kernel let its claim go as the process died, and the file it was holding goes here. `show` asks
-    about one job, and a worker's tick asks about none, so the leases of an agent's interrupted waits are
-    swept where the queue is being read anyway.
-
-    A lease is locked before its name is visible (`watching`), so a lease that is there and unheld is one
-    whose holder has gone, and this takes nothing from a wait that is taking its own."""
-    d = jobstore.top("watchers")
-    out = []
-    for fn in sorted(os.listdir(d)):
-        if not fn.endswith(".claim"):
-            continue
-        path = os.path.join(d, fn)
-        rec = lock.Claim.holder(path)
-        if rec is None:
-            lock.Claim.forget(path)     # the process whose own name this is has gone, so the file goes too
-            continue
-        if job is None or not rec.get("pid"):
-            continue        # a sweep, which asks about none; or a record that names nobody
-        if (rec.get("ids") is None or job["id"] in rec["ids"]) and (rec.get("scope") is None or job["queue"] in rec["scope"]):
-            out.append(rec)
-    return out
-
-
 def _stamp_reported(jid: int, verb: str):
     who = session.caller()
     stamp = {"t": time.time(), "by": f"{verb} pid {os.getpid()}", "session": who["session"] if who else None}
@@ -1472,7 +782,7 @@ def public(j: dict) -> dict:
     Fields others rely on: id (int), state, queue, tag, project, cwd, cmd (argv), runner (argv, maybe []), needs,
     prio, owner {session, cwd} or None, timeout, retries, attempt, rc, reason, seconds, log,
     notes [{t, by, text}], reported [{t, by, session}], stop {by, t, grace, timeout, sent, kill9, denied, was}
-    on a job asked to stop, and from `show` also watchers [{pid, verb, session}].
+    on a job asked to stop, and from `show` also jobcore.watchers [{pid, verb, session}].
 
     `env` and `shell_env` keep their keys and give every value as "***". A token or a secret is what the help
     says to pass with --env, and an agent reads `--json` to see how its jobs are getting on, so the values
@@ -1566,7 +876,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     shell_env = {k: os.environ[k] for k in CAPTURED_ENV if k in os.environ}
     state = "held" if a.hold else "queued"
     project = project_name(cwd)
-    ids = []
+    records = []
     for c in cmds:
         job = {"queue": q, "tag": a.tag or default_tag(c), "project": project, "cwd": cwd, "cmd": c, "runner": [],
                "env": dict(env), "shell_env": shell_env, "needs": needs, "prio": a.prio, "owner": owner,
@@ -1574,9 +884,10 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
                "attempt": 1, "on_fail": on_fail, "on_done": on_done}
         if prepare_job:
             prepare_job(job, a)
-        with jobstore.txn() as s:
-            jid = s.add(job, state)["id"]
-        ids.append(jid)
+        records.append(job)
+    ids = jobcore.add_jobs(records, state)      # n records, n ids, one scope
+    for jid, job in zip(ids, records):
+        c = job["cmd"]
         print(jid)
         extra = " ".join(x for x in (f"timeout {ui.human_duration(timeout)}" if timeout else "",
                                       f"retries {retries}" if retries else "",
@@ -1585,7 +896,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
         print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(project)}] p{a.prio} {_needs_str(needs)} {extra}  "
               f"{_text(shlex.join(c), 100)}{via}", file=sys.stderr)
     if not a.hold and not a.no_start:
-        worker_up(q, wake=True)
+        _worker_up(q, wake=True)
     if owner:     # the pull side: an agent hears the outcome by waiting on it in the background
         some = " ".join(map(str, ids))
         print(f"pp {_PROG}: to hear how it ends, run `pp {_PROG} wait {some}` in the background (it exits with the "
@@ -1626,11 +937,11 @@ def cmd_status(a, scope: list[str] | None) -> int:
     all_jobs = jobstore.jobs()
     # what each queue's worker is, through the one construct, so the hints that nothing launches or records
     # this queue's jobs come back from the one answer it gave
-    workers = {q: worker_now(q) for q in _scope_list(scope)}
+    workers = {q: jobcore.worker_now(q) for q in _scope_list(scope)}
     # the queues those workers are of, so this view comes of one listing of the store: a queue another process
     # creates between two listings would otherwise be one this has no worker for
     qs = [q for q in workers
-          if scope is not None or any(j["queue"] == q for j in all_jobs) or workers[q].how != DOWN]
+          if scope is not None or any(j["queue"] == q for j in all_jobs) or workers[q].how != jobcore.DOWN]
     if a.here or a.project:
         want = a.project or project_name(os.getcwd())
         keep = lambda js: [j for j in js if j.get("project") == want]   # noqa: E731
@@ -1660,7 +971,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
         flat = lambda st: [public(j) for q in qs for j in per[q]["data"][st]]   # noqa: E731
         recent = sorted((j for q in qs for j in per[q]["recent"]), key=lambda j: -(j.get("ended") or 0))
         ui.print_json({"cards": cards, "queues": qs, "workers": {q: per[q]["wpid"] for q in qs},
-                       "starting": [q for q in qs if per[q]["how"] == STARTING],
+                       "starting": [q for q in qs if per[q]["how"] == jobcore.STARTING],
                        "pools": {q: per[q]["pools"] for q in qs}, "shared": shared,
                        "waiting": {q: per[q]["waiting"] for q in qs},
                        **{st: flat(st) for st in ("running", "queued", "held")},
@@ -1687,7 +998,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
         s = per[q]
         data, waiting, wpid = s["data"], s["waiting"], s["wpid"]
         up = (f"worker up (pid {wpid})" if wpid is not None else
-              ui.c("worker starting" if s["how"] == STARTING else "worker down", "yellow"))
+              ui.c("worker starting" if s["how"] == jobcore.STARTING else "worker down", "yellow"))
         usage = [_pool_str(p, now) for p in s["pools"]]
         head = ui.c(f"== {q}", "bold") + f"   {up}"
         counts = " · ".join(usage + [f"queued {len(data['queued'])}", f"held {len(data['held'])}",
@@ -1711,9 +1022,9 @@ def cmd_status(a, scope: list[str] | None) -> int:
                 print(line)
                 if last:
                     print(ui.c("      " + last, "dim"))
-            if s["how"] == DOWN:
+            if s["how"] == jobcore.DOWN:
                 print(ui.c(f"  nothing records how they end: `pp {_PROG} worker start -q {q}`", "yellow"))
-            elif s["how"] == STARTING:
+            elif s["how"] == jobcore.STARTING:
                 print(ui.c("  a worker is starting; it records how they end", "yellow"))
         if data["queued"]:
             print(ui.c("queued (run order)", "bold"))
@@ -1729,9 +1040,9 @@ def cmd_status(a, scope: list[str] | None) -> int:
             print("\n".join(_section(rows, 2, width)))
             if len(data["queued"]) > len(rows):
                 print(f"  ... {len(data['queued']) - len(rows)} more")
-            if s["how"] == DOWN:
+            if s["how"] == jobcore.DOWN:
                 print(ui.c(f"  nothing launches them: `pp {_PROG} worker start -q {q}`", "yellow"))
-            elif s["how"] == STARTING:
+            elif s["how"] == jobcore.STARTING:
                 print(ui.c("  a worker is starting; it launches them", "yellow"))
         if data["held"]:
             print(ui.c("held", "bold"))
@@ -1767,7 +1078,7 @@ def _pool_str(p: dict, now: float) -> str:
 
 def cmd_show(a) -> int:
     j = _one(a.id, "show", a.scope)
-    watched = [{k: w[k] for k in ("pid", "verb", "session")} for w in watchers(j)]
+    watched = [{k: w[k] for k in ("pid", "verb", "session")} for w in jobcore.watchers(j)]
     if a.json:
         ui.print_json({**public(j), "watchers": watched})
         return 0
@@ -1909,22 +1220,17 @@ def cmd_kill(a) -> int:
             ui.warn(f"{_PROG}: job {jid} is {j['state']}, not running; {hint}")
             rc = 2
             continue
-        with jobstore.txn() as s:
-            cur = s.job(jid)
-            if cur is None or cur["state"] in jobstore.ENDED:
-                print(f"job {jid} already {cur['state'] if cur else 'gone'}")
-                continue
-            if cur["state"] in ("queued", "held"):
-                # it went back to its queue for a retry: no process exists, so this is where it ends
-                was = cur["state"]
-                jobstore._finish(s, cur, "failed", None, "killed")
-                print(f"killed {jid} (it was {was}, with no process to stop)  {_text(j.get('tag'))}")
-                continue
-            cur["stop"] = policy.merge_stop(cur.get("stop"), {"by": _by(), "t": time.time(), "grace": float(a.grace)})
-            s.save(cur)
-        asked.append((j, cur["stop"]["t"]))
+        out = jobcore.ask_stop(jid, _by(), float(a.grace))
+        if out["did"] == "ended":
+            print(f"job {jid} already {out['was']}")
+            continue
+        if out["did"] == "killed":
+            # it went back to its queue for a retry: no process exists, so that is where it ended
+            print(f"killed {jid} (it was {out['was']}, with no process to stop)  {_text(j.get('tag'))}")
+            continue
+        asked.append((j, out["t"]))
     for q in sorted({j["queue"] for j, _t in asked}):
-        worker_up(q, wake=True)     # the queue's worker is what carries these stops out
+        _worker_up(q, wake=True)     # the queue's worker is what carries these stops out
     for j, t in asked:
         rc = max(rc, _await_stop(j, float(a.grace), t))
     return rc
@@ -1970,16 +1276,16 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
                     "the SIGTERM went out" if stop.get("sent") else "no signal of pp's has gone out")
             said = (f"{_PROG}: job {jid} is still running {waited} after it was asked to stop; {went}. "
                     f"`pp {_PROG} show {jid}` says what went out for it.")
-            if worker_now(q).up:
+            if jobcore.worker_now(q).up:
                 ui.warn(f"{said} The stop went to the {q} worker on every pass, so this wait is not the "
-                        f"queue's poll period. The {q} worker's log: {_worker_log(q)}")
+                        f"queue's poll period. The {q} worker's log: {jobcore.worker_log(q)}")
             else:
                 ui.warn(f"{said} No worker of the {q} queue is up now, so nothing is carrying it out. The "
-                        f"{q} worker's log says why none came up: {_worker_log(q)}")
+                        f"{q} worker's log says why none came up: {jobcore.worker_log(q)}")
             return 1
         # a pass wakes the worker that is up, so its next tick is this pass and what this waits out is the
         # job's own exit time. Where none is up, worker_up starts one at most every START_EVERY
-        worker_up(j["queue"], quiet=True, wake=True)
+        _worker_up(j["queue"], quiet=True, wake=True)
         if time.time() > deadline:
             continue        # a round of starts took this pass past the deadline: look once more and report
         time.sleep(KILL_POLL)
@@ -2004,48 +1310,43 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
         go = _gate(a, jobs, "drop", src)
         if go is not None:
             return go
+    # one transaction per job, each told the states it may act on, so none of them acts on a copy that has
+    # gone stale; the record it moved, or the state the store holds it in, is what this says
+    moved, left = jobcore.forget(jobs, src) if dst is None else jobcore.set_state(jobs, src, dst)
+    was = {cur["id"]: cur for cur in left}
     for j in jobs:
-        with jobstore.txn() as s:
-            cur = s.job(j["id"])
-            if cur is None or cur["state"] not in src:
-                if j["_bulk"]:
-                    if verb != "drop":          # drop's plan listed them already
-                        skipped.append(cur or {**j, "state": "gone"})
-                    continue
-                st = cur["state"] if cur else "gone"
-                hint = f". `pp {_PROG} kill {j['id']}` stops it" if st == "running" else ""
-                ui.warn(f"{_PROG}: job {j['id']} is {st}; {verb} works on {'/'.join(src)} jobs{hint}")
-                rc = 2
+        if j["id"] in was:
+            cur = was[j["id"]]
+            if j["_bulk"]:
+                if verb != "drop":          # drop's plan listed them already
+                    skipped.append(cur)
                 continue
-            if dst is None:
-                jobstore._forget_job(s, cur)         # the record, and every file that belongs to this job alone
-            else:
-                cur["state"] = dst
-                s.save(cur)
+            hint = f". `pp {_PROG} kill {j['id']}` stops it" if cur["state"] == "running" else ""
+            ui.warn(f"{_PROG}: job {j['id']} is {cur['state']}; {verb} works on {'/'.join(src)} jobs{hint}")
+            rc = 2
+            continue
         print(f"{done} {j['id']}  {_text(j.get('tag'))}")
         if dst == "queued":
-            started.add(cur["queue"])
+            started.add(j["queue"])
     _left(skipped)
     if not getattr(a, "no_start", False):          # a job added with --hold started no worker; one per queue
         for q in sorted(started):
-            worker_up(q, wake=True)
+            _worker_up(q, wake=True)
     return rc
 
 
 def _reprio(a) -> int:
     rc, skipped = 0, []
     for j in _resolve(a.ids, a.scope):
-        with jobstore.txn() as s:
-            cur = s.job(j["id"])
-            if cur is None or cur["state"] not in ("queued", "held"):
-                if j["_bulk"]:
-                    skipped.append(cur or {**j, "state": "gone"})
-                    continue
-                ui.warn(f"{_PROG}: job {j['id']} is {cur['state'] if cur else 'gone'}; reprio works on queued/held jobs")
-                rc = 2
+        cur = jobcore.amend(j["id"], {"prio": a.prio}, must_be=("queued", "held"))
+        if cur is None:
+            got = jobcore.find(j["id"])
+            if j["_bulk"]:
+                skipped.append(got or {**j, "state": "gone"})
                 continue
-            cur["prio"] = a.prio
-            s.save(cur)
+            ui.warn(f"{_PROG}: job {j['id']} is {got['state'] if got else 'gone'}; reprio works on queued/held jobs")
+            rc = 2
+            continue
         print(f"reprio {j['id']} -> p{a.prio}")
     _left(skipped)
     return rc
@@ -2069,15 +1370,14 @@ def cmd_retry(a) -> int:
         new.update(retry_of=j["id"], attempt=1)
         if a.prio is not None:
             new["prio"] = a.prio
-        with jobstore.txn() as s:
-            jid = s.add(new, "queued")["id"]
+        jid = jobcore.add_jobs([new], "queued")[0]
         print(jid)
         print(f"pp {_PROG}: retry of {j['id']} queued as {jid} ({j['queue']})", file=sys.stderr)
         started.add(j["queue"])
     _left(skipped)
     if not a.no_start:
         for q in sorted(started):
-            worker_up(q, wake=True)
+            _worker_up(q, wake=True)
     return rc
 
 
@@ -2095,16 +1395,8 @@ def cmd_clean(a, scope: list[str] | None) -> int:
         return 0
     if not ui.confirm("remove them?", a.yes):
         return 2
-    removed = 0
-    for batch in (victims[i:i + jobstore.CLEAN_BATCH] for i in range(0, len(victims), jobstore.CLEAN_BATCH)):
-        with jobstore.txn() as s:            # a batch at a time: a reader waits for the transaction, so it stays short
-            for v in batch:
-                j = s.job(v["id"], must_be=jobstore.ENDED)
-                if j is None:
-                    continue
-                jobstore._forget_job(s, j)
-                removed += 1
-    print(f"removed {removed}")
+    gone, _left_as_they_were = jobcore.forget(victims, jobstore.ENDED)
+    print(f"removed {len(gone)}")
     return 0
 
 
@@ -2161,7 +1453,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         before = {j["id"] for j in jobstore.jobs(jobstore.ENDED, scope)}
         told: set = set()
         asked: set = set()      # the queues this loop has asked for a worker: it says what holds a claim once
-        with watching(None, scope, verb):
+        with jobcore.watching(None, scope, verb):
             while True:
                 # one listing: the jobs still to come and the ones that ended are read together, so the last
                 # look, the one that finds none live, holds every outcome there is to report
@@ -2177,7 +1469,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                             tell(j, j["id"])
                 if not a.no_start:      # running ones too: only a worker records how a job ended
                     for q in {j["queue"] for j in live}:
-                        worker_up(q, quiet=q in asked)
+                        _worker_up(q, quiet=q in asked)
                         asked.add(q)
                 if timed_out():
                     print(f"[{_PROG} {verb}] timeout after {a.timeout:g}s", file=sys.stderr)
@@ -2218,7 +1510,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
     if held:
         print(f"[{_PROG} {verb}] note: {', '.join(map(str, held))} held, so this waits forever. "
               f"`pp {_PROG} release` them", file=sys.stderr)
-    with watching(targets, None, verb):
+    with jobcore.watching(targets, None, verb):
         prev: dict = {}
         told: set = set()
         asked = set()           # as above: a loop says what holds a queue's claim on its first pass only
@@ -2245,7 +1537,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
             if not a.no_start:      # a dead worker would otherwise make this wait forever, queued or running:
                 for q in {j["queue"] for j in cur.values() if j and j["state"] in ("queued", "running")}:
                     quietly = stream or q in asked
-                    w = worker_up(q, quiet=quietly)             # only a worker records how a job ended
+                    w = _worker_up(q, quiet=quietly)             # only a worker records how a job ended
                     asked.add(q)
                     if w.why and q not in blamed:
                         # `watch` asks quietly on every pass, so a queue no worker can come up for would
@@ -2253,7 +1545,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                         blamed.add(q)
                         if quietly:
                             say(f"[{_PROG} {verb}] the {q} worker did not come up: {w.why}; "
-                                f"its log: {_worker_log(q)}")
+                                f"its log: {jobcore.worker_log(q)}")
             if timed_out():
                 print(f"[{_PROG} {verb}] timeout after {a.timeout:g}s: {len(targets) - len(ended)} of {len(targets)} not ended",
                       file=sys.stderr)
@@ -2279,28 +1571,28 @@ def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | No
     """
     if a.action == "status":
         qs = [q_given] if q_given else _scope_list(scope)
-        rows = [{"queue": q, "pid": (w := worker_now(q)).pid, "how": w.how, "log": _worker_log(q)} for q in qs]
+        rows = [{"queue": q, "pid": (w := jobcore.worker_now(q)).pid, "how": w.how, "log": jobcore.worker_log(q)} for q in qs]
         if a.json:
             ui.print_json([{**r, "up": r["pid"] is not None} for r in rows])
         elif not rows:
             print("no queues yet")
         for r in [] if a.json else rows:
             state = (f"worker up (pid {r['pid']})" if r["pid"] is not None
-                     else "worker starting" if r["how"] == STARTING else "worker down")
+                     else "worker starting" if r["how"] == jobcore.STARTING else "worker down")
             print(f"{r['queue']}: {state}   log {r['log']}")
         return 0
     q = q_given or default_queue
     jobstore.writing_queue(q)    # `worker start -q NAME` opens that queue, so it goes through the same refusal
-    logf = _worker_log(q)
+    logf = jobcore.worker_log(q)
     if a.action == "start":
         # one answer, from the scope that acted on it: nothing looks at the claim again, so a worker that came
         # up between two looks can never read as one that never came
-        w = worker_up(q, quiet=True)
-        if w.how == STARTED:
+        w = _worker_up(q, quiet=True)
+        if w.how == jobcore.STARTED:
             print(f"{q}: started worker (pid {w.pid}; log {logf})")
         elif w.up:
             print(f"{q}: worker already up (pid {w.pid})")
-        elif w.how == STARTING:
+        elif w.how == jobcore.STARTING:
             ui.die(f"{_PROG}: {_starting(q)}; ask again", 1)
         else:
             # this asked quietly, so the reason the answer carries is said here: a start that timed out
@@ -2308,38 +1600,21 @@ def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | No
             why = f": {w.why}" if w.why else ""
             ui.die(f"{_PROG}: the {q} worker did not come up{why}; its log: {logf}")
         return 0
-    w = worker_now(q)           # one look, and this stop signals the worker that look found
-    if w.how == STARTING:       # there is nothing to signal yet: it has not recorded itself
+    # the stop is the core's: one look, the signal to the worker that look found, and the wait for that
+    # holder. What it did is worded here, with the pid it signalled
+    def slow(kind, job, f):
+        print(f"{q}: worker {f['pid']} is finishing its tick (a probe or nvidia-smi); waiting", flush=True)
+    out = jobcore.worker_stop(q, slow)
+    pid = out["pid"]
+    if out["did"] == "starting":        # there is nothing to signal yet: it has not recorded itself
         ui.die(f"{_PROG}: {_starting(q)}; ask again", 1)
-    if not w.up:                # nothing holds the claim: there is no worker, whatever is written in it
+    if out["did"] == "down":
         print(f"{q}: worker down")
         return 0
-    h = w.handle        # the handle this one look gave: no second look decides what is signalled
-    pid = h.id
-    outcome = proc.signal_pid(h, signal.SIGTERM)
-    if outcome == "gone":           # it exited since we looked, or that pid is another process now
-        print(f"{q}: worker down")
-        return 0
-    if outcome == "denied":
+    if out["did"] == "denied":
         ui.die(f"{_PROG}: not allowed to stop the {q} worker (pid {pid}); it belongs to another user", 1)
-    # it stops between ticks, and one tick can wait on a probe (up to 60s each) or nvidia-smi; it is down when
-    # the claim is no longer its own, which the kernel sees to even if it never reaches the end of its own stop.
-    # What this waits for is that worker, not a free claim: an `add` or a background `wait` starts the next
-    # worker as soon as the claim is free, and this stop is over when the one it signalled has let it go.
-    def it_still_holds() -> bool:
-        """Whether the worker this stop signalled still holds the claim, asked through the one construct. A
-        record naming another worker, and nothing holding the claim, are both that worker gone."""
-        held = worker_now(q).rec or {}
-        return (held.get("pid"), held.get("pstart")) == (h.id, h.start)
-
-    start, said = time.time(), False
-    while it_still_holds():
-        if not said and time.time() - start > 10:
-            print(f"{q}: worker {pid} is finishing its tick (a probe or nvidia-smi); waiting", flush=True)
-            said = True
-        if time.time() - start > STOP_WAIT:
-            ui.die(f"{_PROG}: the {q} worker ({pid}) did not stop within {ui.human_duration(STOP_WAIT)}; its log: {logf}")
-        time.sleep(0.1)
+    if out["did"] == "timeout":
+        ui.die(f"{_PROG}: the {q} worker ({pid}) did not stop within {ui.human_duration(jobcore.STOP_WAIT)}; its log: {logf}")
     print(f"{q}: stopped worker {pid}; running jobs keep running and the next worker adopts them")
     return 0
 
@@ -2450,7 +1725,7 @@ def run_cli(argv: list[str], prog: str, default_queue: str, doc: str, prepare_jo
     The store's refusal of a queue another layout wrote is worded here, the one place it is said: every verb
     opens a queue, so the refusal can come from any of them, and the store writes no sentence."""
     global _PROG
-    _PROG = prog
+    _PROG = jobcore.PROG = prog     # the worker the core starts is this command's own
     try:
         return _verb(argv, prog, default_queue, doc, prepare_job, add_args)
     except jobstore.Foreign as e:
@@ -2492,6 +1767,6 @@ def _verb(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job,
              "release": lambda: _transition(a, ("held",), "queued", "release", "released"),
              "clean": lambda: cmd_clean(a, scope),
              "wait": lambda: cmd_wait(a, scope), "watch": lambda: cmd_wait(a, scope, stream=True),
-             "work": lambda: work(q or default_queue, a.backfill, a.poll),
+             "work": lambda: cmd_work(q or default_queue, a.backfill, a.poll),
              "worker": lambda: cmd_worker(a, q, default_queue, scope)}
     return verbs[a.verb]() if a.verb in verbs else 2

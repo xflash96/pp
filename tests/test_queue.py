@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import journey  # noqa: E402
 import sandbox  # noqa: E402
 from pp.commands import queue as queue_cmd  # noqa: E402     the help text, which states the rules jobq keeps
-from pp.lib import config, jobpolicy, jobq, jobstore, proc  # noqa: E402
+from pp.lib import config, jobpolicy, jobcore, jobq, jobstore, proc  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -30,7 +30,7 @@ def card(index=0, total=24.0, used=0.0):
 def worker_pid(q: str = "default") -> int | None:
     """The pid of queue q's worker, as `worker_now` answers it: None where nobody holds the claim, and while a
     worker that holds it has not recorded itself. What every verb prints from, read here for a test."""
-    return jobq.worker_now(q).pid
+    return jobcore.worker_now(q).pid
 
 
 def _sentences(doc: str) -> list[str]:
@@ -66,8 +66,8 @@ LEFT_A_RECORD = """
 import json
 import os
 import sys
-from pp.lib import jobpolicy, jobq, jobstore, lock
-lock.Claim.take(jobq._worker_claim(sys.argv[1]), json.loads(sys.argv[2]))
+from pp.lib import jobpolicy, jobcore, jobq, jobstore, lock
+lock.Claim.take(jobcore._worker_claim(sys.argv[1]), json.loads(sys.argv[2]))
 os._exit(0)     # as a worker that was killed goes: no way out of its own runs, so its record stays behind
 """
 
@@ -111,7 +111,7 @@ class QueueCase(unittest.TestCase):
         self.sb.later(lambda: setattr(jobq, "_cards", cards0))
         # when this process last failed to bring a worker up, per queue: it holds a start off for START_EVERY,
         # and these tests are one process, so one test's queue must not hold the next test's off
-        jobq._none_came_up.clear()
+        jobcore._none_came_up.clear()
         self.tables: dict = {}
         self.shared = ""
         self.config("slots = 3")
@@ -119,7 +119,7 @@ class QueueCase(unittest.TestCase):
     def _restore(self):
         """The queue's own part of the way out: no job of this test's is left running."""
         for j in jobstore.jobs("running"):         # never leave a test job behind
-            h = jobq._group_handle(j)
+            h = jobcore._group_handle(j)
             if h is not None:
                 proc.signal_group(h, signal.SIGKILL)
 
@@ -143,22 +143,22 @@ class QueueCase(unittest.TestCase):
         self.assertIsNotNone(w.waiting, "the worker waits for nothing")
         return w.waiting["why"]
 
-    def as_the_worker(self, w=None, q: str = "default") -> jobq.Worker:
+    def as_the_worker(self, w=None, q: str = "default") -> jobcore.Worker:
         """This test's worker, holding queue q's worker claim: the worker a verb finds, so a kill wakes it
         and nothing starts a worker beside it.
 
-        The test enters jobq.waking() with it, so a verb's wake lands in this process's own wakeup pipe
+        The test enters jobcore.waking() with it, so a verb's wake lands in this process's own wakeup pipe
         instead of ending the test. `self.waits` is that pipe, which a test asks whether a wake arrived on."""
-        w = w or jobq.Worker(q)
-        wake = jobq.waking()
+        w = w or jobq.worker_for(q)
+        wake = jobcore.waking()
         self.waits = wake.__enter__()
         self.addCleanup(wake.__exit__, None, None, None)
-        claim = jobq.lock.Claim.take(jobq._worker_claim(q), w.record())
+        claim = jobq.lock.Claim.take(jobcore._worker_claim(q), w.record())
         self.assertIsNotNone(claim, f"something else holds the {q} worker claim")
         self.addCleanup(claim.release)
         return w
 
-    def worker_beside(self, w=None, q: str = "default") -> jobq.Worker:
+    def worker_beside(self, w=None, q: str = "default") -> jobcore.Worker:
         """A worker of queue q ticking beside the test until it ends, in place of the one a verb would start.
         What `kill` and `wait` need: only the queue's worker stops a job and records how it ended."""
         w = self.as_the_worker(w, q)
@@ -169,8 +169,8 @@ class QueueCase(unittest.TestCase):
         """Stand in for the worker a verb starts, as the real one is by the time it says it is ready: it
         holds the queue's claim and has recorded itself. It is this process, so the test can tick it, and
         `self.worker` is it."""
-        self.worker = w = jobq.Worker(q)
-        claim = jobq.lock.Claim.take(jobq._worker_claim(q), w.record())
+        self.worker = w = jobq.worker_for(q)
+        claim = jobq.lock.Claim.take(jobcore._worker_claim(q), w.record())
         self.assertIsNotNone(claim, f"the {q} worker claim was not free for the worker it started")
         self.addCleanup(claim.release)
         w.claim = claim
@@ -195,7 +195,7 @@ class QueueCase(unittest.TestCase):
         A wake the verb sends that worker lands in this process's own wakeup pipe, so no wake of a verb's
         ends the test."""
         self.worker, self.started, self.ticks = None, [], []
-        real = jobq.worker_up
+        real = jobcore.worker_up
 
         def worker_up(q, **kw):
             if each_pass is not None:
@@ -203,8 +203,8 @@ class QueueCase(unittest.TestCase):
             out = real(q, **kw)
             self.tick_here()
             return out
-        with jobq.waking(), mock.patch.object(jobq, "_start_worker", self.start_a_worker_here), \
-                mock.patch.object(jobq, "worker_up", worker_up), \
+        with jobcore.waking(), mock.patch.object(jobcore, "_start_worker", self.start_a_worker_here), \
+                mock.patch.object(jobcore, "worker_up", worker_up), \
                 mock.patch.object(jobq, "KILL_POLL", 0.0):
             yield
 
@@ -327,7 +327,7 @@ class TestStore(QueueCase):
         self.assertEqual(changes(lambda: self.call("release", "--no-start", str(j))), [("held", "queued")])
         self.assertEqual(changes(lambda: self.call("hold", str(j))), [("queued", "held")])
         self.call("release", "--no-start", str(j))
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.assertEqual(changes(w.tick), [("queued", "running")])       # claimed, then its pid amended in place
         self.assertEqual(changes(lambda: self.run_until(w, lambda: self.state(j) == "queued")),
                          [("running", "queued")])                       # the retry keeps the id
@@ -423,7 +423,7 @@ class TestStore(QueueCase):
         """POSIX does not say what a directory read sees while entries in it are replaced, and a file system
         may report one entry twice or skip it, so a listing holds the store lock shared."""
         self.config("slots = 1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         done = self.add(cmd="true")
         self.run_until(w, lambda: self.state(done) == "done")
         failed = self.add(cmd="exit 1")
@@ -450,7 +450,7 @@ class TestStore(QueueCase):
         """status reads the store once, so it cannot show one job as both running and done, nor count more
         jobs than it lists."""
         self.config("slots = 1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         done = self.add(cmd="true")
         self.run_until(w, lambda: self.state(done) == "done")
         self.add(cmd="sleep 30")
@@ -564,7 +564,7 @@ class TestStore(QueueCase):
             self.assertIn("--timeout", err.getvalue())      # the flag it is about, and how to write one
             self.assertIn("say how long", err.getvalue())
         ended = self.add(cmd="true")
-        self.run_until(jobq.Worker("default"), lambda: self.state(ended) in jobstore.ENDED)
+        self.run_until(jobq.worker_for("default"), lambda: self.state(ended) in jobstore.ENDED)
         for argv in (["add", "--no-start", "--cwd", self.work, "--timeout", "", "--", "true"],
                      ["add", "--no-start", "--cwd", self.work, "--retry-delay", "", "--", "true"],
                      ["clean", "--older", "", "-n"]):
@@ -591,7 +591,7 @@ class TestWorker(QueueCase):
     def test_runs_and_records_rc(self):
         ok = self.add(cmd="echo hello")
         bad = self.add(cmd="exit 3")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(ok) == "done" and self.state(bad) == "failed")
         self.assertEqual(jobstore.find(bad)["rc"], 3)
         with open(jobstore.find(ok)["log"]) as f:
@@ -603,7 +603,7 @@ class TestWorker(QueueCase):
         self.config("slots = 1")
         a = self.add(cmd="sleep 0.3")
         b = self.add(cmd="sleep 0.1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual((self.state(a), self.state(b)), ("running", "queued"))
         self.run_until(w, lambda: self.state(b) == "done")
@@ -614,7 +614,7 @@ class TestWorker(QueueCase):
         a = self.add("--need", "quota=1", cmd="sleep 2")
         b = self.add("--need", "quota=1", cmd="sleep 2")
         c = self.add(cmd="sleep 2")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual([self.state(x) for x in (a, b, c)], ["running", "queued", "queued"])   # strict: c waits behind b
         self.assertEqual(w.waiting["id"], b)
@@ -634,7 +634,7 @@ class TestWorker(QueueCase):
                 passes.append(str(path))
             return real(path)
         with mock.patch.object(jobq.os, "listdir", spy):
-            jobq.Worker("default").launch()
+            jobq.worker_for("default").launch()
         self.assertEqual([self.state(i) for i in ids], ["running"] * 4)
         self.assertEqual(len(passes), 2)        # the queued jobs, then the transaction that claims them
 
@@ -642,7 +642,7 @@ class TestWorker(QueueCase):
         self.config("slots = 1")
         a = self.add(cmd="sleep 2")
         b = self.add(cmd="sleep 2")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(self.state(b), "queued")
         self.config("slots = 2")
@@ -655,7 +655,7 @@ class TestWorker(QueueCase):
         not run."""
         h = self.add("--hold", cmd="true")
         self.assertEqual(self.state(h), "held")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         w.tick()
         self.assertEqual(self.state(h), "held")
@@ -667,14 +667,14 @@ class TestWorker(QueueCase):
         self.config("slots = 1")
         ids = [self.add(cmd="sleep 0.1") for _ in range(3)]
         self.assertEqual(self.call("reprio", str(ids[2]), "0")[0], 0)
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(self.state(ids[2]), "running")
         self.assertEqual(self.state(ids[0]), "queued")
 
     def test_retry_verb_carries_the_job_over(self):
         j = self.add("--tag", "flaky", "--prio", "4", "--timeout", "1h", "--retries", "0", "--on-fail", "true", cmd="exit 1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "failed")
         rc, out, _ = self.call("retry", "--no-start", str(j))
         self.assertEqual(rc, 0)
@@ -689,7 +689,7 @@ class TestWorker(QueueCase):
         self.assertEqual(self.call("drop", str(q))[0], 0)
         self.assertIsNone(jobstore.find(q))
         d = self.add(cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(d) == "done")
         rc, out, _ = self.call("clean", "-n")
         self.assertIn("1 ended", out)
@@ -708,7 +708,7 @@ class TestWorker(QueueCase):
         f = self.sb.path("hook")
         j = self.add("--retries", "1", "--retry-delay", "30", cmd="exit 1")
         done = self.add("--on-done", f"echo x >> {f}", cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "queued" and jobstore.find(j)["attempt"] == 2
                        and self.state(done) == "done")
         journey.until(lambda: jobstore.find(done).get("hooks"), timeout=10, what="the hook on the record")
@@ -726,11 +726,11 @@ class TestWorker(QueueCase):
 
     def test_adoption_reads_rc_from_file(self):
         j = self.add(cmd="sleep 0.3; exit 4")
-        w1 = jobq.Worker("default")
+        w1 = jobq.worker_for("default")
         w1.tick()
         self.assertEqual(self.state(j), "running")
         del w1                                  # the worker dies; the job does not
-        w2 = jobq.Worker("default")
+        w2 = jobq.worker_for("default")
         self.run_until(w2, lambda: self.state(j) == "failed")
         rec = jobstore.find(j)
         self.assertEqual(rec["rc"], 4)
@@ -738,10 +738,10 @@ class TestWorker(QueueCase):
 
     def test_adoption_without_rc_is_lost(self):
         j = self.add(cmd="sleep 30")
-        w1 = jobq.Worker("default")
+        w1 = jobq.worker_for("default")
         w1.tick()
-        proc.signal_group(jobq._group_handle(jobstore.find(j)), signal.SIGKILL)   # it dies before writing an rc
-        w2 = jobq.Worker("default")
+        proc.signal_group(jobcore._group_handle(jobstore.find(j)), signal.SIGKILL)   # it dies before writing an rc
+        w2 = jobq.worker_for("default")
         self.run_until(w2, lambda: self.state(j) == "failed")
         self.assertEqual(jobstore.find(j)["reason"], "lost")
 
@@ -749,7 +749,7 @@ class TestWorker(QueueCase):
         """A kill writes a stop on the job; its worker signals the whole group, so nothing the job started
         runs on, and records how it ended, which is what the kill prints."""
         j = self.add(cmd="sleep 30 & sleep 30; wait")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         pid = jobstore.find(j)["pid"]
         journey.until(lambda: len([p for p in proc.descendants(pid)
@@ -773,7 +773,7 @@ class TestWorker(QueueCase):
         The job's claim names its wrapper, which leads that group and holds the claim, so the worker reaches
         the group without pp ever signalling a bare id."""
         j = self.add(cmd="sleep 30 & sleep 30; wait")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         pid = jobstore.find(j)["pid"]
         journey.until(lambda: len(proc.descendants(pid)) >= 2, timeout=10, what="the job's children")
@@ -794,7 +794,7 @@ class TestWorker(QueueCase):
         left in its group goes with it, as it does after a timeout, so a command that ignores the signal does
         not outlive the job."""
         j = self.add(cmd="trap '' TERM; while :; do sleep 0.05; done")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         pid = jobstore.find(j)["pid"]
         journey.until(lambda: proc.descendants(pid), timeout=5, what="the job's command")
@@ -811,7 +811,7 @@ class TestWorker(QueueCase):
         ended. So a tick can find the claim free and the wrapper not yet reapable: the run is still live then,
         and its end is read once the worker reaps it, never guessed as lost."""
         j = self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         rec = jobstore.find(j)
         journey.until(lambda: proc.descendants(rec["pid"]), timeout=5, what="the job's command")
@@ -836,7 +836,7 @@ class TestWorker(QueueCase):
         that is running is stopped and reported."""
         a, b = self.add(cmd="sleep 30"), self.add(cmd="sleep 30")
         held = self.add("--hold", cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.worker_beside(w)
         rc, out, _ = self.call("kill", f"{a}-{held}", "-n")
@@ -859,7 +859,7 @@ class TestWorker(QueueCase):
         One stop carries one grace, the shorter of every ask, and that is the one the SIGKILL goes out after.
         It is also the one `kill` prints, whichever ask it came from: a kill that asks for two minutes inside
         a grace of a fifth of a second does not report a two-minute grace."""
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.worker_beside(w)       # one worker for the whole test, ticking beside it
         rows = [("a shorter ask hastens the SIGKILL", 300.0, 0.0, "0.2"),
                 ("a longer ask leaves the grace the record kept", 0.2, 1.0, "120")]
@@ -886,7 +886,7 @@ class TestWorker(QueueCase):
         field is in the list JSON consumers read, so a second reader does not wait for a stop that is never
         carried out."""
         j = self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         with mock.patch.object(jobq.proc, "signal_group", lambda *a, **k: "denied"):
             w.carry_out()                       # nothing in flight yet
@@ -916,7 +916,7 @@ class TestWorker(QueueCase):
         """A job the kill named as running may be back in its queue for a retry by the time the kill writes
         its stop. No process exists then, so the transaction ends it, and no worker is asked for."""
         j = self.add("--retries", "1", "--retry-delay", "30", cmd="exit 1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "queued" and jobstore.find(j)["attempt"] == 2)
         as_running = [{**jobstore.find(j), "state": "running", "_bulk": False}]      # as a kill read it before
         with mock.patch.object(jobq, "_resolve", lambda *a, **k: as_running):
@@ -925,7 +925,7 @@ class TestWorker(QueueCase):
         self.assertIn(f"killed {j} (it was queued, with no process to stop)", out)
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["reason"], rec["attempt"]), ("failed", "killed", 2))
-        self.assertIsNone(jobq.worker("default"))       # nothing was asked of a worker, and none was started
+        self.assertIsNone(jobcore.worker("default"))       # nothing was asked of a worker, and none was started
 
     def test_a_run_claim_the_launch_took_is_never_left_held(self):
         """A launch takes each admitted job's run claim inside its transaction and hands it to the spawn after
@@ -933,15 +933,15 @@ class TestWorker(QueueCase):
         never reached then reads as a run that is over, and the next pass records it, instead of a record that
         says running with a claim nothing will ever free."""
         a, b = self.add(cmd="sleep 30"), self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
-        real, seen = jobq._new_rcfile, []
+        w = jobq.worker_for("default")
+        real, seen = jobcore._new_rcfile, []
 
         def new_rcfile(j):          # the second job of the pass: the rest of its transaction cannot be done
             seen.append(j["id"])
             if len(seen) == 2:
                 raise OSError(28, "No space left on device")
             return real(j)
-        with mock.patch.object(jobq, "_new_rcfile", new_rcfile), self.assertRaises(OSError):
+        with mock.patch.object(jobcore, "_new_rcfile", new_rcfile), self.assertRaises(OSError):
             w.tick()
         self.assertEqual(seen, [a, b])
         for x in (a, b):
@@ -955,7 +955,7 @@ class TestWorker(QueueCase):
     def test_launch_failure(self):
         j = self.add(cmd="true")
         shutil.rmtree(self.work)
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         rec = jobstore.find(j)
         self.assertEqual(rec["state"], "failed")
@@ -975,7 +975,7 @@ class TestWorker(QueueCase):
             cur = s.job(bad)
             cur["env"] = {"PP_IS=NO_NAME": "1"}         # what no execve takes, so this job can never start
             s.save(cur)
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         rec = jobstore.find(bad)
         self.assertEqual(rec["state"], "failed", rec)
@@ -991,7 +991,7 @@ class TestNamedQueues(QueueCase):
         a1 = self.add(cmd="sleep 2", q="alpha")
         a2 = self.add(cmd="true", q="alpha")
         b1 = self.add(cmd="true", q="beta")
-        wa, wb = jobq.Worker("alpha"), jobq.Worker("beta")
+        wa, wb = jobq.worker_for("alpha"), jobq.worker_for("beta")
         wa.tick()
         self.assertEqual((self.state(a1), self.state(a2), self.state(b1)), ("running", "queued", "queued"))
         self.run_until(wb, lambda: self.state(b1) == "done")       # alpha's blocked head never holds up beta
@@ -1039,7 +1039,7 @@ class TestGpu(QueueCase):
         jobq._cards = lambda: [card(total=24)]           # budget: 24 - 2 = 22
         a = self.add("--gpu-gb", "12", cmd="sleep 2")
         b = self.add("--gpu-gb", "12", cmd="sleep 2")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual((self.state(a), self.state(b)), ("running", "queued"))
         self.assertIn("does not fit", self.why(w))
@@ -1051,7 +1051,7 @@ class TestGpu(QueueCase):
         self.config("slots = 3", q="beta")
         a = self.add("--gpu-gb", "12", cmd="sleep 2", q="alpha")
         b = self.add("--gpu-gb", "12", cmd="sleep 2", q="beta")
-        wa, wb = jobq.Worker("alpha"), jobq.Worker("beta")
+        wa, wb = jobq.worker_for("alpha"), jobq.worker_for("beta")
         wa.tick()
         wb.tick()
         self.assertEqual((self.state(a), self.state(b)), ("running", "queued"))
@@ -1061,7 +1061,7 @@ class TestGpu(QueueCase):
         cards = [card(total=24, used=19)]                # another tenant holds 19 GB
         jobq._cards = lambda: cards
         j = self.add("--gpu-gb", "10", cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(self.state(j), "queued")
         cards[0] = card(total=24, used=0)
@@ -1075,7 +1075,7 @@ class TestGpu(QueueCase):
         jobq._cards = lambda: cards
         a = self.add("--gpu-gb", "8", cmd="sleep 3", q="alpha")
         b = self.add("--gpu-gb", "8", cmd="sleep 3", q="beta")
-        wa, wb = jobq.Worker("alpha"), jobq.Worker("beta")
+        wa, wb = jobq.worker_for("alpha"), jobq.worker_for("beta")
         wa.tick()
         wb.tick()
         # nvidia-smi still says 14 free, but alpha's job has not allocated its 8 yet: 6 left, from beta's view too
@@ -1093,7 +1093,7 @@ class TestGpu(QueueCase):
     def test_picks_the_card_that_fits(self):
         jobq._cards = lambda: [card(0, total=24, used=14), card(1, total=24, used=4)]
         j = self.add("--gpu-gb", "15", cmd='echo "dev=$CUDA_VISIBLE_DEVICES"')
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "done")
         rec = jobstore.find(j)
         self.assertEqual(rec["gpu"], 1)
@@ -1110,7 +1110,7 @@ class TestPools(QueueCase):
         a2 = self.add("--cpu", "4", cmd="sleep 3", q="alpha")
         b1 = self.add("--cpu", "4", cmd="sleep 3", q="beta")
         b2 = self.add("--cpu", "1", cmd="sleep 3", q="beta")
-        wa, wb = jobq.Worker("alpha"), jobq.Worker("beta")
+        wa, wb = jobq.worker_for("alpha"), jobq.worker_for("beta")
         wa.tick()
         self.assertEqual((self.state(a1), self.state(a2)), ("running", "queued"))
         self.assertIn("[queue.alpha.resources] cpu", self.why(wa))          # alpha's own share: 6
@@ -1157,7 +1157,7 @@ class TestProbe(QueueCase):
         self.resources(f'nodes = {{ probe = "cat {free}", every = "0s", settle = "0.5s" }}')
         a = self.add("--need", "nodes=2", cmd="sleep 5")
         b = self.add("--need", "nodes=2", cmd="sleep 5")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual((self.state(a), self.state(b)), ("running", "queued"))
         self.assertIn("2 of it launched since", self.why(w))    # the probe said 3, but a took 2 after it
@@ -1176,7 +1176,7 @@ class TestProbe(QueueCase):
     def test_a_failing_probe_holds_the_job_and_says_why(self):
         self.resources('nodes = { probe = "echo cluster down >&2; exit 4", every = "0s" }')
         j = self.add("--need", "nodes=1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(self.state(j), "queued")
         self.assertIn("probe failed", self.why(w))
@@ -1196,7 +1196,7 @@ class TestProbe(QueueCase):
             self.assertLess(time.time() - t0, 5)        # it did not wait for the holder
             self.assertFalse(os.path.exists(ran))       # and it did not run the user's command
             j = self.add("--need", "nodes=1", cmd="true")
-            w = jobq.Worker("default")
+            w = jobq.worker_for("default")
             w.tick()
             self.assertEqual(self.state(j), "queued")
             self.assertIn("its probe is being read", self.why(w))
@@ -1215,7 +1215,7 @@ class TestProbe(QueueCase):
         calls = self.sb.path("calls")
         self.resources(f'nodes = {{ probe = "echo x >> {calls}; echo 5", every = "1h" }}')
         self.add("--need", "nodes=9")                           # never fits: every tick asks for a reading
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         w.tick()
         with open(calls) as f:
@@ -1224,7 +1224,7 @@ class TestProbe(QueueCase):
     def test_status_shows_shared_pools(self):
         self.resources('license = 2\nnodes = { probe = "echo 7", every = "0s" }')
         self.add("--need", "license=1", "--need", "nodes=1", cmd="sleep 3")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         out = self.call("status")[1]
         self.assertIn("shared: ", out)
@@ -1239,7 +1239,7 @@ class TestProbe(QueueCase):
 class TestTimeoutRetry(QueueCase):
     def test_timeout_kills_the_group(self):
         j = self.add("--timeout", "0.5", cmd="sleep 30 & sleep 30; wait")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         pid = jobstore.find(j)["pid"]
         journey.until(lambda: len(proc.descendants(pid)) >= 2, timeout=5, what="the job's children")
@@ -1253,7 +1253,7 @@ class TestTimeoutRetry(QueueCase):
         marker = self.sb.path("m")
         j = self.add("--retries", "2", "--retry-delay", "0.2", cmd=f"test -f {marker}.2 && exit 0; "
                      f"test -f {marker}.1 && touch {marker}.2 && exit 1; touch {marker}.1; exit 1")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: (jobstore.find(j) or {}).get("attempt") == 2)
         rec = jobstore.find(j)
         # queued for its delay, or running again where a pass took longer than the delay on a loaded machine:
@@ -1279,7 +1279,7 @@ class TestTimeoutRetry(QueueCase):
         hit = self.add("--retries", "1", "--retry-delay", "0.05", "--retry-if", "transient", cmd="echo transient glitch; exit 1")
         miss = self.add("--retries", "1", "--retry-delay", "0.05", "--retry-if", "transient", cmd="echo real bug; exit 1")
         tmo = self.add("--retries", "1", "--retry-delay", "0.05", "--retry-if", "^timeout$", "--timeout", "0.3", cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: all(self.state(x) == "failed" for x in (hit, miss, tmo)), timeout=10)
         self.assertEqual(jobstore.find(hit)["attempt"], 2)
         self.assertEqual(jobstore.find(miss)["attempt"], 1)       # not retryable: final at once
@@ -1291,7 +1291,7 @@ class TestTimeoutRetry(QueueCase):
         none of them counts backwards: `--retry-delay 1s` is the README's own line."""
         said: list = []
         j = self.add("--retries", "1", "--retry-delay", "1", cmd="echo trying; exit 3")
-        w = jobq.Worker("default", log=said.append)
+        w = jobq.worker_for("default", log=said.append)
         w.tick()
         rcf = jobstore.find(j)["rcfile"]
         journey.until(lambda: os.path.exists(rcf), timeout=10, what="the job's exit code")
@@ -1313,7 +1313,7 @@ class TestTimeoutRetry(QueueCase):
         self.config("slots = 1")
         a = self.add("--retries", "1", "--retry-delay", "30", cmd="exit 1")
         b = self.add(cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(b) == "done")
         self.assertEqual((self.state(a), jobstore.find(a)["attempt"]), ("queued", 2))
         rc, out, _ = self.call()
@@ -1329,7 +1329,7 @@ class TestHooks(QueueCase):
         f = self.hook_file()
         j = self.add("--retries", "2", "--retry-delay", "0.05", "--tag", "flaky",
                      "--on-fail", f"env | grep '^PP_QUEUE' | sort >> {f}; echo --- >> {f}", cmd="exit 7")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "failed")
         journey.until(lambda: os.path.exists(f) and "---" in text(f), timeout=5, what="the hook's output")
         for _ in range(3):
@@ -1348,7 +1348,7 @@ class TestHooks(QueueCase):
     def test_on_done(self):
         f = self.hook_file()
         j = self.add("--on-done", f"echo $PP_QUEUE_EVENT $PP_QUEUE_RC > {f}", "--on-fail", f"echo wrong > {f}", cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "done")
         journey.until(lambda: os.path.exists(f) and text(f).strip(), timeout=5, what="the hook's output")
         self.assertEqual(text(f).strip(), "done 0")
@@ -1357,7 +1357,7 @@ class TestHooks(QueueCase):
         f = self.hook_file()
         k = self.add("--on-fail", f"echo $PP_QUEUE_JOB >> {f}", cmd="sleep 30")
         d = self.add("--on-fail", f"echo $PP_QUEUE_JOB >> {f}", "--hold", cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.worker_beside(w)
         self.assertEqual(self.call("kill", str(k), "--grace", "1")[0], 0)
@@ -1371,13 +1371,13 @@ class TestHooks(QueueCase):
         report: the stop on its record says so, whatever its attempts left."""
         f = self.hook_file()
         k = self.add("--retries", "3", "--on-fail", f"echo x >> {f}", cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         with jobstore.txn() as s:
             cur = s.job(k, must_be=("running",))
             cur["stop"] = {"by": "user", "t": time.time(), "grace": 0, "sent": time.time()}
             s.save(cur)
-        proc.signal_group(jobq._group_handle(cur), signal.SIGKILL)
+        proc.signal_group(jobcore._group_handle(cur), signal.SIGKILL)
         self.run_until(w, lambda: self.state(k) == "failed")
         rec = jobstore.find(k)
         self.assertEqual((rec["reason"], rec["attempt"]), ("killed", 1))
@@ -1392,13 +1392,13 @@ class TestHooks(QueueCase):
         Without this a real failure is recorded as a kill, and the hook an agent waits on never runs."""
         f = self.hook_file()
         k = self.add("--retries", "3", "--on-fail", f"echo $PP_QUEUE_REASON >> {f}", cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         with jobstore.txn() as s:
             cur = s.job(k, must_be=("running",))
             cur["stop"] = {"by": "user", "t": time.time(), "grace": 10.0}   # written; nothing out for it
             s.save(cur)
-        proc.signal_group(jobq._group_handle(cur), signal.SIGKILL)       # something outside pp ended it
+        proc.signal_group(jobcore._group_handle(cur), signal.SIGKILL)       # something outside pp ended it
         journey.until(lambda: jobq.lock.Claim.holder(jobstore.run_claim("default", k)) is None, timeout=10,
                       what="the job's run to be over")
         w.carry_out()                   # its run is over before any pass of this worker, so nothing went out
@@ -1416,7 +1416,7 @@ class TestHooks(QueueCase):
         says pp was refused rather than leaving a person to read the job as lost."""
         j = self.add("--timeout", "60", "--retries", "1", "--retry-delay", "0.05", "--retry-if", "^timeout$",
                      cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.started_earlier(j, 120)                    # its own time has run out
         with mock.patch.object(jobq.proc, "signal_group", lambda *a, **k: "denied"):
@@ -1428,7 +1428,7 @@ class TestHooks(QueueCase):
             shown = self.call("show", str(j))[1]
         self.assertIn("nothing signalled", shown)
         self.assertIn("pp is not allowed to signal its group", shown)
-        proc.signal_group(jobq._group_handle(jobstore.find(j)), signal.SIGKILL)     # it ends some other way
+        proc.signal_group(jobcore._group_handle(jobstore.find(j)), signal.SIGKILL)     # it ends some other way
         journey.until(lambda: jobq.lock.Claim.holder(jobstore.run_claim("default", j)) is None, timeout=10,
                       what="the job's run to be over")
         w.carry_out()
@@ -1443,7 +1443,7 @@ class TestHooks(QueueCase):
         f = self.hook_file()
         j = self.add("--timeout", "0.2", "--retries", "0", "--on-fail", f"echo $PP_QUEUE_REASON > {f}",
                      cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "failed", timeout=15)
         self.assertEqual(jobstore.find(j)["reason"], "timeout")
         journey.until(lambda: os.path.exists(f) and text(f).strip(), timeout=5, what="the hook's output")
@@ -1459,12 +1459,12 @@ class TestHooks(QueueCase):
         pass fires it: a hook fires once, and not never."""
         f = self.hook_file()
         j = self.add("--on-fail", f"echo x >> {f}", cmd="exit 3")
-        w = jobq.Worker("default")
-        with mock.patch.object(jobq.Worker, "fire", lambda *a, **k: None):      # it died before firing it
+        w = jobq.worker_for("default")
+        with mock.patch.object(jobcore.Worker, "fire", lambda *a, **k: None):      # it died before firing it
             self.run_until(w, lambda: self.state(j) == "failed")
         self.assertEqual(jobstore.find(j)["hook_due"], "failed")
         self.assertFalse(os.path.exists(f))
-        w2 = jobq.Worker("default")
+        w2 = jobq.worker_for("default")
         w2.tick()                                   # the next worker finds the hook owed, and fires it
         journey.until(lambda: os.path.exists(f) and text(f).strip(), timeout=5, what="the hook's output")
         self.assertNotIn("hook_due", jobstore.find(j))
@@ -1477,7 +1477,7 @@ class TestHooks(QueueCase):
         f = self.hook_file()
         j = self.add("--on-fail", f"echo $PP_QUEUE_REASON > {f}", cmd="true")
         shutil.rmtree(self.work)
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         journey.until(lambda: os.path.exists(f) and text(f).strip(), timeout=5, what="the hook's output")
         self.assertIn("launch failed", text(f))
@@ -1504,7 +1504,7 @@ class TestHooks(QueueCase):
         self.sb.as_session("test-session-2")
         self.sb.setenv(TMUX_PANE="%999999", CLAUDECODE="1")
         j = self.add(cmd="env")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "done")
         with open(jobstore.find(j)["log"]) as f:
             log = f.read()
@@ -1527,7 +1527,7 @@ class TestShowNote(QueueCase):
         j = int(out.split()[-1])
         self.assertEqual(rc, 0, err)
         self.assertNotIn("\x1b", err)                   # add's own summary of what it queued
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "failed")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "failed")
         self.assertEqual(self.call("note", str(j), "note" + esc)[0], 0)
         for argv in (("status",), ("show", str(j)), ("wait", str(j), "--timeout", "10", "--poll", "0.05")):
             with self.subTest(argv=argv):
@@ -1538,7 +1538,7 @@ class TestShowNote(QueueCase):
 
     def test_note_and_show(self):
         j = self.add("--tag", "noted", "--timeout", "90s", cmd="echo out-line; exit 2")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "failed")
         rc, out, _ = self.call("note", str(j), "lr", "too", "high")
         self.assertEqual(rc, 0)
@@ -1557,7 +1557,7 @@ class TestShowNote(QueueCase):
         the header of the same output does, instead of leaking Python's None into what a person reads."""
         j = self.add("--timeout", "0.2", "--retries", "1", "--retry-delay", "0.05", "--retry-if", "timeout",
                      cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: jobstore.find(j)["attempt"] == 2, timeout=15)
         out = self.call("show", str(j))[1]
         self.assertIn("attempt 1: rc=- (timeout)", out)
@@ -1593,7 +1593,7 @@ class TestStatusWait(QueueCase):
         self.add(cmd="sleep 2")
         self.add(cmd="true")
         self.add("--hold", cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         rc, out, _ = self.call()
         self.assertEqual(rc, 0)
@@ -1610,7 +1610,7 @@ class TestStatusWait(QueueCase):
         self.config("slots = 3")
         a = self.add("--tag", "a", cmd="sleep 30")
         b = self.add("--tag", "a-very-long-tag-name-for-alignment", cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual([self.state(x) for x in (a, b)], ["running", "running"])
         out = self.call("status")[1]
@@ -1649,7 +1649,7 @@ class TestStatusWait(QueueCase):
     def test_exit_codes(self):
         ok = self.add(cmd="true")
         bad = self.add(cmd="exit 2")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(ok) == "done" and self.state(bad) == "failed")
         self.assertEqual(self.call("wait", str(ok))[0], 0)
         rc, out, _ = self.call("wait", f"{ok}-{bad}")
@@ -1674,7 +1674,7 @@ class TestPull(QueueCase):
 
     def test_wait_prints_the_failure_with_its_log_tail_and_stamps_the_job(self):
         j = self.add(cmd="echo first-line; echo boom-line; exit 3")
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "failed")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "failed")
         rc, out, _ = self.call("wait", str(j), "--no-start")
         self.assertEqual(rc, 1)
         self.assertIn("  | boom-line", out)
@@ -1685,7 +1685,7 @@ class TestPull(QueueCase):
         marker = self.sb.path("flaky")
         j = self.add("--retries", "1", "--retry-delay", "0.4", "--on-fail", "none",
                      cmd=f"sleep 0.3; test -f {marker} || {{ touch {marker}; echo flaked; exit 1; }}; echo fine")
-        self.sb.ticker(jobq.Worker("default").tick)
+        self.sb.ticker(jobq.worker_for("default").tick)
         rc, out, _ = self.call("watch", str(j), "--no-start", "--poll", "0.05", "--timeout", "20")
         self.assertEqual(rc, 0, out)
         lines = out.splitlines()
@@ -1700,13 +1700,13 @@ class TestPull(QueueCase):
         p = journey.start([sys.executable, os.path.join(ROOT, "bin", "pp"), "queue", "wait", str(j), "--no-start",
                            "--poll", "0.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            journey.until(lambda: jobq.watchers(jobstore.find(j)), timeout=10, what="the wait's lease on the job")
-            w = jobq.watchers(jobstore.find(j))[0]
+            journey.until(lambda: jobcore.watchers(jobstore.find(j)), timeout=10, what="the wait's lease on the job")
+            w = jobcore.watchers(jobstore.find(j))[0]
             self.assertEqual((w["pid"], w["ids"], w["verb"]), (p.pid, [j], "wait"))
             self.assertEqual(json.loads(self.call("show", str(j), "--json")[1])["watchers"][0]["pid"], p.pid)
         finally:
             p.close()         # no cleanup runs: the lease file stays behind ...
-        self.assertEqual(jobq.watchers(jobstore.find(j)), [])       # ... and is recognised as dead and removed
+        self.assertEqual(jobcore.watchers(jobstore.find(j)), [])       # ... and is recognised as dead and removed
         self.assertEqual(os.listdir(os.path.join(self.sb.state, "queue", "watchers")), [])
 
     def test_a_lease_whose_wait_a_signal_ended_is_swept_by_a_worker(self):
@@ -1719,13 +1719,13 @@ class TestPull(QueueCase):
         p = journey.start([sys.executable, os.path.join(ROOT, "bin", "pp"), "queue", "wait", str(j),
                            "--no-start", "--poll", "0.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(p.close)
-        journey.until(lambda: jobq.watchers(jobstore.find(j)), timeout=10, what="the wait's lease on the job")
+        journey.until(lambda: jobcore.watchers(jobstore.find(j)), timeout=10, what="the wait's lease on the job")
         leases = os.listdir(d)
         self.assertEqual(len(leases), 1, leases)
         p.signal(signal.SIGTERM)                     # as an agent ends a wait it ran in the background
         journey.until(lambda: p.poll() is not None, timeout=10, what="the wait to end")
         self.assertEqual(os.listdir(d), leases)      # nothing of its own took the file with it ...
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         self.assertEqual(os.listdir(d), [])          # ... and the next pass of a worker did
 
     def test_a_lease_a_signal_ended_mid_take_is_swept_too(self):
@@ -1744,7 +1744,7 @@ class TestPull(QueueCase):
         left = os.listdir(d)
         self.assertEqual(len(left), 1, left)            # the file it was holding, under the name it took
         self.assertFalse(os.path.exists(lease))         # and never under the name it was taking it for
-        self.assertEqual(jobq.watchers(), [])
+        self.assertEqual(jobcore.watchers(), [])
         self.assertEqual(os.listdir(d), [])             # the sweep every read of a queue runs forgot it
 
     def test_a_lease_cannot_be_swept_away_while_a_wait_is_taking_it(self):
@@ -1768,11 +1768,11 @@ class TestPull(QueueCase):
                 def stepped(*args, real=real, gate=gate, about=about_a_lease, **kw):
                     out = real(*args, **kw)
                     if about(args):
-                        gate.once(jobq.watchers)        # a worker's pass over the leases, exactly here
+                        gate.once(jobcore.watchers)        # a worker's pass over the leases, exactly here
                     return out
                 with mock.patch.object(where, fn, stepped):
-                    with jobq.watching([j], None, "wait"):
-                        held = [w["pid"] for w in jobq.watchers(jobstore.find(j))]
+                    with jobcore.watching([j], None, "wait"):
+                        held = [w["pid"] for w in jobcore.watchers(jobstore.find(j))]
                         files = os.listdir(d)
                 self.assertEqual(gate.ran, 1, f"no sweep ran as the lease was {step}")
                 self.assertEqual(held, [os.getpid()], f"the sweep took the lease away as it was {step}")
@@ -1785,7 +1785,7 @@ class TestPull(QueueCase):
         self.sb.as_session("session-b")
         theirs = self.add("--on-fail", "none", "--hold", cmd="true")
         self.sb.as_session("session-a")
-        self.sb.ticker(jobq.Worker("default").tick)
+        self.sb.ticker(jobq.worker_for("default").tick)
         rc, out, _ = self.call("wait", "--mine", "--no-start", "--poll", "0.05", "--timeout", "20")
         self.assertEqual(rc, 0, out)
         self.assertIn(f"done {mine}", out)
@@ -1828,7 +1828,7 @@ class TestPull(QueueCase):
             return real(jid)
         for argv in (["--mine"], []):
             j = self.add("--on-fail", "none", cmd=f"while [ ! -f {go} ]; do sleep 0.02; done")
-            ticker = self.sb.ticker(jobq.Worker("default").tick)
+            ticker = self.sb.ticker(jobq.worker_for("default").tick)
             journey.until(lambda: self.state(j) == "running", timeout=10, what=f"job {j} to start")
             with mock.patch.object(jobstore, "find", find):
                 rc, out, _ = self.call("wait", *argv, "--no-start", "--poll", "0.05", "--timeout", "10")
@@ -1900,10 +1900,10 @@ class TestWorkerClaim(QueueCase):
         self.add("--hold")
         me = proc.read(os.getpid())
         self.left_behind(pid=os.getpid(), pstart=me.start)
-        self.assertIsNone(jobq.worker("default"))
+        self.assertIsNone(jobcore.worker("default"))
         self.assertIsNone(worker_pid())
-        self.assertIsNone(jobq.worker_now("default").handle)
-        with jobq.lock.Claim.take(jobq._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start}):
+        self.assertIsNone(jobcore.worker_now("default").handle)
+        with jobq.lock.Claim.take(jobcore._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start}):
             self.assertEqual(worker_pid(), os.getpid())   # held: the record is this holder's own
 
     def test_stopping_a_worker_that_just_exited(self):
@@ -1919,7 +1919,7 @@ class TestWorkerClaim(QueueCase):
         worker that is down: that is what the stop says, and it says it without a warning."""
         self.add("--hold")
         me = proc.read(os.getpid())
-        with jobq.lock.Claim.take(jobq._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start}):
+        with jobq.lock.Claim.take(jobcore._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start}):
             with mock.patch.object(jobq.proc, "signal_pid", lambda *a, **k: "gone"):
                 rc, out, err = self.call("worker", "stop")
             self.assertEqual((rc, out.strip(), err), (0, "default: worker down", ""))
@@ -1929,8 +1929,8 @@ class TestWorkerClaim(QueueCase):
         is held by something that names no process. There is nothing to signal yet, so the stop says a worker
         is starting and asks the user to come back, rather than signalling whatever holds that pid."""
         self.add("--hold")
-        with jobq.lock.Claim.take(jobq._worker_claim("default")), \
-                mock.patch.object(jobq, "STARTING_PAUSE", 0):
+        with jobq.lock.Claim.take(jobcore._worker_claim("default")), \
+                mock.patch.object(jobcore, "STARTING_PAUSE", 0):
             rc, _, err = self.call("worker", "stop")
         self.assertEqual(rc, 1)
         self.assertIn("the default worker is starting", err)
@@ -1941,45 +1941,45 @@ class TestWorkerClaim(QueueCase):
         claim go, whoever holds it then."""
         self.add("--hold")
         me = proc.read(os.getpid())
-        old = jobq.lock.Claim.take(jobq._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start})
+        old = jobq.lock.Claim.take(jobcore._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start})
         self.addCleanup(old.release)
         successor = []
 
         def signalled(h, sig=signal.SIGTERM):
             old.release()                   # the worker it signalled ends, and the next one takes the claim
-            c = jobq.lock.Claim.take(jobq._worker_claim("default"), {"pid": os.getpid() + 1, "pstart": 1})
+            c = jobq.lock.Claim.take(jobcore._worker_claim("default"), {"pid": os.getpid() + 1, "pstart": 1})
             self.assertIsNotNone(c, "the successor could not take the claim")
             successor.append(c)
             self.addCleanup(c.release)
             return "exited"
-        with mock.patch.object(jobq.proc, "signal_pid", signalled), mock.patch.object(jobq, "STOP_WAIT", 2.0):
+        with mock.patch.object(jobq.proc, "signal_pid", signalled), mock.patch.object(jobcore, "STOP_WAIT", 2.0):
             rc, out, err = self.call("worker", "stop")
         self.assertEqual((rc, err), (0, ""))
         self.assertIn(f"stopped worker {os.getpid()}", out)
-        self.assertEqual((jobq.worker("default") or {}).get("pid"), os.getpid() + 1)   # the successor is up
+        self.assertEqual((jobcore.worker("default") or {}).get("pid"), os.getpid() + 1)   # the successor is up
 
     def test_readiness_means_a_stop_is_handled(self):
         """A worker says it is ready only once it holds its claim, has recorded itself and has its stop
         handler in place. So a SIGTERM the instant it says so stops it between ticks, and leaves no worker."""
         self.add("--hold")
-        p = jobq._start_worker("default")           # returns when the worker says it is ready
+        p = jobcore._start_worker("default")           # returns when the worker says it is ready
         self.addCleanup(p.wait)
         self.addCleanup(p.end, signal.SIGKILL)
         self.assertEqual(p.end(signal.SIGTERM), "alive")      # it went out; the wait says what it did
         self.assertEqual(p.wait(10), 0)             # its own exit, not a signal's
-        self.assertIsNone(jobq.worker("default"))
+        self.assertIsNone(jobcore.worker("default"))
 
     def test_a_worker_is_up_the_moment_worker_up_returns(self):
         """Nothing looks again to find out whether the worker it started came up: it was told."""
         self.config("slots = 3", table="idle_exit = 60\npoll = 0.2")
         self.add("--hold")
         self.addCleanup(self.call, "worker", "stop")
-        w = jobq.worker_up("default", quiet=True)
-        self.assertEqual((w.how, w.up), (jobq.STARTED, True))
-        self.assertEqual((jobq.worker("default") or {}).get("pid"), w.pid)
+        w = jobq._worker_up("default", quiet=True)
+        self.assertEqual((w.how, w.up), (jobcore.STARTED, True))
+        self.assertEqual((jobcore.worker("default") or {}).get("pid"), w.pid)
         rc, out, _ = self.call("worker", "stop")
         self.assertEqual((rc, out.split()[:3]), (0, ["default:", "stopped", "worker"]))
-        self.assertIsNone(jobq.worker("default"))
+        self.assertIsNone(jobcore.worker("default"))
 
     def test_the_answer_is_a_decision_taken_after_the_last_start(self):
         """A worker that lets the claim go between the start and the next look sends `worker_up` round
@@ -1992,18 +1992,18 @@ class TestWorkerClaim(QueueCase):
             """The first workers take the claim and let it go, as one at its idle_exit does; the last keeps
             it, as a worker that is up does."""
             starts.append(q)
-            claim = jobq.lock.Claim.take(jobq._worker_claim(q), {"pid": os.getpid(), "pstart": me.start})
+            claim = jobq.lock.Claim.take(jobcore._worker_claim(q), {"pid": os.getpid(), "pstart": me.start})
             self.assertIsNotNone(claim, f"the {q} worker claim was not free for the worker it started")
             if len(starts) < 3:
                 claim.release()
                 return mock.Mock(pid=-1)
             self.addCleanup(claim.release)
             return mock.Mock(pid=os.getpid())
-        with mock.patch.object(jobq, "_start_worker", start):
+        with mock.patch.object(jobcore, "_start_worker", start):
             rc, out, err = self.call("worker", "start")
         self.assertEqual(rc, 0, err)
         self.assertIn(f"started worker (pid {os.getpid()};", out)
-        self.assertEqual(len(starts), jobq.WORKER_STARTS)
+        self.assertEqual(len(starts), jobcore.WORKER_STARTS)
         self.assertEqual(worker_pid(), os.getpid())
 
     def test_a_job_added_before_the_worker_lets_go_of_its_claim_keeps_it_up(self):
@@ -2012,7 +2012,7 @@ class TestWorkerClaim(QueueCase):
         that stored it starts the next worker."""
         self.config("slots = 3", table="idle_exit = 0\npoll = 0.01")
         self.add("--hold")                          # nothing to run: the worker is idle from the start
-        real, added, started, ticks = jobq.Worker.tick, [], [], []
+        real, added, started, ticks = jobcore.Worker.tick, [], [], []
         real_release, store = jobq.lock.Claim.release, []
         asked, adding = journey.Gate(), journey.Gate()
 
@@ -2042,16 +2042,16 @@ class TestWorkerClaim(QueueCase):
             raise AssertionError("it started a worker while one held the claim")
         # work() installs its own stop handler; the scope hands SIGTERM back the way this test found it
         self.sb.on_signal(signal.SIGTERM, signal.getsignal(signal.SIGTERM))
-        with mock.patch.object(jobq.Worker, "tick", tick), redirect_stdout(io.StringIO()), \
+        with mock.patch.object(jobcore.Worker, "tick", tick), redirect_stdout(io.StringIO()), \
                 mock.patch.object(jobq.lock.Claim, "release", release), \
-                mock.patch.object(jobq, "_start_worker", never):
-            jobq.work("default")
+                mock.patch.object(jobcore, "_start_worker", never):
+            jobq.cmd_work("default")
         # the claim went inside the scope that had read the store, so no other process could read it yet: a job
         # stored before that read is this worker's, and one stored after it finds the claim free
         self.assertEqual(store, ["busy"])
         self.assertEqual(started, [])               # the add found the worker up, as it was
         self.assertEqual(self.state(added[0]), "done")
-        self.assertIsNone(jobq.worker("default"))   # and it let the claim go on its way out
+        self.assertIsNone(jobcore.worker("default"))   # and it let the claim go on its way out
 
 
     def me(self) -> dict:
@@ -2064,10 +2064,10 @@ class TestWorkerClaim(QueueCase):
         worker and start another, which would find the claim taken and bring nothing up. Nothing is decided
         from such a look: the answer is the holder's own record."""
         self.add("--hold")
-        claim = jobq.lock.Claim.take(jobq._worker_claim("default"))      # held, and naming nothing yet
+        claim = jobq.lock.Claim.take(jobcore._worker_claim("default"))      # held, and naming nothing yet
         self.assertIsNotNone(claim, "something else holds the default worker claim")
         self.addCleanup(claim.release)
-        looks, gate, real, started = [], journey.Gate(), jobq.worker, []
+        looks, gate, real, started = [], journey.Gate(), jobcore.worker, []
 
         def records_itself(q):
             rec = real(q)
@@ -2075,10 +2075,10 @@ class TestWorkerClaim(QueueCase):
             # the worker writes its record exactly between the look that found none and the next one
             gate.once(lambda: claim.write({**self.me(), "waiting": None}))
             return rec
-        with mock.patch.object(jobq, "worker", records_itself), \
-                mock.patch.object(jobq, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)):
-            w = jobq.worker_up("default", quiet=True)
-        self.assertEqual((w.how, w.pid, gate.ran), (jobq.UP, os.getpid(), 1))
+        with mock.patch.object(jobcore, "worker", records_itself), \
+                mock.patch.object(jobcore, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)):
+            w = jobq._worker_up("default", quiet=True)
+        self.assertEqual((w.how, w.pid, gate.ran), (jobcore.UP, os.getpid(), 1))
         self.assertEqual(looks[0], {})      # the first look found a holder that named nothing
         self.assertEqual(started, [])       # and nothing was started while that worker held the claim
 
@@ -2100,7 +2100,7 @@ class TestWorkerClaim(QueueCase):
             said.extend([self.call("status")[1], self.call("worker", "status")[1]])
             out = io.StringIO()
             with redirect_stdout(out):
-                self.assertEqual(jobq.work("default"), 0)   # a worker that finds the claim held says so too
+                self.assertEqual(jobq.cmd_work("default"), 0)   # a worker that finds the claim held says so too
             said.append(out.getvalue())
             said.append(self.call("worker", "stop")[2])
             # the two verbs that start workers: in this window they start none and say a worker is starting
@@ -2114,9 +2114,9 @@ class TestWorkerClaim(QueueCase):
             gate.once(asked_in_that_window)
             return real(fd, length)
         with mock.patch.object(jobq.lock.os, "ftruncate", ftruncate), \
-                mock.patch.object(jobq, "STARTING_PAUSE", 0), \
-                mock.patch.object(jobq, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)):
-            claim = jobq.lock.Claim.take(jobq._worker_claim("default"), self.me())
+                mock.patch.object(jobcore, "STARTING_PAUSE", 0), \
+                mock.patch.object(jobcore, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)):
+            claim = jobq.lock.Claim.take(jobcore._worker_claim("default"), self.me())
             self.addCleanup(claim.release)
         self.assertEqual(gate.ran, 1)
         self.assertEqual(started, [])       # no verb started a worker beside the one holding the claim
@@ -2132,7 +2132,7 @@ class TestWorkerClaim(QueueCase):
         # and what a JSON consumer reads of the same state
         self.assertEqual(data["status"]["starting"], ["default"])
         self.assertIsNone(data["status"]["workers"]["default"])
-        self.assertEqual(data["worker"][0]["how"], jobq.STARTING)
+        self.assertEqual(data["worker"][0]["how"], jobcore.STARTING)
         self.assertIs(data["worker"][0]["up"], False)
 
     def test_a_start_that_brings_no_worker_up_is_told_to_the_verb_that_asked_out_loud(self):
@@ -2145,20 +2145,20 @@ class TestWorkerClaim(QueueCase):
         for failed, said in ((never, "did not say it was ready"),
                              (lambda q: mock.Mock(pid=-1), "the default worker did not come up")):
             with self.subTest(said=said):
-                jobq._none_came_up.clear()      # the hold-off the round before this one left
+                jobcore._none_came_up.clear()      # the hold-off the round before this one left
                 out, err = io.StringIO(), io.StringIO()
-                with mock.patch.object(jobq, "_start_worker", failed), \
+                with mock.patch.object(jobcore, "_start_worker", failed), \
                         redirect_stdout(out), redirect_stderr(err):
-                    loud = jobq.worker_up("default")
-                self.assertEqual(loud.how, jobq.DOWN)
+                    loud = jobq._worker_up("default")
+                self.assertEqual(loud.how, jobcore.DOWN)
                 self.assertIn(said, err.getvalue())
                 self.assertIn("worker.log", err.getvalue())
-                jobq._none_came_up.clear()
+                jobcore._none_came_up.clear()
                 qout, qerr = io.StringIO(), io.StringIO()
-                with mock.patch.object(jobq, "_start_worker", failed), \
+                with mock.patch.object(jobcore, "_start_worker", failed), \
                         redirect_stdout(qout), redirect_stderr(qerr):
-                    quiet = jobq.worker_up("default", quiet=True)
-                self.assertEqual(quiet.how, jobq.DOWN)      # the same answer, and not a word about it
+                    quiet = jobq._worker_up("default", quiet=True)
+                self.assertEqual(quiet.how, jobcore.DOWN)      # the same answer, and not a word about it
                 self.assertEqual((qout.getvalue(), qerr.getvalue()), ("", ""))
 
     def test_worker_start_says_why_the_start_timed_out(self):
@@ -2168,8 +2168,8 @@ class TestWorkerClaim(QueueCase):
         crash."""
         def never(q):
             raise TimeoutError("pp did not say it was ready within 60s")
-        jobq._none_came_up.clear()
-        with mock.patch.object(jobq, "_start_worker", never):
+        jobcore._none_came_up.clear()
+        with mock.patch.object(jobcore, "_start_worker", never):
             rc, _out, err = self.call("worker", "start")
         self.assertEqual(rc, 1)
         self.assertIn("the default worker did not come up: pp did not say it was ready within 60s", err)
@@ -2178,10 +2178,10 @@ class TestWorkerClaim(QueueCase):
     def test_a_queue_whose_worker_came_up_is_not_held_off_the_next_start(self):
         """The hold-off is on a queue whose last round of starts brought none up, and it goes as soon as a
         worker is found up: a queue that recovers is started again at once."""
-        jobq._none_came_up["default"] = time.time()
+        jobcore._none_came_up["default"] = time.time()
         w = self.as_the_worker()                        # a worker is up now
-        self.assertTrue(jobq.worker_up("default", quiet=True).up)
-        self.assertNotIn("default", jobq._none_came_up)
+        self.assertTrue(jobq._worker_up("default", quiet=True).up)
+        self.assertNotIn("default", jobcore._none_came_up)
         self.assertEqual(w.queue, "default")
 
     def test_add_release_and_retry_wake_a_worker_that_is_up(self):
@@ -2189,10 +2189,10 @@ class TestWorkerClaim(QueueCase):
         that wake brings forward and not at the end of the worker's period."""
         held = self.add("--hold", cmd="true")
         ended = self.add(cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(ended) == "done")
-        with jobq.waking() as waits:        # this process is the worker: a wake lands in its own pipe
-            claim = jobq.lock.Claim.take(jobq._worker_claim("default"), w.record())
+        with jobcore.waking() as waits:        # this process is the worker: a wake lands in its own pipe
+            claim = jobq.lock.Claim.take(jobcore._worker_claim("default"), w.record())
             self.assertIsNotNone(claim, "something else holds the default worker claim")
             self.addCleanup(claim.release)
             self.assertFalse(waits.wait(0), "a wake arrived before any verb sent one")
@@ -2216,10 +2216,10 @@ class TestAKillWithNoWorkerUp(QueueCase):
         record. That worker signals the job, records how it ended, and launches the queue's queued jobs, as
         the worker an `add` starts does."""
         running = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         self.assertEqual(self.state(running), "running")
         queued = self.add(cmd="true")
-        self.assertIsNone(jobq.worker("default"))
+        self.assertIsNone(jobcore.worker("default"))
         with self.one_thread():
             rc, out, err = self.call("kill", str(running))
         self.assertEqual((rc, self.started), (0, ["default"]), err)
@@ -2233,9 +2233,9 @@ class TestAKillWithNoWorkerUp(QueueCase):
         """The second kill runs inside the first one's wait. It finds the worker the first one started and
         wakes it, so one worker has both stops to carry out and both kills hear their own outcome."""
         a, b = self.add(cmd="sleep 30"), self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         self.assertEqual((self.state(a), self.state(b)), ("running", "running"))
-        self.assertIsNone(jobq.worker("default"))
+        self.assertIsNone(jobcore.worker("default"))
         second, other = journey.Gate(), []
 
         def the_second_kill():
@@ -2260,12 +2260,12 @@ class TestAKillWithNoWorkerUp(QueueCase):
         f = self.sb.path("hook")
         j = self.add("--retries", "2", "--retry-delay", "0.05", "--timeout", "60", "--on-fail",
                      f"echo x >> {f}", cmd="trap '' TERM; while :; do sleep 0.05; done")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         with jobstore.txn() as s:       # its time ran out and the worker wrote the stop, as a timeout does
             cur = s.job(j, must_be=("running",))
             cur["stop"] = {"by": "timeout", "timeout": True, "t": time.time(), "grace": 10.0}
             s.save(cur)
-        self.addCleanup(proc.signal_group, jobq._group_handle(cur), signal.SIGKILL)
+        self.addCleanup(proc.signal_group, jobcore._group_handle(cur), signal.SIGKILL)
         with self.one_thread():
             rc, out, err = self.call("kill", str(j), "--grace", "0")
         self.assertEqual((rc, err.count("started the default worker")), (0, 1), err)
@@ -2286,10 +2286,10 @@ class TestAKillWithNoWorkerUp(QueueCase):
         brought up: the queue has no worker now, nothing of pp's has gone out, and the log of the worker that
         never came up is where that is written. It never names a worker log as one that holds this job."""
         j = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         self.assertEqual(self.state(j), "running")
         started: list = []
-        with mock.patch.object(jobq, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)), \
+        with mock.patch.object(jobcore, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)), \
                 mock.patch.object(jobq, "KILL_WAIT", 0.0):
             rc, _out, err = self.call("kill", str(j), "--grace", "0")
         self.assertEqual(rc, 1)
@@ -2297,19 +2297,19 @@ class TestAKillWithNoWorkerUp(QueueCase):
         self.assertIn("no signal of pp's has gone out", err)
         self.assertIn("No worker of the default queue is up now", err)
         self.assertIn("worker.log", err)
-        self.assertEqual(started, ["default"] * jobq.WORKER_STARTS)     # it asked for one, each time
+        self.assertEqual(started, ["default"] * jobcore.WORKER_STARTS)     # it asked for one, each time
 
     def test_a_kill_whose_job_outlives_the_wait_says_what_went_out_for_it(self):
         """A queue with no worker now is not a stop nothing went out for: a worker can send the SIGTERM,
         record it and then go away. What went out is on the job's record, so the message says it from there
         instead of telling a person the opposite of what `show` would."""
         j = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         with jobstore.txn() as s:               # a worker sent the SIGTERM and recorded it, then went away
             cur = s.job(j, must_be=("running",))
             cur["stop"] = {"by": "ann", "t": time.time(), "grace": 30.0, "sent": time.time()}
             s.save(cur)
-        with mock.patch.object(jobq, "_start_worker", lambda q: mock.Mock(pid=-1)), \
+        with mock.patch.object(jobcore, "_start_worker", lambda q: mock.Mock(pid=-1)), \
                 mock.patch.object(jobq, "KILL_WAIT", 0.0):
             rc, _out, err = self.call("kill", str(j), "--grace", "0")
         self.assertEqual(rc, 1)
@@ -2323,27 +2323,27 @@ class TestAKillWithNoWorkerUp(QueueCase):
         the claim and dies in its first tick is started again only every START_EVERY, not ten times a second.
         The clock is the test's: each pass moves it on by a tenth of a second."""
         j = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         started: list = []
         clock = [1000.0]
 
         def sleep(_s):
             clock[0] += 0.1
-        with mock.patch.object(jobq, "_start_worker", lambda q: started.append(clock[0]) or mock.Mock(pid=-1)), \
-                mock.patch.object(jobq, "KILL_WAIT", 12.0), mock.patch.object(jobq, "START_EVERY", 5.0), \
+        with mock.patch.object(jobcore, "_start_worker", lambda q: started.append(clock[0]) or mock.Mock(pid=-1)), \
+                mock.patch.object(jobq, "KILL_WAIT", 12.0), mock.patch.object(jobcore, "START_EVERY", 5.0), \
                 mock.patch.object(jobq.time, "time", lambda: clock[0]), mock.patch.object(jobq.time, "sleep", sleep):
             rc, _out, err = self.call("kill", str(j), "--grace", "0")
         self.assertEqual(rc, 1)
         rounds = sorted({round(t - 1000.0) for t in started})
         self.assertEqual(rounds, [0, 5, 10], started)       # the verb's own ask, then one round every 5s
-        self.assertLessEqual(len(started), 4 * jobq.WORKER_STARTS)
+        self.assertLessEqual(len(started), 4 * jobcore.WORKER_STARTS)
 
     def test_a_round_of_starts_that_outlasts_the_interval_still_holds_the_next_one_off(self):
         """The interval is counted from the clock after the round, not before it: a start waits for the
         worker to say it is ready, so a round of them can take longer than START_EVERY. Counted from before,
         every pass after such a round would start another."""
         j = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         started: list = []
         clock = [1000.0]
 
@@ -2354,13 +2354,13 @@ class TestAKillWithNoWorkerUp(QueueCase):
 
         def sleep(_s):
             clock[0] += 0.1
-        with mock.patch.object(jobq, "_start_worker", start), \
-                mock.patch.object(jobq, "KILL_WAIT", 30.0), mock.patch.object(jobq, "START_EVERY", 5.0), \
+        with mock.patch.object(jobcore, "_start_worker", start), \
+                mock.patch.object(jobq, "KILL_WAIT", 30.0), mock.patch.object(jobcore, "START_EVERY", 5.0), \
                 mock.patch.object(jobq.time, "time", lambda: clock[0]), mock.patch.object(jobq.time, "sleep", sleep):
             rc, _out, err = self.call("kill", str(j), "--grace", "0")
         self.assertEqual(rc, 1)
-        rounds = len(started) // jobq.WORKER_STARTS
-        self.assertEqual(len(started) % jobq.WORKER_STARTS, 0, started)
+        rounds = len(started) // jobcore.WORKER_STARTS
+        self.assertEqual(len(started) % jobcore.WORKER_STARTS, 0, started)
         # 30s of waiting, 12s per round and 5s held off after each: three rounds, not one per pass
         self.assertEqual(rounds, 3, started)
         # the round that ran past the deadline is reported as soon as it is over, and the time said is the
@@ -2377,8 +2377,8 @@ class TestAKillWithNoWorkerUp(QueueCase):
 
         def sleep(_s):
             clock[0] += 0.5                 # the wait's own --poll, as this test's clock sees it
-        with mock.patch.object(jobq, "_start_worker", lambda q: started.append(clock[0]) or mock.Mock(pid=-1)), \
-                mock.patch.object(jobq, "START_EVERY", 5.0), \
+        with mock.patch.object(jobcore, "_start_worker", lambda q: started.append(clock[0]) or mock.Mock(pid=-1)), \
+                mock.patch.object(jobcore, "START_EVERY", 5.0), \
                 mock.patch.object(jobq.time, "time", lambda: clock[0]), mock.patch.object(jobq.time, "sleep", sleep):
             rc, _out, err = self.call("wait", str(j), "--timeout", "20", "--poll", "0.5")
         self.assertEqual(rc, 3)             # it gave up at its timeout, with the job still queued
@@ -2398,9 +2398,9 @@ class TestAKillWithNoWorkerUp(QueueCase):
 
         def sleep(_s):
             clock[0] += 0.5                 # the watch's own --poll, as this test's clock sees it
-        jobq._none_came_up.clear()
-        with mock.patch.object(jobq, "_start_worker", never), \
-                mock.patch.object(jobq, "START_EVERY", 5.0), \
+        jobcore._none_came_up.clear()
+        with mock.patch.object(jobcore, "_start_worker", never), \
+                mock.patch.object(jobcore, "START_EVERY", 5.0), \
                 mock.patch.object(jobq.time, "time", lambda: clock[0]), mock.patch.object(jobq.time, "sleep", sleep):
             rc, out, _err = self.call("watch", str(j), "--timeout", "20", "--poll", "0.5")
         self.assertEqual(rc, 3)             # it gave up at its timeout, with the job still queued
@@ -2423,14 +2423,14 @@ class TestJobClaim(QueueCase):
         """A record with nothing in it to signal is not a job that has ended: its claim says it runs, and the
         wrapper's own pid in that claim names it again."""
         j = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         with jobstore.txn() as s:               # as if its worker had died before it recorded the process
             cur = s.job(j, must_be=("running",))
             for k in ("pid", "pgid", "pstart"):
                 cur.pop(k, None)
             s.save(cur)
         self.assertIsNotNone(jobq.lock.Claim.holder(jobstore.run_claim("default", j)))
-        jobq.Worker("default").carry_out()
+        jobq.worker_for("default").carry_out()
         self.assertEqual(self.state(j), "running")      # not lost, and not reported
         rec = jobstore.find(j)
         self.assertTrue(proc.alive(rec["pid"], rec["pstart"]))      # named again, from its claim
@@ -2441,12 +2441,12 @@ class TestJobClaim(QueueCase):
         """The claim decides whether a run may start, so a job that is queued again while its own run is still
         live is not started a second time."""
         j = self.add(cmd="sleep 30")
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         with jobstore.txn() as s:               # queued under its own run, as a lost race would leave it
             cur = s.job(j, must_be=("running",))
             cur["state"] = "queued"
             s.save(cur)
-        jobq.Worker("default").tick()
+        jobq.worker_for("default").tick()
         self.assertEqual(self.state(j), "queued")       # its claim is held: nothing launched it
         self.assertEqual(self.banners(j), 1)
         with jobstore.txn() as s:               # as it was, so the test's own cleanup stops it
@@ -2462,7 +2462,7 @@ class TestJobClaim(QueueCase):
             rec = s.job(j)
             rec.update(started=time.time(), state="running")
             s.save(rec)
-        jobq.Worker("default").carry_out()
+        jobq.worker_for("default").carry_out()
         self.assertEqual((self.state(j), jobstore.find(j)["reason"]), ("failed", "lost"))
 
     def test_an_attempt_cannot_read_the_code_another_attempt_wrote(self):
@@ -2471,15 +2471,15 @@ class TestJobClaim(QueueCase):
         launch. `clean` takes them with the record."""
         m = os.path.join(self.work, "once")
         j = self.add("--retries", "1", "--retry-delay", "0.05", cmd=f"test -f {m} && exit 7; touch {m}; exit 1")
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "failed")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "failed")
         rec = jobstore.find(j)
         first, second = rec["history"][0]["rcfile"], rec["rcfile"]
         self.assertNotEqual(first, second)
         self.assertEqual((rec["attempt"], rec["rc"]), (2, 7))
-        self.assertEqual(jobq.ended_on_its_own({"rcfile": first})[0], 1)     # attempt 1's code, still its own
-        self.assertEqual(jobq.ended_on_its_own(rec)[0], 7)
+        self.assertEqual(jobcore.ended_on_its_own({"rcfile": first})[0], 1)     # attempt 1's code, still its own
+        self.assertEqual(jobcore.ended_on_its_own(rec)[0], 7)
         # a record that has not run yet reads no code, whatever any attempt before it left on disk
-        self.assertIsNone(jobq.ended_on_its_own({k: v for k, v in rec.items() if k != "rcfile"}))
+        self.assertIsNone(jobcore.ended_on_its_own({k: v for k, v in rec.items() if k != "rcfile"}))
         self.assertEqual(self.call("clean", "-y")[0], 0)
         self.assertEqual([os.path.exists(p) for p in (first, second)], [False, False])
 
@@ -2490,7 +2490,7 @@ class TestJobClaim(QueueCase):
         # the daemon writes its pid under another name and renames it, so the file is whole the moment it is
         # there: a `>` redirect creates and empties the file before the write, and the read can land in between
         j = self.add(cmd=f"sh -c 'echo $$ > {pidf}.part && mv {pidf}.part {pidf}; exec sleep 30' & exit 0")
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "done")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "done")
         journey.until(lambda: os.path.exists(pidf), timeout=10, what="the daemon's pid")
         with open(pidf) as f:
             dpid = int(f.read())
@@ -2536,7 +2536,7 @@ class TestTwoAtOnce(QueueCase):
     def test_a_ctrl_c_inside_a_change_of_several_records_lands_after_it(self):
         """`clean` removes a batch of records in one transaction. A Ctrl-C after the first of them is delivered
         when the scope ends, so the batch is whole: every record it named is gone, not some of them."""
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         ids = [self.add(cmd="true") for _ in range(3)]
         self.run_until(w, lambda: all(self.state(i) == "done" for i in ids))
         real, gate = os.remove, journey.Gate()
@@ -2557,14 +2557,14 @@ class TestTwoAtOnce(QueueCase):
         """A job whose run claim is held is being started or is running: a reaper that finds it running with
         no pid yet leaves it alone, since the claim says a run of it is live."""
         j = self.add(cmd="sleep 30")
-        real = jobq.Worker._spawn
+        real = jobcore.Worker._spawn
 
         def spawn(w, job, gpu, claim):      # running, no pid yet: another reaper looks exactly now
             self.assertIsNotNone(jobq.lock.Claim.holder(jobstore.run_claim("default", j)))
-            jobq.Worker("default").carry_out()
+            jobq.worker_for("default").carry_out()
             return real(w, job, gpu, claim)
-        with mock.patch.object(jobq.Worker, "_spawn", spawn):
-            jobq.Worker("default").tick()
+        with mock.patch.object(jobcore.Worker, "_spawn", spawn):
+            jobq.worker_for("default").tick()
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec.get("attempt", 1)), ("running", 1))
         self.assertTrue(proc.alive(rec["pid"], rec["pstart"]))
@@ -2583,7 +2583,7 @@ class TestTwoAtOnce(QueueCase):
                 gate.once(lambda: jobq.add_note(j, "while it starts", by="user"))
             return real_read(pid)
         with mock.patch.object(jobq.Resources, "__init__", init), mock.patch.object(jobq.proc, "read", read):
-            jobq.Worker("default").tick()
+            jobq.worker_for("default").tick()
         rec = jobstore.find(j)
         self.assertEqual(rec["state"], "running")
         self.assertEqual([n["text"] for n in rec.get("notes", [])], ["before the claim", "while it starts"])
@@ -2593,9 +2593,9 @@ class TestTwoAtOnce(QueueCase):
         recorded by one actor: its hook fires once and one `wait` reports it once."""
         f = self.sb.path("hook")
         j = self.add("--on-done", f"echo x >> {f}", cmd=self.gated("go"))
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
-        real, gate = jobq.Worker.carry_out, journey.Gate()
+        real, gate = jobcore.Worker.carry_out, journey.Gate()
 
         def it_exits():         # the job exits 0 of its own accord, and nothing is signalled until it has
             open(os.path.join(self.work, "go"), "w").close()
@@ -2604,7 +2604,7 @@ class TestTwoAtOnce(QueueCase):
         def serve(wk, *a, **kw):              # once the kill's stop is on the record, never before
             gate.once(it_exits, when=lambda: (jobstore.find(j) or {}).get("stop"))
             real(wk, *a, **kw)
-        with mock.patch.object(jobq.Worker, "carry_out", serve), self.one_thread():
+        with mock.patch.object(jobcore.Worker, "carry_out", serve), self.one_thread():
             rc, out, _ = self.call("kill", str(j))      # the kill starts the worker that serves its stop
             self.assertEqual((rc, gate.ran), (0, 1))
             # whether the signal reaches the group before the job's last process goes is a race; either way
@@ -2625,18 +2625,18 @@ class TestTwoAtOnce(QueueCase):
         own exit code inside it is ended there, with that code, and never runs again, whatever attempts it had
         left. One stop, one outcome, and the kill reports it instead of waiting out its deadline."""
         j = self.add("--retries", "1", "--retry-delay", "0.05", cmd=self.gated("go") + "; exit 7")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         open(os.path.join(self.work, "go"), "w").close()         # it exits 7 with no worker to reap it
         journey.until(lambda: jobq.lock.Claim.holder(jobstore.run_claim("default", j)) is None,
                       timeout=10, what="the job's run to be over")
-        real, gate = jobq.Worker.carry_out, journey.Gate()
+        real, gate = jobcore.Worker.carry_out, journey.Gate()
 
         def pass_over(wk, *a, **kw):          # the first pass over it finds the stop written and its run over
             gate.once(lambda: journey.until(lambda: (jobstore.find(j) or {}).get("stop"), timeout=10,
                                             what="the kill's stop"))
             real(wk, *a, **kw)
-        with mock.patch.object(jobq.Worker, "carry_out", pass_over), mock.patch.object(jobq, "KILL_WAIT", 10.0):
+        with mock.patch.object(jobcore.Worker, "carry_out", pass_over), mock.patch.object(jobq, "KILL_WAIT", 10.0):
             self.worker_beside(w)       # a worker from here on, and its first pass is the gated one
             rc, out, err = self.call("kill", str(j))
         self.assertEqual((rc, err, gate.ran), (0, "", 1))
@@ -2654,16 +2654,16 @@ class TestTwoAtOnce(QueueCase):
         What the record says went out is all the decision has, and it says nothing did, so the job is
         recorded as its own run ended rather than as a kill pp carried out."""
         j = self.add("--retries", "3", cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         with jobstore.txn() as s:
             cur = s.job(j, must_be=("running",))
             cur["stop"] = {"by": "user", "t": time.time(), "grace": 10.0}   # written; nothing recorded yet
             s.save(cur)
-        proc.signal_group(jobq._group_handle(cur), signal.SIGKILL)          # the signal went out ...
+        proc.signal_group(jobcore._group_handle(cur), signal.SIGKILL)          # the signal went out ...
         journey.until(lambda: jobq.lock.Claim.holder(jobstore.run_claim("default", j)) is None, timeout=10,
                       what="the job's run to be over")
-        jobq.Worker("default").carry_out()                                       # ... and the next worker reaps it
+        jobq.worker_for("default").carry_out()                                       # ... and the next worker reaps it
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec.get("reason"), rec["attempt"]), ("failed", "lost", 1))
 
@@ -2674,9 +2674,9 @@ class TestTwoAtOnce(QueueCase):
         follows once the grace is up, and nothing waits out the job's own life. The run ends there, and the
         code that was written stands as the outcome."""
         j = self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
-        held = jobq._group_handle(jobstore.find(j))
+        held = jobcore._group_handle(jobstore.find(j))
         self.addCleanup(proc.signal_group, held, signal.SIGKILL)
         with open(self.rc_file(j), "w") as f:       # the command's own doing: `echo 0 > "$PP_QUEUE_RCFILE"`
             f.write("0\n")
@@ -2709,9 +2709,9 @@ class TestTwoAtOnce(QueueCase):
         this is about. The worker holds the queue's claim and ticks not at all, so no second actor can carry
         the stop out or launch the retry while the kill reads the record."""
         j = self.add("--retries", "1", cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
-        group = jobq._group_handle(jobstore.find(j))        # taken while it runs, so it names that run's group
+        group = jobcore._group_handle(jobstore.find(j))        # taken while it runs, so it names that run's group
 
         def nothing_is_left():
             """Its group goes, and the wrapper the worker holds is waited for, so this test leaves no child
@@ -2722,7 +2722,7 @@ class TestTwoAtOnce(QueueCase):
                 p.wait()
         self.addCleanup(nothing_is_left)
         self.as_the_worker(w)
-        real_up, moved = jobq.worker_up, journey.Gate()
+        real_up, moved = jobcore.worker_up, journey.Gate()
 
         def back_to_its_queue():
             with jobstore.txn() as s:       # a retry, which is what takes the stop with it
@@ -2736,7 +2736,7 @@ class TestTwoAtOnce(QueueCase):
             moved.once(back_to_its_queue)
             return real_up(q, **kw)
         start = time.monotonic()
-        with mock.patch.object(jobq, "worker_up", worker_up), mock.patch.object(jobq, "KILL_WAIT", 20.0):
+        with mock.patch.object(jobcore, "worker_up", worker_up), mock.patch.object(jobq, "KILL_WAIT", 20.0):
             rc, _, err = self.call("kill", str(j))
         self.assertEqual(moved.ran, 1, "the kill never made sure of the queue's worker")
         self.assertEqual(rc, 1)
@@ -2750,7 +2750,7 @@ class TestTwoAtOnce(QueueCase):
         refused nothing. It writes its stop, and the worker that launched the job signals the group as soon as
         it knows it."""
         j = self.add(cmd="sleep 30")
-        real, killing, window = jobq.Worker._spawn, [], []
+        real, killing, window = jobcore.Worker._spawn, [], []
 
         def spawn(wk, job, gpu, claim):     # claimed, recorded as running, its process not recorded yet
             rec = jobstore.find(j)
@@ -2763,7 +2763,7 @@ class TestTwoAtOnce(QueueCase):
             return real(wk, job, gpu, claim)
 
         w = self.as_the_worker()        # this worker holds the claim, so the kill wakes it and waits
-        with mock.patch.object(jobq.Worker, "_spawn", spawn):
+        with mock.patch.object(jobcore.Worker, "_spawn", spawn):
             w.tick()
             self.run_until(w, lambda: self.state(j) == "failed")
             journey.until(lambda: killing, timeout=30, what="the kill to report")
@@ -2785,7 +2785,7 @@ class TestTwoAtOnce(QueueCase):
                        stop={"by": "timeout", "timeout": True, "t": time.time() - 30, "grace": 10,
                              "sent": time.time() - 30})
             s.save(rec)
-        jobq.Worker("default").carry_out()
+        jobq.worker_for("default").carry_out()
         self.assertEqual(jobstore.find(j)["reason"], "timeout")
         self.assertIsNone(other.poll())
 
@@ -2804,15 +2804,15 @@ class TestTwoAtOnce(QueueCase):
                        boot="00000000-0000-0000-0000-000000000000",     # ... but it was read before a reboot
                        stop={"by": "user", "t": time.time() - 30, "grace": 0})
             s.save(rec)
-        self.assertIsNone(jobq._group_handle(jobstore.find(j)))
-        jobq.Worker("default").carry_out()      # it ends the job, and what it sweeps is its group
+        self.assertIsNone(jobcore._group_handle(jobstore.find(j)))
+        jobq.worker_for("default").carry_out()      # it ends the job, and what it sweeps is its group
         self.assertIsNone(other.poll(), "it signalled a process group that is not the job's")
         # no signal of pp's went out for the stop, so the job is recorded as its own run ended: with nothing
         self.assertEqual(jobstore.find(j).get("reason"), "lost")
 
     def test_a_log_removed_as_it_is_opened(self):
         j = self.add(cmd="echo hello")
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "done")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "done")
         log, real = jobstore.find(j)["log"], open
 
         def opener(path, *a, **k):      # `clean` removes it just before `log` opens it
@@ -2826,7 +2826,7 @@ class TestTwoAtOnce(QueueCase):
 
     def test_wait_restarts_the_worker_of_a_running_job(self):
         j = self.add(cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         journey.until(lambda: os.path.exists(self.rc_file(j)), timeout=10, what="the job's exit code")
         del w                                       # it died before recording the end
@@ -2834,9 +2834,9 @@ class TestTwoAtOnce(QueueCase):
 
         def brings_one_up(q, quiet=False, wake=False):      # stands in for the worker it starts
             started.append(q)
-            jobq.Worker(q).carry_out()
-            return jobq.Holder(jobq.UP, rec={"pid": os.getpid()})
-        with mock.patch.object(jobq, "worker_up", brings_one_up):
+            jobq.worker_for(q).carry_out()
+            return jobcore.Holder(jobcore.UP, rec={"pid": os.getpid()})
+        with mock.patch.object(jobcore, "worker_up", brings_one_up):
             rc, out, _ = self.call("wait", str(j), "--timeout", "5", "--poll", "0.05")
         self.assertEqual((rc, started[:1]), (0, ["default"]))
         self.assertIn(f"done {j}", out)
@@ -2847,8 +2847,8 @@ class TestTwoAtOnce(QueueCase):
         self.config("slots = 3", q="b")
         a = self.add("--need", "nodes=1", cmd="sleep 30", q="a")
         b = self.add("--need", "nodes=1", cmd="sleep 30", q="b")
-        wb = jobq.Worker("b")
-        jobq.Worker("a").tick()
+        wb = jobq.worker_for("b")
+        jobq.worker_for("a").tick()
         wb.tick()                       # a fresh reading still says 1 free: a has not taken its node yet
         self.assertEqual((self.state(a), self.state(b)), ("running", "queued"))
         self.assertIn("1 of it launched since", self.why(wb))
@@ -2857,7 +2857,7 @@ class TestTwoAtOnce(QueueCase):
         self.config("slots = 1")
         a, b = self.add(cmd="sleep 30"), self.add(cmd="sleep 30")
         open(os.path.join(self.cfg, "config.toml"), "w").close()     # mid-save
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         with self.assertRaises(config.ConfigError):
             w.tick()                    # work() reports it as a bad config; nothing launches
         self.assertEqual((self.state(a), self.state(b)), ("queued", "queued"))
@@ -2868,20 +2868,20 @@ class TestTwoAtOnce(QueueCase):
 
     def test_a_worker_told_to_stop_launches_nothing_new(self):
         j = self.add()
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.stopping = lambda: True
         w.tick()
         self.assertEqual(self.state(j), "queued")
 
 
 class TestTheWorkersWait(QueueCase):
-    """What jobq.waking promises: the wait between a worker's ticks ends the moment a wake arrives, and a wake
+    """What jobcore.waking promises: the wait between a worker's ticks ends the moment a wake arrives, and a wake
     sent while a tick runs is taken by the next wait rather than lost."""
 
     def test_a_wake_ends_the_wait_at_once(self):
         """The wait is for the period, or until a wake, whichever comes first."""
-        with jobq.waking() as waits:
-            self.sb.ticker(lambda: proc.raise_to_self(jobq.WAKE), period=0.01, name="waker")
+        with jobcore.waking() as waits:
+            self.sb.ticker(lambda: proc.raise_to_self(jobcore.WAKE), period=0.01, name="waker")
             start = time.monotonic()
             self.assertTrue(waits.wait(30))         # it says a signal ended it
             self.assertLess(time.monotonic() - start, 5, "the wake did not end the wait")
@@ -2889,8 +2889,8 @@ class TestTheWorkersWait(QueueCase):
     def test_a_wake_sent_while_a_tick_runs_is_not_lost(self):
         """A wake that arrives before the wait begins is what a kill sends while the worker is mid-tick. It
         ends the next wait at once, so no stop waits a whole period for the tick after it."""
-        with jobq.waking() as waits:
-            proc.raise_to_self(jobq.WAKE)           # as a tick runs, before any wait
+        with jobcore.waking() as waits:
+            proc.raise_to_self(jobcore.WAKE)           # as a tick runs, before any wait
             start = time.monotonic()
             self.assertTrue(waits.wait(30))
             self.assertLess(time.monotonic() - start, 5, "the wake was lost")
@@ -2902,22 +2902,22 @@ class TestTheWorkersWait(QueueCase):
         stop is in flight, so the outcome is recorded as soon as the job is gone: the whole kill costs the
         job's own exit time, whatever the poll is."""
         j = self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         woke: list = []
-        with jobq.waking() as waits:
-            claim = jobq.lock.Claim.take(jobq._worker_claim("default"), w.record())
+        with jobcore.waking() as waits:
+            claim = jobq.lock.Claim.take(jobcore._worker_claim("default"), w.record())
             self.assertIsNotNone(claim, "something else holds the default worker claim")
 
             def loop():         # work()'s own loop: a wait of ten seconds that only a wake or a stop shortens
-                woke.append(waits.wait(jobq.STOP_PERIOD if w.serving else 10))
+                woke.append(waits.wait(jobcore.STOP_PERIOD if w.serving else 10))
                 w.tick()
             t = self.sb.ticker(loop, period=0, name="worker")
             start = time.monotonic()
             try:
                 rc, out, _ = self.call("kill", str(j), "--grace", "1")
             finally:
-                proc.raise_to_self(jobq.WAKE)       # end the wait this loop is in, then stop it
+                proc.raise_to_self(jobcore.WAKE)       # end the wait this loop is in, then stop it
                 t.stop()
                 claim.release()
         self.assertEqual(rc, 0)
@@ -2929,7 +2929,7 @@ class TestTheWorkersWait(QueueCase):
         """A stop in flight is the one thing that shortens a worker's own period: it ticks until the stop is
         carried out, so the outcome is recorded about as soon as the job ends."""
         j = self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(w.serving, 0)
         with jobstore.txn() as s:
@@ -2938,7 +2938,7 @@ class TestTheWorkersWait(QueueCase):
             s.save(cur)
         w.carry_out()
         self.assertEqual(w.serving, 1)              # work() then waits STOP_PERIOD, not the queue's poll
-        self.assertLess(jobq.STOP_PERIOD, 2.0)
+        self.assertLess(jobcore.STOP_PERIOD, 2.0)
         self.run_until(w, lambda: self.state(j) == "failed")
         self.assertEqual(w.serving, 0)
 
@@ -2976,7 +2976,7 @@ class TestTheWorkersWait(QueueCase):
         w = self.as_the_worker()
         self.assertFalse(self.waits.wait(0), "a wake arrived before any pass sent one")
         for pass_ in range(3):
-            self.assertTrue(jobq.worker_up("default", quiet=True, wake=True).up)
+            self.assertTrue(jobq._worker_up("default", quiet=True, wake=True).up)
             self.assertTrue(self.waits.wait(0), f"pass {pass_ + 1} sent no wake")
         self.assertEqual(w.queue, "default")
 
@@ -2986,9 +2986,9 @@ class TestTheWorkersWait(QueueCase):
         waits for, so it waits its poll out rather than taking the one store lock ten times a second until
         the job is gone."""
         j = self.add("--timeout", "60", cmd="sleep 30")
-        jobq.Worker("default").tick()                   # running, under no claim of its own
+        jobq.worker_for("default").tick()                   # running, under no claim of its own
         self.started_earlier(j, 120)                    # and its time is up, so the next tick writes the stop
-        asked, real = [], jobq.Wait.wait
+        asked, real = [], jobcore.Wait.wait
         # work() installs its own stop handler; the scope hands SIGTERM back the way this test found it
         self.sb.on_signal(signal.SIGTERM, signal.getsignal(signal.SIGTERM))
 
@@ -2997,11 +2997,11 @@ class TestTheWorkersWait(QueueCase):
             if len(asked) == 2:
                 proc.raise_to_self(signal.SIGTERM)      # the worker stops after the second wait it asks for
             return real(self_, 0)
-        with mock.patch.object(jobq.Wait, "wait", wait), redirect_stdout(io.StringIO()):
-            self.assertEqual(jobq.work("default", poll=5.0), 0)
+        with mock.patch.object(jobcore.Wait, "wait", wait), redirect_stdout(io.StringIO()):
+            self.assertEqual(jobq.cmd_work("default", poll=5.0), 0)
         self.assertEqual(asked, [5.0, 5.0])             # the queue's poll, never STOP_PERIOD
         self.assertEqual((jobstore.find(j)["stop"] or {}).get("by"), "timeout")
-        self.assertLess(jobq.STOP_PERIOD, 5.0)
+        self.assertLess(jobcore.STOP_PERIOD, 5.0)
 
     def test_a_stop_whose_sigkill_is_out_is_not_in_flight(self):
         """Once the SIGKILL is out there is nothing left to carry out for that stop, only a reap. So the
@@ -3011,7 +3011,7 @@ class TestTheWorkersWait(QueueCase):
         The reap sees the run claim go at the queue's poll, or at the next pass of a verb that is waiting for
         the stop, which wakes this worker each time."""
         j = self.add(cmd="sleep 30")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         now = time.time()
         with jobstore.txn() as s:
@@ -3344,11 +3344,11 @@ class TestWhatTheTextNames(QueueCase):
         """A contributor looking for a stale lease goes by the name the reference gives, so that name is the
         one a `wait` really holds its lease on."""
         j = self.add("--hold", cmd="true")
-        with jobq.watching([j], None, "wait"):
+        with jobcore.watching([j], None, "wait"):
             leases = os.listdir(os.path.join(self.sb.state, "queue", "watchers"))
         self.assertEqual(len(leases), 1, leases)
         self.assertRegex(leases[0], r"^\d+-\d+\.claim$")        # <pid>-<pstart>.claim, as it is written
-        with open(os.path.join(ROOT, "pp", "lib", "jobq.py")) as f:
+        with open(os.path.join(ROOT, "pp", "lib", "jobcore.py")) as f:
             src = f.read()
         self.assertIn("watchers/<pid>-<pstart>.claim", src)
         self.assertNotIn("watchers/<pid>.json", src)
@@ -3429,7 +3429,7 @@ import os
 import sys
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobpolicy, jobq, jobstore, proc
+from pp.lib import jobpolicy, jobcore, jobq, jobstore, proc
 
 STEP, Q, NOTES, PASSES = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 AT_THE_STEP = 97            # the same number the test that started this worker reads
@@ -3473,32 +3473,32 @@ def read_then_die(job):
 
 
 take, spawn, signal_group, ended_on_its_own = (jobq.lock.Claim.take, proc.spawn, proc.signal_group,
-                                               jobq.ended_on_its_own)
+                                               jobcore.ended_on_its_own)
 if STEP == "the run claim":
     jobq.lock.Claim.take = die_at_the_run_claim
 elif STEP == "the record":
-    jobq.Worker._claim = die
+    jobcore.Worker._claim = die
 elif STEP == "the spawn":
-    jobq.Worker._spawn = die
+    jobcore.Worker._spawn = die
 elif STEP == "the start":
     proc.spawn = start_then_die
 elif STEP == "the send":
-    jobq.Worker._send = die
+    jobcore.Worker._send = die
 elif STEP == "the signal":
     proc.signal_group = note_then_die
 elif STEP == "the signal of the group":
     proc.signal_group = send_then_die
 elif STEP == "the exit code":
-    jobq.ended_on_its_own = read_then_die
+    jobcore.ended_on_its_own = read_then_die
 elif STEP == "the hook":
-    jobq.Worker.fire = die
+    jobcore.Worker.fire = die
 elif STEP == "the log line":
     jobq._append_log = die
 else:
     raise SystemExit("no step of a worker is called %r" % STEP)
 
 jobq._cards = lambda: None      # the cards of the machine this runs on are nothing to a test
-w = jobq.Worker(Q)
+w = jobq.worker_for(Q)
 for _ in range(PASSES):
     w.tick()
 note("the step never came")
@@ -3514,7 +3514,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobpolicy, jobq, jobstore
+from pp.lib import jobpolicy, jobcore, jobq, jobstore
 
 OUT, JID, DEADLINE = sys.argv[2], int(sys.argv[3]), time.monotonic() + 60
 with jobstore.listing() as s:               # one look before it says it is up, so the test writes after it
@@ -3537,7 +3537,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobpolicy, jobq, jobstore
+from pp.lib import jobpolicy, jobcore, jobq, jobstore
 
 GATE, CWD, DEADLINE = sys.argv[2], sys.argv[3], time.monotonic() + 60
 print("ready", flush=True)
@@ -3556,7 +3556,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobpolicy, jobq, jobstore
+from pp.lib import jobpolicy, jobcore, jobq, jobstore
 
 GATE, Q, DEADLINE = sys.argv[2], sys.argv[3], time.monotonic() + 60
 print("ready", flush=True)
@@ -3564,7 +3564,7 @@ while not os.path.exists(GATE):
     if time.monotonic() > DEADLINE:
         sys.exit(2)
     time.sleep(0.01)
-sys.exit(0 if jobq.worker_up(Q, quiet=True).up else 3)
+sys.exit(0 if jobq._worker_up(Q, quiet=True).up else 3)
 '''
 
 
@@ -3623,13 +3623,13 @@ class InjectedCase(QueueCase):
     def open_the_gate(self, name: str = "go") -> None:
         open(self.gate(name), "w").close()
 
-    def nothing_of_the_job_is_left(self, w: jobq.Worker, jid: int) -> None:
+    def nothing_of_the_job_is_left(self, w: jobcore.Worker, jid: int) -> None:
         """This test's own way out for a job its own worker started: the group the job leads goes, and the
         wrapper that worker holds is waited for. So a test that drops its worker with a live child leaves no
         process of its own behind and none to be collected unreaped.
 
         Called while the job is running, since that is when its record names the group."""
-        group = jobq._group_handle(jobstore.find(jid))
+        group = jobcore._group_handle(jobstore.find(jid))
 
         def done():
             if group is not None:
@@ -3684,7 +3684,7 @@ class TestAWorkerKilledWhileItLaunches(InjectedCase):
         self.assertIsNone(jobq.lock.Claim.holder(jobstore.run_claim("default", j)))
         self.assertEqual([x["id"] for x in jobstore.jobs()], [j])       # one record, under one id
         self.assertIsNone(jobstore.find(j).get("rcfile"))
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "done")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "done")
 
     def test_a_worker_killed_holding_the_claim_leaves_no_running_job_unclaimed(self):
         """A job's run claim is held before its record says running. A worker that ends between the two
@@ -3695,7 +3695,7 @@ class TestAWorkerKilledWhileItLaunches(InjectedCase):
         self.assertEqual(self.state(j), "queued")
         self.assertIsNone(jobq.lock.Claim.holder(jobstore.run_claim("default", j)))
         self.assertEqual(jobstore.jobs("running"), [])
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "done")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "done")
 
     def test_a_worker_killed_before_the_spawn_leaves_a_job_the_next_worker_reaps(self):
         """A pass marks every job it admitted running before it starts any of them. A worker that ends
@@ -3706,8 +3706,8 @@ class TestAWorkerKilledWhileItLaunches(InjectedCase):
         self.a_worker_killed_at("the spawn")
         self.assertEqual(self.state(j), "running")
         self.assertIsNone(jobq.lock.Claim.holder(jobstore.run_claim("default", j)))
-        self.assertIsNone(jobq.ended_on_its_own(jobstore.find(j)))
-        jobq.Worker("default").carry_out()
+        self.assertIsNone(jobcore.ended_on_its_own(jobstore.find(j)))
+        jobq.worker_for("default").carry_out()
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["rc"], rec["reason"]), ("failed", None, "lost"))
 
@@ -3720,12 +3720,12 @@ class TestAWorkerKilledWhileItLaunches(InjectedCase):
         self.a_worker_killed_at("the start")
         held = self.the_run_is_live(j)
         self.assertEqual((self.state(j), jobstore.find(j).get("pid")), ("running", None))
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.carry_out()                   # the claim says which process the run is, and the record takes it
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["pid"], rec["boot"]), ("running", held["pid"], proc.boot_id()))
         self.assertEqual(rec["pgid"], proc.read(held["pid"]).pgid)
-        self.assertIsNotNone(jobq._group_handle(rec), "the record names no group a signal could go through")
+        self.assertIsNotNone(jobcore._group_handle(rec), "the record names no group a signal could go through")
         self.open_the_gate()
         self.the_run_is_over(j)
         self.run_until(w, lambda: self.state(j) == "done")
@@ -3740,7 +3740,7 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         """A running job of this test's, with its run live and this test's worker holding its wrapper. -> the
         job's id and that worker."""
         j = self.add(*args, cmd=cmd or self.gated())
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(self.state(j), "running")
         self.the_run_is_live(j)
@@ -3865,7 +3865,7 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         that outcome once."""
         f = self.hook_file()
         j = self.add("--on-fail", f"echo x >> {f}", cmd="exit 7")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         self.the_run_is_over(j)
@@ -3875,7 +3875,7 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         self.assertEqual(self.a_worker_killed_at("the exit code"), ["code 7"])
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec.get("rc"), rec["rcfile"]), ("running", None, rcfile))
-        self.assertEqual(jobq.ended_on_its_own(rec)[0], 7)      # the same code, read again
+        self.assertEqual(jobcore.ended_on_its_own(rec)[0], 7)      # the same code, read again
         w.carry_out()
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["rc"]), ("failed", 7))
@@ -3891,7 +3891,7 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         the next worker fires it: a hook fires once, and not never."""
         f = self.hook_file()
         j = self.add("--on-fail", f"echo x >> {f}", cmd="exit 3")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         self.the_run_is_over(j)
@@ -3900,7 +3900,7 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         self.assertEqual((rec["state"], rec["rc"], rec["hook_due"]), ("failed", 3, "failed"))
         self.assertEqual(self.ran(f), 0)
         self.assertIsNone(rec.get("hooks"))
-        w2 = jobq.Worker("default")
+        w2 = jobq.worker_for("default")
         self.run_until(w2, lambda: not w2.hooks and "hook_due" not in jobstore.find(j))
         self.assertEqual([h["event"] for h in jobstore.find(j)["hooks"]], ["failed"])
         self.assertEqual(self.ran(f), 1)
@@ -3915,7 +3915,7 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         record that says the hook is owed, so the next worker starts it again, and a worker after that does not."""
         f = self.hook_file()
         j = self.add("--on-fail", f"echo x >> {f}", cmd="exit 3")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         self.the_run_is_over(j)
@@ -3924,10 +3924,10 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["hook_due"]), ("failed", "failed"))
         self.assertIsNone(rec.get("hooks"))
-        w2 = jobq.Worker("default")
+        w2 = jobq.worker_for("default")
         self.run_until(w2, lambda: not w2.hooks and "hook_due" not in jobstore.find(j))
         self.assertEqual(self.ran(f), 2)
-        w3 = jobq.Worker("default")
+        w3 = jobq.worker_for("default")
         w3.tick()
         self.assertEqual((self.ran(f), len(jobstore.find(j)["hooks"])), (2, 1))
 
@@ -3939,7 +3939,7 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         self.config("slots = 1")
         j = self.add("--retries", "1", "--retry-delay", "60", cmd="exit 1")
         later = self.add(cmd="true")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         self.assertEqual((self.state(j), self.state(later)), ("running", "queued"))
@@ -3963,12 +3963,12 @@ class TestAStopAndAReapThatCross(InjectedCase):
     def a_kill_between_the_facts_and_the_decision(self, jid: int, grace: float = 10.0) -> journey.Gate:
         """Write a kill's stop in the window between the facts of a pass and its decision. The gate takes the
         step once, where the pass has the facts of this job and has opened no scope yet."""
-        gate, real = journey.Gate(), jobq.Worker._step
+        gate, real = journey.Gate(), jobcore.Worker._step
 
         def step(w, job, facts):
             gate.once(lambda: self.a_kill_asks(jid, grace=grace))
             return real(w, job, facts)
-        patch = mock.patch.object(jobq.Worker, "_step", step)
+        patch = mock.patch.object(jobcore.Worker, "_step", step)
         patch.start()
         self.addCleanup(patch.stop)
         return gate
@@ -3979,7 +3979,7 @@ class TestAStopAndAReapThatCross(InjectedCase):
         recorded once, so its hook fires once."""
         f = self.hook_file()
         j = self.add("--retries", "2", "--on-fail", f"echo x >> {f}", cmd="exit 5")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         self.the_run_is_over(j)
@@ -3999,7 +3999,7 @@ class TestAStopAndAReapThatCross(InjectedCase):
         written in between is carried out by that same pass: the SIGTERM goes out for it, and the record says
         so, although the facts were read when the job carried no stop."""
         j = self.add(cmd=self.gated())
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         self.the_run_is_live(j)
@@ -4025,7 +4025,7 @@ class TestTheStoreUnderTwoActors(InjectedCase):
                               ready="reading", stderr=subprocess.PIPE)
         self.addCleanup(reader.close)
         self.assertEqual(self.call("release", str(j), "--no-start")[0], 0)
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) == "failed", timeout=30)
         self.assertTrue(reader.dead(30), "the reader of the store did not come to the end of it")
         self.assertEqual(reader.returncode, 0, reader.stderr.read())
@@ -4095,7 +4095,7 @@ class TestTheStoreUnderTwoActors(InjectedCase):
         self.assertEqual(self.files(), was)                 # and nothing of the queue was written
         jobq.paths.write_json(fmt, jobstore.FORMAT)
         self.assertEqual(self.state(j), "queued")
-        self.run_until(jobq.Worker("default"), lambda: self.state(j) == "done")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "done")
 
 
 class TestOneWorkerPerQueue(InjectedCase):
@@ -4104,10 +4104,10 @@ class TestOneWorkerPerQueue(InjectedCase):
     def stop_the_worker(self, q: str = "default") -> None:
         """Stop the worker a test of this class started, and wait for its claim to be free, so nothing of the
         test is left running."""
-        h = jobq.worker_now(q).handle
+        h = jobcore.worker_now(q).handle
         if h is not None:
             proc.signal_pid(h, signal.SIGTERM)
-        journey.until(lambda: jobq.worker(q) is None, timeout=30,
+        journey.until(lambda: jobcore.worker(q) is None, timeout=30,
                       what=f"the {q} worker to let its claim go")
 
     def test_two_workers_of_one_queue_never_both_run(self):
@@ -4126,9 +4126,9 @@ class TestOneWorkerPerQueue(InjectedCase):
                              what="one of the two workers to find the claim taken")
         self.assertEqual(len(done), 1, "two workers of one queue both ran")
         self.assertEqual(done[0].returncode, 0)
-        up = journey.until(lambda: jobq.worker_now("default").rec, timeout=30, what="the worker that won")
+        up = journey.until(lambda: jobcore.worker_now("default").rec, timeout=30, what="the worker that won")
         self.assertEqual(up["pid"], [p for p in both if p.poll() is None][0].pid)
-        self.assertIsNone(jobq.lock.Claim.take(jobq._worker_claim("default")), "the claim was free to take")
+        self.assertIsNone(jobq.lock.Claim.take(jobcore._worker_claim("default")), "the claim was free to take")
         journey.until(lambda: jobstore.jobs("running"), timeout=30, what="the worker to start the head of its queue")
         self.assertEqual([x["state"] for x in jobstore.jobs()], ["running", "queued"])
         self.assertEqual([x["attempt"] for x in jobstore.jobs("running")], [1])
@@ -4138,13 +4138,13 @@ class TestOneWorkerPerQueue(InjectedCase):
     def test_a_wake_sent_during_a_tick_ends_the_next_wait(self):
         """A wake reaches a worker through that worker's own pipe. One sent while a tick runs is in the pipe
         when the next wait begins, so it ends that wait instead of being lost, and it ends one wait only."""
-        w = jobq.Worker("default")
-        gate, real = journey.Gate(), jobq.Worker.carry_out
+        w = jobq.worker_for("default")
+        gate, real = journey.Gate(), jobcore.Worker.carry_out
 
         def pass_over(wk, *a, **kw):
-            gate.once(lambda: proc.raise_to_self(jobq.WAKE))     # as a verb wakes a worker mid-tick
+            gate.once(lambda: proc.raise_to_self(jobcore.WAKE))     # as a verb wakes a worker mid-tick
             return real(wk, *a, **kw)
-        with jobq.waking() as waits, mock.patch.object(jobq.Worker, "carry_out", pass_over):
+        with jobcore.waking() as waits, mock.patch.object(jobcore.Worker, "carry_out", pass_over):
             w.tick()
             self.assertEqual(gate.ran, 1)
             self.assertTrue(waits.wait(30), "the wake sent during the tick was lost")
@@ -4166,12 +4166,12 @@ class TestOneWorkerPerQueue(InjectedCase):
         for p in askers:
             self.assertTrue(p.dead(60), "an ask for a worker never came back")
             self.assertEqual(p.returncode, 0, p.stderr.read())
-        up = journey.until(lambda: jobq.worker_now("default").rec, timeout=30, what="the queue's worker")
+        up = journey.until(lambda: jobcore.worker_now("default").rec, timeout=30, what="the queue's worker")
         self.assertIsNotNone(proc.Handle.running(up["pid"], up["pstart"]), "the claim's holder is gone")
-        self.assertIsNone(jobq.lock.Claim.take(jobq._worker_claim("default")), "the claim was free to take")
-        with mock.patch.object(jobq, "_start_worker",
+        self.assertIsNone(jobq.lock.Claim.take(jobcore._worker_claim("default")), "the claim was free to take")
+        with mock.patch.object(jobcore, "_start_worker",
                                lambda q: self.fail(f"a start began for {q}, whose worker is up")):
-            self.assertTrue(jobq.worker_up("default", quiet=True).up)       # an ask that starts nothing
+            self.assertTrue(jobq._worker_up("default", quiet=True).up)       # an ask that starts nothing
         journey.until(lambda: jobstore.jobs("running"), timeout=30, what="the worker to start the head of its queue")
         self.assertEqual([self.state(a), self.state(b)], ["running", "queued"])
 
@@ -4193,8 +4193,8 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
                        pstart=start - 7, boot=proc.boot_id(),       # the id was handed out again since
                        stop={"by": "user", "t": time.time() - 30, "grace": 0, "sent": time.time() - 30})
             s.save(rec)
-        self.assertIsNotNone(jobq._group_handle(jobstore.find(j)), "a record of this boot names a group")
-        jobq.Worker("default").carry_out()
+        self.assertIsNotNone(jobcore._group_handle(jobstore.find(j)), "a record of this boot names a group")
+        jobq.worker_for("default").carry_out()
         self.assertIsNone(other.poll(), "a group that is not the job's was signalled")
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["reason"]), ("failed", "killed"))
@@ -4209,16 +4209,16 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
                               "--no-start", "--poll", "0.1"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(wait.close)
-        journey.until(lambda: jobq.watchers(jobstore.find(j)), timeout=30, what="the wait's lease on the job")
+        journey.until(lambda: jobcore.watchers(jobstore.find(j)), timeout=30, what="the wait's lease on the job")
         leases = os.listdir(d)
         self.assertEqual(len(leases), 1, leases)
-        self.assertEqual(jobq.watchers(jobstore.find(j))[0]["pid"], wait.pid)
+        self.assertEqual(jobcore.watchers(jobstore.find(j))[0]["pid"], wait.pid)
         wait.signal(signal.SIGKILL)
         journey.until(lambda: wait.poll() is not None, timeout=30, what="the wait to end")
         self.assertEqual(wait.poll(), -signal.SIGKILL)
         self.assertEqual(os.listdir(d), leases)                 # nothing of its own ran
-        self.assertEqual(jobq.watchers(jobstore.find(j)), [])       # and nobody holds what it left
-        jobq.Worker("default").tick()
+        self.assertEqual(jobcore.watchers(jobstore.find(j)), [])       # and nobody holds what it left
+        jobq.worker_for("default").tick()
         self.assertEqual(os.listdir(d), [])
 
     def test_a_sweep_runs_once_per_attempt_whose_run_is_over(self):
@@ -4227,7 +4227,7 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         records nothing and changes no outcome: the job keeps the exit code it wrote."""
         kid = self.sb.path("the-job-left-this")
         j = self.add(cmd=f"sleep 300 & echo $! > {kid}; exit 0")
-        w = jobq.Worker("default")
+        w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
         journey.until(lambda: os.path.exists(kid) and text(kid).strip(), timeout=30,
