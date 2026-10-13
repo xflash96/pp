@@ -1,16 +1,8 @@
 """The job-queue engine behind `pp queue`, and its CLI (run_cli).
 
-Named queues, one directory each: ~/.local/state/pp/queue/<name>/
-    jobs/<id>.json  one file per job, holding every field, its `state` among them (queued, held, running, done,
-                    failed): a change of state replaces that one file, and nothing else moves
-    jobs/<id>.run   the claim one run of that job holds, from its own wrapper, for exactly as long as it runs
-    rc/<id>.<attempt>.<token>   the exit code, written by the job's own `sh` under the name its record names,
-                    so ANY worker can tell how it ended, and no attempt can read another's code
-    logs/<id>.log  hooks/<id>-<event>.log   worker.lock (the worker's claim, and its record)  worker.log
-    FORMAT          the number this layout is, written by the first writer that reaches the queue: a queue
-                    whose jobs another pp wrote is refused where it is opened (open_queue), never read
-and, shared by every queue, ~/.local/state/pp/queue/{counter,.lock,probes/,watchers/}: job ids are global (an id
-names one job machine-wide), and the shared resource pools ([resources]) count every queue's running jobs.
+The store is pp/lib/jobstore.py (one file per job, and the transaction that changes one) and the rules are
+pp/lib/jobpolicy.py (the facts in, one decision out). Here: the verbs, the views, the readings a limit is
+checked against, the lines a setting is read from, and the help.
 
 One worker per queue reaps ended jobs, carries out the stops asked of them, re-queues retries, starts what
 fits, and fires the job's on_fail / on_done hook on its FINAL outcome. Admission is strict head-of-line by
@@ -57,11 +49,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
-from pp.lib import config, jobpolicy as policy, lock, paths, proc, session, ui
+from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, session, ui
 
-STATES = ("queued", "held", "running", "done", "failed")
-LIVE = ("queued", "held", "running")
-ENDED = ("done", "failed")
 CAPTURED_ENV = ("PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV")
 # What a job runs as. Its stdin is the job's run claim, which this `sh` holds for exactly as long as the attempt
 # lives; it writes its own pid in there first, so the claim names it even if the worker that started it died
@@ -72,10 +61,6 @@ WRAP = ('printf \'{"pid": %d}\' "$$" >&0; "$@" 0</dev/null; r=$?; '
         'echo "$r" > "$PP_QUEUE_RCFILE.part" && mv "$PP_QUEUE_RCFILE.part" "$PP_QUEUE_RCFILE"')
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 LAUNCH_BANNER = re.compile(r"\[pp queue\] \S+ \S+ job \d+ \(")     # the line _spawn writes before each attempt
-NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
-RECORD = re.compile(r"\d+\.json")     # what a job record is called: jobs/<id>.json, and nothing else is one
-RESERVED = ("probes", "watchers")     # directories beside the queues
-FORMAT = 1                  # what a queue's FORMAT file holds: the layout of everything under queue/<name>/
 WAKE = signal.SIGUSR1       # what a verb sends a worker to end its wait between ticks, so a stop is served now
 STOP_PERIOD = 0.1           # how long a woken worker waits between ticks while a stop of its queue is in flight
 KILL_POLL = 0.1             # how often `kill` looks for the outcome that is recorded
@@ -88,357 +73,15 @@ KILL_WAIT = 120.0
 # how often one process starts a worker again for a queue whose last round of starts brought none up
 START_EVERY = 5.0
 STOP_WAIT = 300.0           # how long `worker stop` waits for a worker inside a slow tick
-CLEAN_BATCH = 100           # job records `clean` removes in one transaction, so a reader never waits long
 
 _PROG = "queue"             # the command running the CLI: names it in messages and starts its workers
-
-
-# ---- store ------------------------------------------------------------------------------------------
-#
-# One file per job: jobs/<id>.json, with every field in it, `state` among them. A change of state replaces that
-# one file, so a reader sees the job as it was before the change or as it is after it, never in two states and
-# never in none. Reading and writing a record goes through txn() and listing(), or through find() for one.
-
-def _top(*sub: str, create: bool = True) -> str:
-    return paths.state_dir("queue", *sub, create=create)
-
-
-def _qroot(q: str, *sub: str, create: bool = True) -> str:
-    return paths.state_dir("queue", q, *sub, create=create)
-
-
-def queues() -> list[str]:
-    """Every queue that exists on disk, each one opened through open_queue."""
-    top = _top(create=False)
-    try:
-        names = os.listdir(top)
-    except OSError:
-        return []
-    found = sorted(n for n in names if NAME_RE.fullmatch(n) and os.path.isdir(os.path.join(top, n, "jobs")))
-    for n in found:
-        open_queue(n)
-    return found
-
-
-def _format_file(q: str, create: bool = False) -> str:
-    return os.path.join(_qroot(q, create=create), "FORMAT")
-
-
-def _format_of(q: str) -> int | None:
-    """The number in queue q's FORMAT file, or None when it holds none."""
-    try:
-        with open(_format_file(q)) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def open_queue(q: str) -> str:
-    """Queue q's directory, with the format of its store checked. The one place a queue is opened, so the one
-    place that refuses a queue this pp cannot read.
-
-    Every path that opens a queue comes through here: queues() for each queue it finds, the CLI for a queue it
-    is given by name, and work() and `worker start` for the queue they fall back to. A queue whose jobs another
-    pp wrote is refused rather than read, since this pp would report records it cannot see as gone, and launch
-    jobs beside ones that are still running."""
-    qdir = _qroot(q, create=False)
-    got = _format_of(q)
-    if got == FORMAT:
-        return qdir
-    # a job is a record, and a record is jobs/<id>.json wherever under jobs/ it lies, so the walk goes down:
-    # a store laid out another way, with a directory per state, is refused like any other foreign format. A
-    # run's claim and the name a write stopped halfway leaves are not records, so a queue whose records have
-    # all been cleaned holds nothing this pp cannot read.
-    has_jobs = any(RECORD.fullmatch(n) for _d, _subs, names in os.walk(os.path.join(qdir, "jobs"))
-                   for n in names)
-    if got is None and not has_jobs:
-        return qdir             # no record yet: a writer says what format this queue is in (writing_queue)
-    says = f"its FORMAT file says {got}" if got is not None else "it has no FORMAT file"
-    ui.die(f"{_PROG}: queue '{q}' holds jobs this pp cannot read: {says}. This pp reads format {FORMAT}. "
-           f"Drain that queue with the pp that wrote it, or remove {qdir}.", 2)
-
-
-def writing_queue(q: str) -> None:
-    """Queue q, opened and ready to be written in: it exists, and it says what format its store is in. Every
-    writer that may be the one creating a queue's directory comes through here, so a queue that exists says
-    its format whether or not it holds a job.
-
-    The directory it opens is bound by no caller, so it hands back nothing, and the refusal open_queue raises
-    still comes first."""
-    open_queue(q)
-    path = _format_file(q, create=True)
-    if not os.path.exists(path):
-        paths.write_json(path, FORMAT)
-
-
-def _store_lock() -> str:
-    return os.path.join(_top(), ".lock")
-
-
-def _counter_file() -> str:
-    return os.path.join(_top(), "counter")
-
-
-def _jpath(q: str, jid: int, create: bool = False) -> str:
-    """Where job jid's record is in queue q. create: make the queue's directories, which only a writer does, so
-    a read of a job that is not there leaves nothing behind."""
-    return os.path.join(_qroot(q, "jobs", create=create), f"{jid}.json")
-
-
-def _job_ids(q: str) -> list[int]:
-    """The ids in queue q, from one pass over its directory."""
-    try:
-        names = os.listdir(_qroot(q, "jobs", create=False))
-    except OSError:
-        return []
-    return sorted(int(n[:-5]) for n in names if RECORD.fullmatch(n))
-
-
-def _read_job(q: str, jid: int) -> dict | None:
-    """Queue q's job jid, or None when it holds no readable record. Every write replaces the whole file, so a
-    read sees one whole record. The queue and the id come from the path, which names them."""
-    try:
-        with open(_jpath(q, jid)) as f:
-            j = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(j, dict) or j.get("state") not in STATES:
-        return None
-    j.update(id=jid, queue=q)
-    return j
-
-
-def _job_json(job: dict) -> dict:
-    return {k: v for k, v in job.items() if not k.startswith("_")}
-
-
-def _write_job(job: dict) -> None:
-    paths.write_json(_jpath(job["queue"], job["id"], create=True), _job_json(job))
-
-
-def _stage_job(job: dict, path: str) -> None:
-    """The whole record, written under a name no other writer picks, ready to be linked to the name that takes
-    its id."""
-    paths.write_json(path, _job_json(job))
-
-
-def _remove_job(job: dict) -> None:
-    os.remove(_jpath(job["queue"], job["id"]))
-
-
-def _counter() -> int:
-    """Where to start looking for a free job id. Never the authority: a lost counter costs a few looks, never
-    an id handed out twice."""
-    try:
-        with open(_counter_file()) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return 0
-
-
-class Txn:
-    """The store, for the length of one scope: the only way pp reads or writes a job record, apart from find().
-
-    txn() holds the store lock, so nothing else reads or writes a record while the scope runs; listing() holds
-    it shared, for a pass that writes nothing. Either way the scope hands out the records it read under the
-    lock and takes back only those, so a copy read outside it can never be written over what another actor
-    recorded meanwhile.
-
-        with txn() as s:
-            j = s.job(jid, must_be=("running",))        # that job in one of those states, else None
-            if j:
-                j.update(rc=0, state="done")
-                s.save(j)                               # one replace of one file
-
-    s.jobs(state=, queue=) lists records, s.add(record, state) stores a new one, s.remove(j) drops one. A verb
-    that reports the state it found asks without must_be and reads j["state"].
-    """
-
-    def __init__(self, write: bool):
-        self.write = write
-        self._mine: dict[int, dict] = {}        # id -> the one record object this scope hands out for it
-        self._ids: dict[str, list[int]] = {}    # queue -> its ids, for the queues this scope has read
-
-    # -- reading
-
-    def job(self, jid: int, must_be: tuple = ()) -> dict | None:
-        """The job with this id, in whichever queue it is. None when there is none, and when must_be names the
-        states it may be in and it is in another."""
-        j = self._mine.get(jid)
-        if j is None:
-            for q in queues():
-                j = self._keep(_read_job(q, jid))
-                if j is not None:
-                    break
-        return None if j is None or (must_be and j["state"] not in must_be) else j
-
-    def jobs(self, state=(), queue=None) -> list[dict]:
-        """The jobs in these states (every state when state is empty), in run order (prio, id). One pass over
-        each queue's directory, so a job is listed once, whole, and in one state."""
-        want = (state,) if isinstance(state, str) else tuple(state)
-        qs = queues() if queue is None else [queue] if isinstance(queue, str) else list(queue)
-        out = [j for q in qs for j in (self._mine.get(i) for i in self._pass(q))
-               if j is not None and (not want or j["state"] in want)]
-        out.sort(key=lambda j: (j.get("prio", 10), j["id"]))
-        return out
-
-    # -- writing
-
-    def save(self, job: dict) -> None:
-        """Write the record back: one replace of its file."""
-        self._writing(job)
-        _write_job(job)
-
-    def remove(self, job: dict) -> None:
-        self._writing(job)
-        _remove_job(job)
-        self._mine.pop(job["id"], None)
-
-    def add(self, job: dict, state: str) -> dict:
-        """Store a new job of job["queue"], and hand it back with its id, state, log and added filled in.
-
-        The whole record is written under a name of this writer's own and then linked to jobs/<id>.json, which
-        fails if that name is there. So the id and the record that holds it land together: two adds at once
-        never choose the same id, and an add stopped in between leaves no job file, never an empty one.
-
-        An id names one job machine-wide, so one any queue holds is taken; `counter` says where to start
-        looking and is never the authority, so a lost one costs a few looks, never an id handed out twice."""
-        self._writing(job, new=True)
-        q = job["queue"]
-        writing_queue(q)        # the queue is opened, so a record never lands in one this pp cannot read
-        others = [x for x in queues() if x != q]
-        tmp = paths.staging(_qroot(q, "jobs"), "job")
-        n = _counter()
-        try:
-            while True:
-                n += 1
-                if any(os.path.exists(_jpath(x, n)) for x in others):
-                    continue
-                job.update(id=n, state=state, log=os.path.join(_qroot(q, "logs"), f"{n}.log"), added=time.time())
-                _stage_job(job, tmp)
-                try:
-                    os.link(tmp, _jpath(q, n))
-                except FileExistsError:
-                    continue
-                break
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        paths.write_json(_counter_file(), n)
-        self._mine[n] = job
-        if q in self._ids:
-            self._ids[q].append(n)
-        return job
-
-    # -- what the scope read, and what it may write
-
-    def _keep(self, j: dict | None) -> dict | None:
-        """One record object per id for the scope's lifetime: the one save() takes back."""
-        if j is None:
-            return None
-        return self._mine.setdefault(j["id"], j)
-
-    def _pass(self, q: str) -> list[int]:
-        """Queue q's ids, read once per scope."""
-        if q not in self._ids:
-            self._ids[q] = [jid for jid in _job_ids(q)
-                            if jid in self._mine or self._keep(_read_job(q, jid)) is not None]
-        return self._ids[q]
-
-    def _writing(self, job: dict, new: bool = False) -> None:
-        if not self.write:
-            raise RuntimeError("the store is open for reading: a listing writes nothing")
-        if not new and self._mine.get(job.get("id")) is not job:
-            raise RuntimeError(f"job {job.get('id')}: this record did not come from this scope, so what it holds "
-                               "may be older than the store; read it again with s.job()")
-
-
-@contextmanager
-def txn():
-    """The store to this scope alone: read records, and change them. Every write of a job file happens here.
-
-    The scope holds the store lock (one for all the queues), so no other pp process reads or writes a record
-    while it runs, and the signals `lock.deferring` holds back are delivered when it ends, so a change is
-    never left half made. Keep it short: readers wait for it, so nothing that can block for long (a probe,
-    nvidia-smi, starting a process) belongs inside one. `TestContracts` in tests/test_constructs.py reads the
-    source and fails on a call to one of those inside a scope of this.
-
-    One lock is taken inside it, and only this one: the claim on a job's run, which a worker takes before the
-    record says the job is running (Worker.launch). A claim is taken without waiting, so the scope stays as
-    short as the two calls it takes; the job itself starts after the scope ends."""
-    with lock.locked(_store_lock(), defer=True):
-        yield Txn(write=True)
-
-
-@contextmanager
-def listing():
-    """The store for reading: one pass over each queue's directory, with nothing writing meanwhile.
-
-    POSIX does not say what a directory read sees while entries in it are replaced, and a file system may
-    report one entry twice or skip it, so a listing holds the store lock shared: a writer waits for it. Other
-    pp processes list beside it; two threads of one pp take turns, since the lock helper keeps one open file
-    per lock. A txn inside one is refused, since it would have to let the lock go to take it alone, and what it
-    had read would then be older than the store."""
-    with lock.locked(_store_lock(), shared=True):
-        yield Txn(write=False)
-
-
-def _jobs(state=(), queue=None) -> list[dict]:
-    """One listing, for a caller that needs one list of records and nothing else from it."""
-    with listing() as s:
-        return s.jobs(state, queue)
-
-
-def find(jid: int) -> dict | None:
-    """The job with this id, in whichever queue it is, or None.
-
-    Takes no lock: a job lives in one file, and every write of it is one replace, so one read sees one whole
-    record. A caller that needs several records to agree with each other asks a listing for them together."""
-    for q in queues():
-        j = _read_job(q, jid)
-        if j is not None:
-            return j
-    return None
-
-
-def _run_claim(q: str, jid: int) -> str:
-    """The file whose claim one run of job jid holds. Taking it is how a worker says it is starting that job,
-    and the job's own wrapper holds it from then on, so a held claim means a run of this job is live."""
-    return os.path.join(_qroot(q, "jobs"), f"{jid}.run")
 
 
 def _new_rcfile(j: dict) -> str:
     """The file this attempt of job j writes its exit code to. One name per attempt, chosen as the attempt
     starts and kept on the record, so no attempt can read the code another wrote and nothing has to be removed
     before a launch."""
-    return os.path.join(_qroot(j["queue"], "rc"), f"{j['id']}.{j.get('attempt', 1)}.{secrets.token_hex(4)}")
-
-
-def _forget_job(s: Txn, job: dict) -> None:
-    """In a transaction: take a job's record away, and with it every file that belongs to that job alone.
-
-    The record goes first, so no reader finds a job whose files are gone. Then the exit code each attempt
-    wrote, the job's log, the log of each hook that ran for it, and the claim its runs held. Only files under
-    the queue's own directories, never one pp did not write. What `drop` and `clean` both take away, so
-    neither leaves a file behind that nothing names any more: once the record is gone, nothing names them."""
-    q, jid = job["queue"], job["id"]
-    files = [p for p in [job.get("rcfile")] + [h.get("rcfile") for h in job.get("history") or []]
-             if p and os.path.dirname(p) == _qroot(q, "rc", create=False)]
-    if job.get("log") and os.path.dirname(job["log"]) == _qroot(q, "logs", create=False):
-        files.append(job["log"])
-    # a hook's log is named after the job and the event, so both names are this job's whether or not the
-    # record got as far as naming them (a hook that could not start wrote its first line and no more)
-    files += [os.path.join(_qroot(q, "hooks", create=False), f"{jid}-{e}.log") for e in ("failed", "done")]
-    s.remove(job)
-    for path in files:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    # its record is gone and its run is over, so nothing holds this claim and this id never takes that name again
-    lock.Claim.forget(_run_claim(q, jid))
+    return os.path.join(jobstore.qroot(j["queue"], "rc"), f"{j['id']}.{j.get('attempt', 1)}.{secrets.token_hex(4)}")
 
 
 def ended_on_its_own(job: dict) -> tuple[int, float] | None:
@@ -457,41 +100,6 @@ def ended_on_its_own(job: dict) -> tuple[int, float] | None:
             return int(f.read().strip()), os.fstat(f.fileno()).st_mtime
     except (OSError, ValueError):
         return None
-
-
-def _finish(s: Txn, job: dict, state: str, rc: int | None, reason: str | None = None,
-            ended: float | None = None, not_retried: str | None = None, hook: str | None = None):
-    """In a transaction: the job is over, with this outcome. `state` is what it ended as, which `decide` says
-    and nothing works out again.
-
-    The outcome and the hook it owes are written together (`hook_due`), and that field is cleared once the
-    hook has run (`Worker.fire`). So a worker that dies between the two leaves a record that says a hook is
-    owed, and the next pass over the queue fires it: a hook fires once, and not never."""
-    now = ended or time.time()
-    job.update(ended=now, seconds=now - (job.get("started") or now), rc=rc, state=state)
-    if reason:
-        job["reason"] = reason
-    if not_retried:
-        job["not_retried"] = not_retried
-    if hook:
-        job["hook_due"] = hook
-    s.save(job)
-
-
-def _requeue(s: Txn, job: dict, a: policy.Action) -> str:
-    """In a transaction: the job goes back to its queue for the attempt the action names, with the same id.
-    -> the line for its log, which the caller appends after the scope."""
-    attempt, retries = int(job.get("attempt", 1)), int(job.get("retries") or 0)
-    job.setdefault("history", []).append({"attempt": attempt, "rc": a.rc, "reason": a.reason,
-                                          "started": job.get("started"), "ended": a.ended,
-                                          "seconds": a.ended - (job.get("started") or a.ended),
-                                          "rcfile": job.get("rcfile")})
-    for k in ("pid", "pgid", "pstart", "boot", "started", "gpu", "stop", "rcfile"):
-        job.pop(k, None)            # this attempt's, including the file it wrote its code to
-    job.update(attempt=a.attempt, not_before=a.not_before, state="queued")
-    s.save(job)
-    return (f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} attempt {attempt}/{retries + 1} after {a.why}"
-            f"; attempt {a.attempt} in {ui.human_duration(a.not_before - a.ended)}")
 
 
 def _group_handle(j: dict) -> proc.Handle | None:
@@ -514,15 +122,8 @@ def _by() -> str:
 
 def add_note(jid: int, text: str, by: str | None = None) -> dict | None:
     """Append a note to a job in any state; the updated job, or None when there is no such job."""
-    if by is None:
-        by = _by()
-    with txn() as s:
-        j = s.job(jid)
-        if not j:
-            return None
-        j.setdefault("notes", []).append({"t": time.time(), "text": text, "by": by})
-        s.save(j)
-        return j
+    note = {"t": time.time(), "text": text, "by": _by() if by is None else by}
+    return jobstore.amend(jid, {"notes": [note]})
 
 
 # ---- durations, small parsing ------------------------------------------------------------------------
@@ -686,11 +287,11 @@ def pools(q: str, empty_ok: bool = True) -> list[dict]:
 
 
 def _probe_path(p: dict) -> str:
-    return os.path.join(_top("probes"), f"{p['scope'] or '_shared'}.{p['name']}.json")
+    return os.path.join(jobstore.top("probes"), f"{p['scope'] or '_shared'}.{p['name']}.json")
 
 
 def _probe_claim(p: dict) -> str:
-    return os.path.join(_top("probes"), f"{p['scope'] or '_shared'}.{p['name']}.lock")
+    return os.path.join(jobstore.top("probes"), f"{p['scope'] or '_shared'}.{p['name']}.lock")
 
 
 def _cached(path: str) -> dict | None:
@@ -907,6 +508,13 @@ def log_tail(job: dict, n: int = 40) -> list[str]:
         return []
 
 
+def _retry_line(said: dict) -> str:
+    """What a requeue writes in the job's own log, from what the store wrote: the attempt that ended, why, and
+    the one to come."""
+    return (f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} attempt {said['attempt']}/{said['of']} after "
+            f"{said['why']}; attempt {said['next']} in {ui.human_duration(said['delay'])}")
+
+
 def _append_log(job: dict, line: str):
     try:
         os.makedirs(os.path.dirname(job["log"]), exist_ok=True)
@@ -1013,9 +621,9 @@ class Worker:
         facts about one job and one decision made from all of them, so no part of it can be wrong about what
         another part did."""
         now = time.time()
-        with listing() as s:    # one pass: the jobs to decide about, and the hooks the queue still owes
-            jobs = list(s.jobs(("running",) + ENDED, self.queue))
-        owed = [j for j in jobs if j["state"] in ENDED and j.get("hook_due")]
+        with jobstore.listing() as s:    # one pass: the jobs to decide about, and the hooks the queue still owes
+            jobs = list(s.jobs(("running",) + jobstore.ENDED, self.queue))
+        owed = [j for j in jobs if j["state"] in jobstore.ENDED and j.get("hook_due")]
         in_flight = 0
         for j in [x for x in jobs if x["state"] == "running"]:
             stop = j.get("stop") or {}
@@ -1033,7 +641,7 @@ class Worker:
         # a child of this worker's whose record no longer says running: something outside pp ended the job
         # while it was starting, and `_spawn` stopped the process it had started. Reap the zombie
         for jid, p in list(self.children.items()):
-            if p.poll() is not None and (find(jid) or {}).get("state") != "running":
+            if p.poll() is not None and (jobstore.find(jid) or {}).get("state") != "running":
                 del self.children[jid]
 
     def _facts(self, j: dict, now: float) -> policy.Facts:
@@ -1042,7 +650,7 @@ class Worker:
         and the log tail --retry-if matches against.
 
         Read before the transaction, since none of it is store state and a log tail can be long."""
-        held = lock.Claim.holder(_run_claim(self.queue, j["id"]))
+        held = lock.Claim.holder(jobstore.run_claim(self.queue, j["id"]))
         p = self.children.get(j["id"])
         if held is not None or (p is not None and p.poll() is None):
             # a run of it is live, whatever its record holds: it is never lost, and never started again. Its
@@ -1068,7 +676,7 @@ class Worker:
         it: a stop another actor wrote since those facts were read is part of it, so a job a kill has touched
         is never retried past its stop."""
         jid = j["id"]
-        with txn() as s:
+        with jobstore.txn() as s:
             cur = s.job(jid, must_be=("running",))
             if cur is None:
                 return policy.Action(policy.NOTHING)      # nothing else records a running job: there is nothing to record
@@ -1081,9 +689,9 @@ class Worker:
                 cur["stop"] = {"by": "timeout", "timeout": True, "t": a.t, "grace": a.grace}
                 s.save(cur)
             elif a.do == policy.AGAIN:
-                line = _requeue(s, cur, a)
+                said = jobstore._requeue(s, cur, a)
             elif a.do == policy.ENDED_AS:
-                _finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
+                jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
         if a.do in (policy.TERM, policy.KILL9):
             self._send(cur, a)
             return a
@@ -1091,7 +699,7 @@ class Worker:
             self.log(f"timeout {jid} {cur.get('tag')} after {ui.human_duration(float(cur['timeout']))}: "
                      "stopping it")
         elif a.do == policy.AGAIN:
-            _append_log(cur, line)          # after the scope: a job's log is not the store
+            _append_log(cur, _retry_line(said))     # after the scope: a job's log is not the store
             self.log(f"retry {jid} {cur.get('tag')}: attempt {cur['attempt']}/{int(cur.get('retries') or 0) + 1} "
                      f"in {_in_delay(cur['not_before'])}")
         elif a.do == policy.ENDED_AS:
@@ -1117,7 +725,7 @@ class Worker:
         if outcome is None or outcome == "gone":
             return          # nothing to signal: its run is starting, or it is over and the next pass says how
         now = time.time()
-        with txn() as s:
+        with jobstore.txn() as s:
             cur = s.job(job["id"], must_be=("running",))
             if cur is None or not cur.get("stop"):
                 return
@@ -1135,7 +743,7 @@ class Worker:
         p = proc.read(int(held["pid"]))
         if p is None:
             return              # it ended as this was read; the next look reaps it
-        with txn() as s:
+        with jobstore.txn() as s:
             cur = s.job(j["id"], must_be=("running",))
             if cur is None or cur.get("pid"):
                 return
@@ -1153,7 +761,7 @@ class Worker:
         spec = policy.hook_spec(job.get("on_fail" if event == "failed" else "on_done"))
         argv = policy.hook_argv(spec)
         q, jid = job["queue"], job["id"]
-        hlog = os.path.join(_qroot(q, "hooks"), f"{jid}-{event}.log")
+        hlog = os.path.join(jobstore.qroot(q, "hooks"), f"{jid}-{event}.log")
         ran = False
         if argv:
             env = {"PP_QUEUE": q, "PP_QUEUE_JOB": str(jid), "PP_QUEUE_EVENT": event,
@@ -1170,7 +778,7 @@ class Worker:
                 ran = True
             except OSError as e:
                 self.log(f"hook {event} of {jid} could not start: {e}")
-        with txn() as s:        # it has run: the job owes it no longer, whether or not it could start
+        with jobstore.txn() as s:        # it has run: the job owes it no longer, whether or not it could start
             cur = s.job(jid)
             if cur is not None:
                 if ran:
@@ -1207,7 +815,7 @@ class Worker:
         moment of a launch."""
         h = _group_handle(job)
         if h is None:
-            held = lock.Claim.holder(_run_claim(job["queue"], job["id"])) or {}
+            held = lock.Claim.holder(jobstore.run_claim(job["queue"], job["id"])) or {}
             h = proc.Handle.live(int(held["pid"]), group=True) if held.get("pid") else None
         if h is None:
             return None
@@ -1219,7 +827,7 @@ class Worker:
     # -- launching
 
     def launch(self):
-        queued = _jobs("queued", self.queue)
+        queued = jobstore.jobs("queued", self.queue)
         now = time.time()
         ready = [j for j in queued if (j.get("not_before") or 0) <= now]     # a retry's delay never blocks the line
         if not ready:
@@ -1234,7 +842,7 @@ class Worker:
             # one transaction for the whole pass: it reads the running jobs it admits against once, and reads
             # each job it is about to start again in that same scope, since another queue's worker may be
             # admitting from a shared pool and a verb may have changed the job since it was listed (prio, a note)
-            with txn() as s:
+            with jobstore.txn() as s:
                 running = s.jobs("running")
                 for j in ready:
                     cur = s.job(j["id"], must_be=("queued",))
@@ -1250,7 +858,7 @@ class Worker:
                     # the run claim before the record says running, so a reader never sees a running job with
                     # nothing holding its claim unless its run has ended. Taking one is two calls that never
                     # wait, which is why it belongs in here; nothing under the store lock may wait either.
-                    claim = lock.Claim.take(_run_claim(self.queue, cur["id"]))
+                    claim = lock.Claim.take(jobstore.run_claim(self.queue, cur["id"]))
                     if claim is None:
                         continue        # a run of this job is live already
                     taken.append((cur, card, claim))    # before the rest of it, which can raise
@@ -1268,7 +876,7 @@ class Worker:
         self._note(*blocked)
 
     @staticmethod
-    def _claim(s: Txn, j: dict, gpu: int | None):
+    def _claim(s: jobstore.Txn, j: dict, gpu: int | None):
         """In a transaction: the job, as read in it, becomes running, with the file this attempt writes its exit
         code to. Its run claim is held before this, so no reader ever sees it running with nothing holding its
         claim unless its run has ended."""
@@ -1300,17 +908,17 @@ class Worker:
                 p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
                                env="scrubbed", add_env=env, cwd=j["cwd"], stdout=f, stderr=proc.STDOUT)
         except Exception as e:
-            with txn() as s:
+            with jobstore.txn() as s:
                 cur = s.job(jid, must_be=("running",))
                 if cur:
-                    _finish(s, cur, "failed", None, f"launch failed: {e}", hook=policy.hook_due(cur, "failed"))
+                    jobstore._finish(s, cur, "failed", None, f"launch failed: {e}", hook=policy.hook_due(cur, "failed"))
             claim.release()     # after the record says it ended, so no reader sees it running with a free claim
             self.log(f"FAILED {jid} {j.get('tag')}: launch failed: {e}")
             if cur:
                 self.fire(cur, "failed")
             return None
         claim.release()         # pp's own copy of it; the wrapper's keeps the claim
-        with txn() as s:        # amend the record as it is now, not the copy launch read: a note added meanwhile stays
+        with jobstore.txn() as s:        # amend the record as it is now, not the copy launch read: a note added meanwhile stays
             cur = s.job(jid, must_be=("running",))
             if cur:
                 cur.update(pid=p.pid, pgid=p.pid, pstart=p.handle.start if p.handle else None,
@@ -1342,14 +950,14 @@ class Worker:
 
 
 def _worker_claim(q: str) -> str:
-    return os.path.join(_qroot(q, create=False), "worker.lock")
+    return os.path.join(jobstore.qroot(q, create=False), "worker.lock")
 
 
 def _worker_log(q: str, create: bool = False) -> str:
     """Where queue q's worker writes what it does. Naming it creates nothing: a verb that only reports
     (`worker status`) leaves no directory behind for a queue name that was a typo. create: the worker
     about to open it for writing makes the queue's directories."""
-    return os.path.join(_qroot(q, create=create), "worker.log")
+    return os.path.join(jobstore.qroot(q, create=create), "worker.log")
 
 
 def worker(q: str) -> dict | None:
@@ -1527,7 +1135,7 @@ def worker_up(q: str, quiet: bool = False, wake: bool = False) -> Holder:
 
 
 def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int:
-    writing_queue(q)    # a queue this pp cannot read is refused here too; the worker's own queue says its format
+    jobstore.writing_queue(q)    # a queue this pp cannot read is refused here too; the worker's own queue says its format
     from_cfg = backfill is None       # `work --backfill` fixes it; otherwise it follows the config, like the rest
     if from_cfg:
         try:
@@ -1557,7 +1165,7 @@ def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int
         signal.signal(signal.SIGTERM, lambda *_: stop.append(1))    # a flag, never an exception mid-move
         proc.say_ready()    # it holds its claim, it is recorded, a stop is handled and a wake is taken
         w.stopping = lambda: bool(stop)
-        adopted = _jobs("running", q)
+        adopted = jobstore.jobs("running", q)
         log(f"worker up, pid {os.getpid()}" + (", backfill" if backfill else "")
             + (f", adopting {len(adopted)} running job(s)" if adopted else ""))
         idle_since = None
@@ -1584,7 +1192,7 @@ def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int
                 if bad != bad_cfg:
                     log(f"bad config, nothing launches until it is fixed: {bad}" if bad else "config fixed")
                     bad_cfg = bad
-                with listing() as s:
+                with jobstore.listing() as s:
                     if s.jobs(("queued", "running"), q):
                         idle_since, spent = None, False
                     else:
@@ -1631,7 +1239,7 @@ def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int
 def _watcher_claim(pid: int, pstart: int) -> str:
     """The file one `wait` or `watch` holds its lease on. The name is that process's own, so nobody else ever
     takes it and the file goes with the lease."""
-    return os.path.join(_top("watchers"), f"{pid}-{pstart}.claim")
+    return os.path.join(jobstore.top("watchers"), f"{pid}-{pstart}.claim")
 
 
 @contextmanager
@@ -1663,7 +1271,7 @@ def watchers(job: dict | None = None) -> list[dict]:
 
     A lease is locked before its name is visible (`watching`), so a lease that is there and unheld is one
     whose holder has gone, and this takes nothing from a wait that is taking its own."""
-    d = _top("watchers")
+    d = jobstore.top("watchers")
     out = []
     for fn in sorted(os.listdir(d)):
         if not fn.endswith(".claim"):
@@ -1682,12 +1290,8 @@ def watchers(job: dict | None = None) -> list[dict]:
 
 def _stamp_reported(jid: int, verb: str):
     who = session.caller()
-    with txn() as s:
-        j = s.job(jid, must_be=ENDED)
-        if j:
-            j.setdefault("reported", []).append({"t": time.time(), "by": f"{verb} pid {os.getpid()}",
-                                                 "session": who["session"] if who else None})
-            s.save(j)
+    stamp = {"t": time.time(), "by": f"{verb} pid {os.getpid()}", "session": who["session"] if who else None}
+    jobstore.amend(jid, {"reported": [stamp]}, must_be=jobstore.ENDED)
 
 
 # ---- helpers for verbs ----------------------------------------------------------------------------
@@ -1696,7 +1300,7 @@ def _resolve(specs: list[str], scope: list[str] | None = None) -> list[dict]:
     """Jobs named by ids, ranges (12-15) or exact tags, in the order given, without duplicates. Ids are global.
     Each carries _bulk: it came from a range or a tag naming several jobs, so a verb skips it when it is in a state
     the verb does not apply to, where a job named on its own is an error."""
-    by_id = {j["id"]: j for j in _jobs(queue=scope)}
+    by_id = {j["id"]: j for j in jobstore.jobs(queue=scope)}
     out, seen = [], set()
     for s in specs:
         m = re.fullmatch(r"(\d+)-(\d+)", s)
@@ -1970,7 +1574,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
                "attempt": 1, "on_fail": on_fail, "on_done": on_done}
         if prepare_job:
             prepare_job(job, a)
-        with txn() as s:
+        with jobstore.txn() as s:
             jid = s.add(job, state)["id"]
         ids.append(jid)
         print(jid)
@@ -1992,7 +1596,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
 def _scope_list(scope: list[str] | None) -> list[str]:
     """The queues a verb works on: every one there is, which `queues` opens as it finds it, or the one it was
     given by name, which run_cli opened before any verb ran."""
-    return queues() if scope is None else scope
+    return jobstore.queues() if scope is None else scope
 
 
 def cmd_status(a, scope: list[str] | None) -> int:
@@ -2019,7 +1623,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
     now = time.time()
     # one listing: the counts, the rows and what the shared pools hold are the same jobs, so no job is shown
     # twice or in two states. Every queue is listed, since a shared pool counts every queue's running jobs.
-    all_jobs = _jobs()
+    all_jobs = jobstore.jobs()
     # what each queue's worker is, through the one construct, so the hints that nothing launches or records
     # this queue's jobs come back from the one answer it gave
     workers = {q: worker_now(q) for q in _scope_list(scope)}
@@ -2046,7 +1650,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
     shared = usage(qs[0] if qs else "default", None)    # the same for every queue
     for q in qs:
         mine = [j for j in all_jobs if j["queue"] == q]
-        data = {st: keep([j for j in mine if j["state"] == st]) for st in STATES}
+        data = {st: keep([j for j in mine if j["state"] == st]) for st in jobstore.STATES}
         own = usage(q, q)
         w = workers[q]
         waiting = (w.rec or {}).get("waiting") if w.up else None     # only a live worker waits for anything
@@ -2074,10 +1678,10 @@ def cmd_status(a, scope: list[str] | None) -> int:
     if not qs:
         print(f"no queues yet: `pp {_PROG} add -- CMD` starts one")
         return 1 if bad else 0
-    if scope and scope[0] not in queues() and not _configured(scope[0]):
-        known = [q for q in queues() if q != scope[0]]
+    if scope and scope[0] not in jobstore.queues() and not _configured(scope[0]):
+        known = [q for q in jobstore.queues() if q != scope[0]]
         print(f"no queue '{scope[0]}' yet" + (f" (there are: {', '.join(known)})" if known else ""))
-    if (a.here or a.project) and not any(per[q]["data"][st] for q in qs for st in STATES):
+    if (a.here or a.project) and not any(per[q]["data"][st] for q in qs for st in jobstore.STATES):
         print(f"no jobs of project '{want}'")
     for q in qs:
         s = per[q]
@@ -2169,7 +1773,7 @@ def cmd_show(a) -> int:
         return 0
     state = j["state"] if j["state"] != "failed" else ui.c("FAILED", "red")
     head = f"job {j['id']}  ({j['queue']})  {state}"
-    if j["state"] in ENDED:
+    if j["state"] in jobstore.ENDED:
         head += f"  rc={_rc(j)}" + (f" ({j['reason']})" if j.get("reason") else "")
     print(ui.c(head, "bold"))
     owner = j.get("owner")
@@ -2248,8 +1852,8 @@ def cmd_log(a) -> int:
               f"`pp {_PROG} release {j['id']}` releases it", file=sys.stderr)
     if a.follow:
         while not (path and os.path.exists(path)):     # queued: the log appears when it starts
-            cur = find(j["id"])
-            if not cur or cur["state"] not in LIVE:
+            cur = jobstore.find(j["id"])
+            if not cur or cur["state"] not in jobstore.LIVE:
                 break
             time.sleep(0.5)
     try:        # opened once and read from there: `clean` may remove it at any moment, before or after
@@ -2269,8 +1873,8 @@ def cmd_log(a) -> int:
                 sys.stdout.write(chunk.decode(errors="replace"))
                 sys.stdout.flush()
                 continue
-            cur = find(j["id"])
-            if not cur or cur["state"] in ENDED:     # a pending retry is queued, not ended: keep following
+            cur = jobstore.find(j["id"])
+            if not cur or cur["state"] in jobstore.ENDED:     # a pending retry is queued, not ended: keep following
                 sys.stdout.write(f.read().decode(errors="replace"))
                 print(_ended_line(cur, j["id"]), file=sys.stderr)
                 return 0 if cur and cur["state"] == "done" else 1     # like wait
@@ -2305,15 +1909,15 @@ def cmd_kill(a) -> int:
             ui.warn(f"{_PROG}: job {jid} is {j['state']}, not running; {hint}")
             rc = 2
             continue
-        with txn() as s:
+        with jobstore.txn() as s:
             cur = s.job(jid)
-            if cur is None or cur["state"] in ENDED:
+            if cur is None or cur["state"] in jobstore.ENDED:
                 print(f"job {jid} already {cur['state'] if cur else 'gone'}")
                 continue
             if cur["state"] in ("queued", "held"):
                 # it went back to its queue for a retry: no process exists, so this is where it ends
                 was = cur["state"]
-                _finish(s, cur, "failed", None, "killed")
+                jobstore._finish(s, cur, "failed", None, "killed")
                 print(f"killed {jid} (it was {was}, with no process to stop)  {_text(j.get('tag'))}")
                 continue
             cur["stop"] = policy.merge_stop(cur.get("stop"), {"by": _by(), "t": time.time(), "grace": float(a.grace)})
@@ -2341,12 +1945,12 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
     jid, started_at = j["id"], time.time()
     deadline = started_at + grace + KILL_WAIT
     while True:
-        cur = find(jid)
+        cur = jobstore.find(jid)
         if cur is None:
             print(f"dropped {jid}")
             return 1
         stop = cur.get("stop") or {}
-        if cur["state"] in ENDED:
+        if cur["state"] in jobstore.ENDED:
             break
         if stop.get("t") != t:
             # the record no longer carries this stop, so nobody is going to carry it out: say where the job is
@@ -2401,7 +2005,7 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
         if go is not None:
             return go
     for j in jobs:
-        with txn() as s:
+        with jobstore.txn() as s:
             cur = s.job(j["id"])
             if cur is None or cur["state"] not in src:
                 if j["_bulk"]:
@@ -2414,7 +2018,7 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
                 rc = 2
                 continue
             if dst is None:
-                _forget_job(s, cur)         # the record, and every file that belongs to this job alone
+                jobstore._forget_job(s, cur)         # the record, and every file that belongs to this job alone
             else:
                 cur["state"] = dst
                 s.save(cur)
@@ -2431,7 +2035,7 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
 def _reprio(a) -> int:
     rc, skipped = 0, []
     for j in _resolve(a.ids, a.scope):
-        with txn() as s:
+        with jobstore.txn() as s:
             cur = s.job(j["id"])
             if cur is None or cur["state"] not in ("queued", "held"):
                 if j["_bulk"]:
@@ -2454,10 +2058,10 @@ CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "env", "shell_env", 
 def cmd_retry(a) -> int:
     started, rc, skipped = set(), 0, []
     for j in _resolve(a.ids, a.scope):
-        if j["state"] not in ENDED and j["_bulk"]:
+        if j["state"] not in jobstore.ENDED and j["_bulk"]:
             skipped.append(j)
             continue
-        if j["state"] not in ENDED:
+        if j["state"] not in jobstore.ENDED:
             ui.warn(f"{_PROG}: job {j['id']} is {j['state']}; retry re-queues ended jobs")
             rc = 2
             continue
@@ -2465,7 +2069,7 @@ def cmd_retry(a) -> int:
         new.update(retry_of=j["id"], attempt=1)
         if a.prio is not None:
             new["prio"] = a.prio
-        with txn() as s:
+        with jobstore.txn() as s:
             jid = s.add(new, "queued")["id"]
         print(jid)
         print(f"pp {_PROG}: retry of {j['id']} queued as {jid} ({j['queue']})", file=sys.stderr)
@@ -2479,7 +2083,7 @@ def cmd_retry(a) -> int:
 
 def cmd_clean(a, scope: list[str] | None) -> int:
     cutoff = time.time() - _dur_arg(a.older, "--older", "d") if a.older is not None else None
-    victims = [j for j in _jobs(ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
+    victims = [j for j in jobstore.jobs(jobstore.ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
     if not victims:
         print("nothing to clean")
         return 0
@@ -2492,13 +2096,13 @@ def cmd_clean(a, scope: list[str] | None) -> int:
     if not ui.confirm("remove them?", a.yes):
         return 2
     removed = 0
-    for batch in (victims[i:i + CLEAN_BATCH] for i in range(0, len(victims), CLEAN_BATCH)):
-        with txn() as s:            # a batch at a time: a reader waits for the transaction, so it stays short
+    for batch in (victims[i:i + jobstore.CLEAN_BATCH] for i in range(0, len(victims), jobstore.CLEAN_BATCH)):
+        with jobstore.txn() as s:            # a batch at a time: a reader waits for the transaction, so it stays short
             for v in batch:
-                j = s.job(v["id"], must_be=ENDED)
+                j = s.job(v["id"], must_be=jobstore.ENDED)
                 if j is None:
                     continue
-                _forget_job(s, j)
+                jobstore._forget_job(s, j)
                 removed += 1
     print(f"removed {removed}")
     return 0
@@ -2516,7 +2120,7 @@ def _event(prev: dict | None, j: dict | None, jid: int) -> str | None:
     tag = _text(j.get("tag"))
     started = f"{jid} started{' ' + _attempt_str(j) if _attempt_str(j) else ''}  {tag}"
     lines = [f"{jid} released  {tag}"] if was == "held" and st != "held" else []
-    if st in ENDED:
+    if st in jobstore.ENDED:
         lines += [started] if was in ("held", "queued") else []
     elif st == "running":
         lines.append(started)
@@ -2544,8 +2148,8 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         return a.timeout is not None and time.time() - t0 >= a.timeout
 
     def footer():
-        with listing() as s:
-            live = {st: len(s.jobs(st, scope)) for st in LIVE}
+        with jobstore.listing() as s:
+            live = {st: len(s.jobs(st, scope)) for st in jobstore.LIVE}
         say(f"[{_PROG} {verb}] {datetime.now():%H:%M:%S}: running {live['running']}, queued {live['queued']}, held {live['held']}")
 
     def tell(j, jid):
@@ -2554,16 +2158,16 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
             _stamp_reported(jid, verb)
 
     if a.idle:
-        before = {j["id"] for j in _jobs(ENDED, scope)}
+        before = {j["id"] for j in jobstore.jobs(jobstore.ENDED, scope)}
         told: set = set()
         asked: set = set()      # the queues this loop has asked for a worker: it says what holds a claim once
         with watching(None, scope, verb):
             while True:
                 # one listing: the jobs still to come and the ones that ended are read together, so the last
                 # look, the one that finds none live, holds every outcome there is to report
-                with listing() as s:
+                with jobstore.listing() as s:
                     live = s.jobs(("queued", "running"), scope)
-                    ended = [j for j in s.jobs(ENDED, scope) if j["id"] not in before]
+                    ended = [j for j in s.jobs(jobstore.ENDED, scope) if j["id"] not in before]
                 if not live:
                     break
                 if stream:
@@ -2598,19 +2202,19 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
             return not any(isinstance(r, dict) and r.get("session") == me["session"] for r in j.get("reported") or [])
 
         # one listing of both halves: a job is listed once, in one state, so a target is named once
-        with listing() as s:
-            targets = [j["id"] for j in s.jobs(LIVE, scope) if mine(j)] \
-                + [j["id"] for j in s.jobs(ENDED, scope) if mine(j) and unheard(j)]
+        with jobstore.listing() as s:
+            targets = [j["id"] for j in s.jobs(jobstore.LIVE, scope) if mine(j)] \
+                + [j["id"] for j in s.jobs(jobstore.ENDED, scope) if mine(j) and unheard(j)]
         need_all = True
         if not targets:
             say("nothing of this session's is queued, held or running, and every outcome was reported to it")
             return 0
     else:
-        targets, need_all = [j["id"] for j in _jobs(("queued", "running"), scope)], False
+        targets, need_all = [j["id"] for j in jobstore.jobs(("queued", "running"), scope)], False
         if not targets:
             say("nothing queued or running")
             return 0
-    held = [j["id"] for j in (find(t) for t in targets) if j and j["state"] == "held"]
+    held = [j["id"] for j in (jobstore.find(t) for t in targets) if j and j["state"] == "held"]
     if held:
         print(f"[{_PROG} {verb}] note: {', '.join(map(str, held))} held, so this waits forever. "
               f"`pp {_PROG} release` them", file=sys.stderr)
@@ -2620,7 +2224,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         asked = set()           # as above: a loop says what holds a queue's claim on its first pass only
         blamed: set = set()     # the queues this loop has said no worker came up for, which it says once
         while True:
-            cur = {t: find(t) for t in targets}
+            cur = {t: jobstore.find(t) for t in targets}
             if stream:
                 if not prev:
                     say(f"[{_PROG} watch] " + ", ".join(f"{t} {cur[t]['state'] if cur[t] else 'gone'}" for t in targets))
@@ -2628,11 +2232,11 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                     line = _event(prev.get(t), cur[t], t)
                     if line:
                         say(line)
-                    if t not in told and (cur[t] is None or cur[t]["state"] in ENDED):
+                    if t not in told and (cur[t] is None or cur[t]["state"] in jobstore.ENDED):
                         told.add(t)
                         tell(cur[t], t)
                 prev = {t: j for t, j in cur.items() if j}
-            ended = {t: j for t, j in cur.items() if j is None or j["state"] in ENDED}
+            ended = {t: j for t, j in cur.items() if j is None or j["state"] in jobstore.ENDED}
             if ended and (len(ended) == len(targets) or not need_all):
                 for t in sorted(ended):
                     if t not in told:
@@ -2686,7 +2290,7 @@ def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | No
             print(f"{r['queue']}: {state}   log {r['log']}")
         return 0
     q = q_given or default_queue
-    writing_queue(q)    # `worker start -q NAME` opens that queue, so it goes through the same refusal
+    jobstore.writing_queue(q)    # `worker start -q NAME` opens that queue, so it goes through the same refusal
     logf = _worker_log(q)
     if a.action == "start":
         # one answer, from the scope that acted on it: nothing looks at the claim again, so a worker that came
@@ -2841,9 +2445,23 @@ def _parser(prog: str, doc: str, add_args=None):
 def run_cli(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job=None, add_args=None) -> int:
     """The queue CLI for `pp <prog>`. default_queue receives `add` and `work` without -q; status, wait --idle, clean
     and worker status cover every queue. prepare_job(job, args) amends each job at add time; add_args(parser) adds
-    options to `add`."""
+    options to `add`.
+
+    The store's refusal of a queue another layout wrote is worded here, the one place it is said: every verb
+    opens a queue, so the refusal can come from any of them, and the store writes no sentence."""
     global _PROG
     _PROG = prog
+    try:
+        return _verb(argv, prog, default_queue, doc, prepare_job, add_args)
+    except jobstore.Foreign as e:
+        says = f"its FORMAT file says {e.got}" if e.got is not None else "it has no FORMAT file"
+        ui.die(f"{_PROG}: queue '{e.queue}' holds jobs this pp cannot read: {says}. This pp reads format "
+               f"{jobstore.FORMAT}. Drain that queue with the pp that wrote it, or "
+               f"remove {jobstore.qroot(e.queue, create=False)}.", 2)
+
+
+def _verb(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job, add_args) -> int:
+    """The verb the command line names, carried out: the parsing, the queue it is given, and the one row."""
     argv = list(argv)
     q_top = None
     if len(argv) >= 2 and argv[0] in ("-q", "--queue"):
@@ -2856,11 +2474,11 @@ def run_cli(argv: list[str], prog: str, default_queue: str, doc: str, prepare_jo
         argv, cmd = argv[:i], argv[i + 1:]
     a = _parser(prog, doc, add_args).parse_args(argv)
     q = getattr(a, "queue", None) or q_top
-    if q is not None and (not NAME_RE.fullmatch(q) or q in RESERVED):
-        ui.die(f"{prog}: '{q}' is not a queue name (lowercase letters, digits, - and _; not {' or '.join(RESERVED)})", 2)
+    if q is not None and (not jobstore.NAME_RE.fullmatch(q) or q in jobstore.RESERVED):
+        ui.die(f"{prog}: '{q}' is not a queue name (lowercase letters, digits, - and _; not {' or '.join(jobstore.RESERVED)})", 2)
     scope = a.scope = [q] if q else None
     if q is not None:
-        open_queue(q)       # a queue named with -q is opened once here, whatever the verb does with it
+        jobstore.open_queue(q)       # a queue named with -q is opened once here, whatever the verb does with it
     if a.verb == "add" and cmd and a.cmd:
         ui.die(f"{prog} add: put the whole command after --", 2)
     # one row per verb: what it is called with is in the row, and nothing else is keyed on a verb's name. The

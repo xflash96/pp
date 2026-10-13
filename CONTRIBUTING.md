@@ -214,7 +214,7 @@ this table, and each rule's own docstring is its contract.
 | `alive` | judging a process alive by its pid | a claim's holder, or `Handle` | `pp/lib/proc.py` |
 | `lock` | taking a lock | `locked`, and `deferring` for a scope with no lock | `pp/lib/lock.py` |
 | `claim` | opening a claim's file | `Claim` | `pp/lib/lock.py` |
-| `job` | reading or writing a job's file | `txn`, `listing`, `find` | `pp/lib/jobq.py` |
+| `job` | reading or writing a job's file | `txn`, `listing`, `find` | `pp/lib/jobstore.py` |
 | `worker-claim` | taking a queue's worker claim, or reading its holder | `worker`, `worker_now`, `work` | `pp/lib/jobq.py` |
 | `job-process` | signalling or reaping a job's processes | the `Worker` class, `cmd_worker`, `work` | `pp/lib/jobq.py`, `pp/lib/proc.py`, `pp/commands/kill.py` |
 | `by-name` | deciding on a served file by its name | act on the open file | `pp/commands/http.py` |

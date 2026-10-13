@@ -142,13 +142,12 @@ def _spawn(node, path, qual):
     return (_LIVES_BESIDE if path.startswith("tests/") else _ANY_START)(node, path, qual)
 
 
+_STORE = "pp/lib/jobstore.py"       # the store's own code, which is the `job` rule's home
 _JOB_FILES = {"_jpath", "_job_ids", "_read_job", "_write_job", "_stage_job", "_remove_job"}
-# the store's own code: the primitives, the transaction, the one read that takes no lock, the list of queues
-# with the one place a queue is opened, and the claim that lives beside a record
-_JOB_HOME = _JOB_FILES | {"Txn", "find", "queues", "open_queue", "_run_claim"}
+_JOB_MODULES = ("jobq", "jobstore", "store")    # the store's module, however the file that reads it names it
 _RECORD_FILE = {"open", "os.open", "os.replace", "os.remove", "os.rename", "os.unlink"}
 _PATH_CALLS = ("os.path.join",)                     # builds a path out of its parts
-_PATH_HELPERS = {"_qroot", "_top", "state_dir"}     # ... and so do the store's own directory helpers
+_PATH_HELPERS = {"qroot", "top", "state_dir"}       # ... and so do the store's own directory helpers
 
 
 def _parts(node) -> list[str] | None:
@@ -174,26 +173,25 @@ def _job_file(node, path, qual):
     record without a lock. Everything else asks one of them.
 
     Every way in counts, not only the one a bypass would be written in first: the primitive called by name in
-    jobq.py, through the module (`jobq._write_job`, `getattr(jobq, "_write_job")`), imported out of it by
-    name, the module itself under another name, which hides the calls through it, a path with "jobs" in it
-    opened, replaced or removed by hand, and the jobs directory named anywhere at all, which is where such a
-    path comes from."""
-    if path == "pp/lib/jobq.py" and qual.split(".")[0] in _JOB_HOME:
-        return False
+    the store, through the module (`jobstore._write_job`, `getattr(jobstore, "_write_job")`), imported out of
+    it by name, the module itself under another name, which hides the calls through it, a path with "jobs" in
+    it opened, replaced or removed by hand, and the jobs directory named anywhere at all, which is where such
+    a path comes from."""
     if isinstance(node, ast.Name):
-        return path == "pp/lib/jobq.py" and node.id in _JOB_FILES
+        return node.id in _JOB_FILES
     if isinstance(node, ast.Attribute):
-        return node.attr in _JOB_FILES and _last(_dotted(node.value)) == "jobq"
+        return node.attr in _JOB_FILES and _last(_dotted(node.value)) in _JOB_MODULES
     if isinstance(node, ast.Import):
-        return any(a.asname and _last(a.name) == "jobq" for a in node.names)
+        return any(a.asname and _last(a.name) in ("jobq", "jobstore") for a in node.names)
     if isinstance(node, ast.ImportFrom):
-        if _last(node.module or "") not in ("lib", "jobq"):
+        if _last(node.module or "") not in ("lib", "jobq", "jobstore"):
             return False
-        return any(a.name in _JOB_FILES or (_last(a.name) == "jobq" and a.asname) for a in node.names)
+        return any(a.name in _JOB_FILES or (_last(a.name) in ("jobq", "jobstore") and a.asname)
+                   for a in node.names)
     if isinstance(node, ast.Call):
         name = _dotted(node.func)
         if name == "getattr" and len(node.args) == 2:
-            return _last(_dotted(node.args[0])) == "jobq" and isinstance(node.args[1], ast.Constant) \
+            return _last(_dotted(node.args[0])) in _JOB_MODULES and isinstance(node.args[1], ast.Constant) \
                 and node.args[1].value in _JOB_FILES
         if name in _RECORD_FILE and any(isinstance(n, ast.Constant) and isinstance(n.value, str)
                                         and _says_jobs(n.value) for a in node.args for n in ast.walk(a)):
@@ -201,7 +199,7 @@ def _job_file(node, path, qual):
     return any(_says_jobs(v) for v in _parts(node) or [])
 
 
-_CLAIM_PATHS = {"_worker_claim", "_run_claim", "_probe_claim", "_watcher_claim"}
+_CLAIM_PATHS = {"_worker_claim", "run_claim", "_probe_claim", "_watcher_claim"}
 _CLAIM_FILES = (".run", ".claim", "worker.lock")    # what a claim file is called, beside a probe's own lock
 _handed_to_a_claim: dict[str, set] = {}     # path -> where in it an argument of a lock.Claim call is
 
@@ -586,7 +584,8 @@ RULES = {
                    ("pp", "tests"), home=("pp/lib/proc.py",)),
     "spawn": Rule("starts a process: proc.spawn does that", _spawn, ("pp", "tests"),
                   home=("pp/lib/proc.py", "tests/journey.py")),
-    "job": Rule("reads or writes a job file: the store's transaction does that", _job_file, ("pp", "tests")),
+    "job": Rule("reads or writes a job file: the store's transaction does that", _job_file, ("pp", "tests"),
+                home=(_STORE,)),
     "lock": Rule("takes a lock: pp/lib/lock.py does that",
                  _through({"fcntl": ("flock", "lockf", "fcntl")}, vias=("lock",)),
                  ("pp", "tests"), home=("pp/lib/lock.py",)),
@@ -802,8 +801,8 @@ class TestConstructs(unittest.TestCase):
         lines = {"signal": ("os.kill(1, 15)", "os.killpg(g, 15)", "signal.raise_signal(signal.SIGTERM)",
                             "signal.pthread_kill(t, 15)"),
                  "spawn": ("subprocess.Popen(['true'])",),
-                 "job": ("jobq._write_job(j)", "d = os.path.join(st, 'queue', 'default', 'jobs')",
-                         "d = _qroot(q, 'jobs')", "d = paths.state_dir('queue', q, 'jobs')",
+                 "job": ("jobstore._write_job(j)", "d = os.path.join(st, 'queue', 'default', 'jobs')",
+                         "d = qroot(q, 'jobs')", "d = paths.state_dir('queue', q, 'jobs')",
                          "d = f'{st}/queue/default/jobs'", "d = st + '/queue/default/jobs'"),
                  "lock": ("fcntl.flock(fd, 2)", "fcntl.lockf(fd, 2)", "fcntl.fcntl(fd, 37, b)"),
                  "alive": ("proc.alive(1)",),
@@ -814,12 +813,12 @@ class TestConstructs(unittest.TestCase):
                              "os.environ.update(env)", "os.environ.setdefault('X', '1')",
                              "mock.patch.dict(os.environ, env)", "mock.patch.dict('os.environ', env)"),
                  "worker-claim": ("jobq.worker(q)", "lock.Claim.holder(_worker_claim(q))",
-                                  "lock.Claim.take(os.path.join(_qroot(q), 'worker.lock'), rec)"),
-                 "claim": ("open(_worker_claim(q))", "paths.write_json(_run_claim(q, jid), rec)",
-                           "p = os.path.join(_qroot(q), 'worker.lock')",
-                           "os.remove(os.path.join(_top('watchers'), f'{pid}.claim'))",
-                           "p = os.path.join(_qroot(q, 'jobs'), f'{jid}.run')",
-                           "p = os.path.join(_top('probes'), '_shared.nodes.lock')"),
+                                  "lock.Claim.take(os.path.join(qroot(q), 'worker.lock'), rec)"),
+                 "claim": ("open(_worker_claim(q))", "paths.write_json(run_claim(q, jid), rec)",
+                           "p = os.path.join(qroot(q), 'worker.lock')",
+                           "os.remove(os.path.join(top('watchers'), f'{pid}.claim'))",
+                           "p = os.path.join(qroot(q, 'jobs'), f'{jid}.run')",
+                           "p = os.path.join(top('probes'), '_shared.nodes.lock')"),
                  # every spelling of a flag a test tests and then marks, with the line that starts it off
                  # unset, which is what makes it one
                  "once": ("done = []\nif not done:\n    done.append(1)\n    go()",
@@ -847,10 +846,10 @@ class TestConstructs(unittest.TestCase):
                     # Claim, so the line under test stands in for that file's own
                     _once_sites[path] = _once_flags_in(tree)
                     self.assertTrue(any(RULES[key].match(n, path, "f") for n in ast.walk(tree)))
-        inside = ast.parse("_write_job(j)")        # the same write in jobq itself, outside the store and in it
+        inside = ast.parse("_write_job(j)")        # the same write outside the store, which is its home
         self.assertTrue(any(RULES["job"].match(n, "pp/lib/jobq.py", "cmd_add") for n in ast.walk(inside)))
-        self.assertFalse(any(RULES["job"].match(n, "pp/lib/jobq.py", "Txn.save") for n in ast.walk(inside)))
-        self.assertFalse(any(RULES["job"].match(n, "pp/lib/jobq.py", "find") for n in ast.walk(inside)))
+        self.assertEqual(RULES["job"].home, {_STORE})
+        self.assertNotIn(_STORE, {s.split(":")[0] for s in RULES["job"].sites()})
         for line in ("os.path.isfile(p)", "os.scandir(p)"):
             call = ast.parse(line).body[0].value
             self.assertTrue(RULES["by-name"].match(call, "pp/commands/http.py", "Handler._file"), line)
@@ -858,7 +857,7 @@ class TestConstructs(unittest.TestCase):
         # the one shape a claim's path may be used in, by argument or by keyword, and the functions that
         # return one; the store's own lock file is not a claim's
         for held in (ast.parse("lock.Claim.take(_worker_claim(q), rec)"),
-                     ast.parse("lock.Claim.take(path=os.path.join(_qroot(q), 'worker.lock'))")):
+                     ast.parse("lock.Claim.take(path=os.path.join(qroot(q), 'worker.lock'))")):
             _handed_to_a_claim["pp/held.py"] = _claim_args_in(ast.walk(held))
             self.assertFalse(any(RULES["claim"].match(n, "pp/held.py", "f") for n in ast.walk(held)),
                              ast.unparse(held))
@@ -948,30 +947,26 @@ class TestConstructs(unittest.TestCase):
         """A bypass is written whichever way is at hand, so each way is tried on the rule: the primitive under
         another name, out of an import, through the module under another name or as a string, the file opened
         by hand, and the jobs directory put in a name first, which is how such a path is usually written."""
-        bypasses = ("w = _write_job",                               # an alias of the primitive, in jobq.py
-                    "from pp.lib.jobq import _write_job",           # or out of it, into any file
-                    "from pp.lib import jobq as q",                 # the module renamed: q._write_job is hidden
+        bypasses = ("w = _write_job",                               # an alias of the primitive
+                    "from pp.lib.jobstore import _write_job",       # or out of it, into any file
+                    "from pp.lib import jobstore as q",             # the module renamed: q._write_job is hidden
                     "import pp.lib.jobq as q",
                     "getattr(jobq, '_write_job')(j)",               # the name as a string
                     "open(os.path.join(st, 'queue', 'default', 'jobs', '1.json'), 'w')",
-                    "os.replace(tmp, os.path.join(_qroot(q, 'jobs'), '1.json'))",
-                    "os.remove(_qroot(q, 'jobs') + '/1.json')",
+                    "os.replace(tmp, os.path.join(qroot(q, 'jobs'), '1.json'))",
+                    "os.remove(qroot(q, 'jobs') + '/1.json')",
                     "jobs = os.path.join(st, 'queue', 'default', 'jobs')",       # the directory in a name
-                    "d = _qroot(q, 'jobs')",
+                    "d = qroot(q, 'jobs')",
                     "d = paths.state_dir('queue', q, 'jobs')",
                     "d = f'{st}/queue/{q}/jobs'",
                     "for f in os.listdir(os.path.join(st, 'queue', q, 'jobs')): pass")
         for line in bypasses:
             for path in ("pp/lib/jobq.py", "pp/commands/queue.py", "tests/test_queue.py"):
-                if line.startswith("w = ") and path != "pp/lib/jobq.py":
-                    continue            # a bare name is the primitive itself only in the file that defines it
                 with self.subTest(line=line, path=path):
                     self.assertTrue(any(RULES["job"].match(n, path, "f") for n in ast.walk(ast.parse(line))))
-        for line in bypasses:           # and none of them counts as the store doing its own work
-            with self.subTest(line=line, inside="Txn"):
-                self.assertFalse(any(RULES["job"].match(n, "pp/lib/jobq.py", "Txn.save")
-                                     for n in ast.walk(ast.parse(line))))
-        for ok in ("from pp.lib import jobq", "open(os.path.join(d, 'rc', jid))", "jobq.find(jid)"):
+        # and none of them is reported in the store's own file, which is the rule's home
+        self.assertNotIn(_STORE, {s.split(":")[0] for s in RULES["job"].sites()})
+        for ok in ("from pp.lib import jobq", "open(os.path.join(d, 'rc', jid))", "jobstore.find(jid)"):
             with self.subTest(ok=ok):
                 self.assertFalse(any(RULES["job"].match(n, "pp/commands/queue.py", "f")
                                      for n in ast.walk(ast.parse(ok))))

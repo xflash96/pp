@@ -164,7 +164,7 @@ class Gate:
     are one move, with nothing in between.
 
         gate = Gate()
-        gate.once(requeue, when=lambda: (jobq.find(jid) or {}).get("stop"))
+        gate.once(requeue, when=lambda: (jobstore.find(jid) or {}).get("stop"))
         gate.passed("signalled")            # the point, said by one actor ...
         gate.wait("signalled")              # ... and waited for by another
         self.assertEqual(gate.ran, 1)       # how many times the step ran, in place of a flag to assert on
