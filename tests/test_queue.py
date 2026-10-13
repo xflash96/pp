@@ -3311,6 +3311,339 @@ class TestTheDecision(unittest.TestCase):
                 self.assertEqual(ask, asked, "it changed the ask it was given")
 
 
+class TestThePolicyTables(unittest.TestCase):
+    """One table per rule of pp/lib/jobpolicy.py, exhaustive where the rule's input is finite.
+
+    Every rule is handed records, readings, settings and `now`, and gives back a value, so a table is the
+    whole of its behaviour: no process, no thread, no clock and no store. `TestTheDecision` above is the
+    table for `decide` and `merge_stop`; these are the rest.
+    """
+
+    # -- merge_stop: every combination of the two stops, exhaustive -----------------------------------------
+    def test_the_one_stop_a_run_carries_over_every_pair(self):
+        """One run of a job carries one stop. Every pair of (what the record holds) and (what is asked) is a
+        row here, with `denied` set or not and with either grace the shorter one, so a second ask can never
+        write over what went out, never delay the SIGKILL, and never leave a refusal standing."""
+        rows = 0
+        for was in ("none", "timeout", "kill"):
+            for ask_by in ("timeout", "kill"):
+                for denied in (False, True):
+                    for shorter in ("ask", "record"):
+                        rows += 1
+                        if was == "none" and denied:
+                            continue        # a record that carries no stop carries no refusal either
+                        existing = None if was == "none" else {
+                            "by": "user" if was == "kill" else "timeout", "t": 100.0, "grace": 60.0,
+                            "sent": 101.0, **({"timeout": True} if was == "timeout" else {}),
+                            **({"denied": 102.0} if denied else {})}
+                        ask = {"by": "ann" if ask_by == "kill" else "timeout", "t": 500.0,
+                               "grace": 10.0 if shorter == "ask" else 900.0,
+                               **({"timeout": True} if ask_by == "timeout" else {})}
+                        got = jobpolicy.merge_stop(existing, ask)
+                        with self.subTest(was=was, ask=ask_by, denied=denied, shorter=shorter):
+                            if existing is None:
+                                self.assertEqual(got, ask)      # the ask itself, the first time
+                                continue
+                            self.assertEqual((got["t"], got["sent"]), (existing["t"], existing["sent"]))
+                            self.assertEqual(got["grace"], min(existing["grace"], ask["grace"]))
+                            self.assertNotIn("denied", got)     # a refused stop is asked for again
+                            kill = was == "kill" or ask_by == "kill"
+                            self.assertEqual("timeout" in got, not kill)
+                            self.assertEqual(got.get("was"), "timeout" if was == "timeout" and kill else None)
+        self.assertEqual(rows, 24)
+
+    # -- matches: --retry-if over the text it is handed, exhaustive ------------------------------------------
+    def test_what_retry_if_matches_over_every_pattern(self):
+        """`--retry-if` is read against the failure's own reason and the tail of the job's log, as one text.
+        No pattern matches anything, since a job with no pattern is retried on any failure; a pattern that
+        cannot be compiled matches nothing, so a typo retries nothing rather than everything."""
+        rows = []
+        for pat, holds in ((None, True), ("^lost$", True), ("CUDA out of memory", None),
+                           ("nothing like it", False), ("(unclosed", False)):
+            for tail in ("", "a line\nCUDA out of memory\nthe last line"):
+                want = holds if holds is not None else bool(tail)
+                rows.append((pat, tail, want))
+                with self.subTest(pattern=pat, tail=bool(tail)):
+                    job = {"id": 1} if pat is None else {"id": 1, "retry_if": pat}
+                    self.assertEqual(jobpolicy.matches(job, "lost", tail), want)
+        self.assertEqual(len(rows), 10)
+
+    # -- look: what one look at a worker's claim says, exhaustive --------------------------------------------
+    def test_what_one_look_at_a_workers_claim_says(self):
+        """Nobody holds the claim, a holder that has not recorded itself yet, and one whose record names a
+        live process: the three answers, over every record a claim can hold."""
+        live, dead = {"pid": 7, "pstart": 11}, {"pid": 8, "pstart": 12}
+        rows = 0
+        for rec in (None, {}, dead, live):
+            for alive in (False, True):
+                rows += 1
+                with self.subTest(rec=rec, alive=alive):
+                    if rec is None and alive:
+                        continue        # nothing holds the claim, so no record of its can name a process
+                    want = (jobpolicy.DOWN if rec is None else
+                            jobpolicy.UP if alive else jobpolicy.STARTING)
+                    self.assertEqual(jobpolicy.look(rec, alive), want)
+        self.assertEqual(rows, 8)
+        self.assertEqual((jobpolicy.UP, jobpolicy.DOWN, jobpolicy.STARTING), (jobcore.UP, jobcore.DOWN,
+                                                                             jobcore.STARTING))
+
+    # -- next_tick: how long the worker waits next, exhaustive ------------------------------------------------
+    def test_how_long_the_worker_waits_next(self):
+        """A stop in flight and a wake together make the next wait the short one, so a verb waiting for a stop
+        costs the job's own exit time and not the queue's poll. The idle time is spent only once the queue has
+        held nothing for `idle_exit`, which a queue with something queued or running never has."""
+        st = {"poll": 2.0, "idle_exit": 600.0}
+        now, rows = 10_000.0, 0
+        for serving in (0, 1):
+            for woken in (False, True):
+                for idle_since in (None, now - 599.0, now - 601.0):
+                    rows += 1
+                    with self.subTest(serving=serving, woken=woken, idle=idle_since):
+                        period, spent = jobpolicy.next_tick(st, serving, woken, idle_since, now)
+                        self.assertEqual(period, jobpolicy.STOP_PERIOD if serving and woken else 2.0)
+                        self.assertEqual(spent, idle_since is not None and now - idle_since >= 600.0)
+        self.assertEqual(rows, 12)
+        # the settings a worker was handed, and the defaults where it was handed none
+        self.assertEqual(jobpolicy.next_tick({}, 0, False, None, now), (jobpolicy.POLL, False))
+        self.assertEqual(jobpolicy.next_tick({}, 0, False, now - jobpolicy.IDLE_EXIT, now), (jobpolicy.POLL, True))
+        self.assertEqual(jobpolicy.next_tick({"poll": 0.01}, 1, True, None, now)[0], 0.01)   # the shorter of the two
+
+    # -- job_env and hook_env: what a job and a hook run with ------------------------------------------------
+    def test_what_one_attempt_of_a_job_runs_with(self):
+        """The order the layers merge in: the shell that queued the job, then the project's env and the job's
+        own, then pp's own names, which no job can write over, and then the card it was given."""
+        rows = 0
+        for shell in ({}, {"PATH": "/sh", "CONDA_PREFIX": "/c"}):
+            for env in ({}, {"HF": "1"}, {"PATH": "/mine"}, {"PP_QUEUE": "theirs", "PP_QUEUE_JOB": "9"}):
+                for card_i in (None, 3):
+                    rows += 1
+                    job = {"id": 5, "queue": "dl", "rcfile": "/rc/5.1.ab", "shell_env": shell, "env": env}
+                    got = jobpolicy.job_env(job, card_i)
+                    with self.subTest(shell=bool(shell), env=sorted(env), card=card_i):
+                        self.assertEqual(got["PP_QUEUE"], "dl")         # pp's own names, whatever a job asks
+                        self.assertEqual(got["PP_QUEUE_JOB"], "5")
+                        self.assertEqual(got["PP_QUEUE_RCFILE"], "/rc/5.1.ab")
+                        self.assertEqual(got.get("CUDA_VISIBLE_DEVICES"), None if card_i is None else "3")
+                        for k, v in env.items():                        # the job's own, over the shell's
+                            if not k.startswith("PP_QUEUE"):
+                                self.assertEqual(got[k], v)
+                        for k, v in shell.items():
+                            if k not in env:
+                                self.assertEqual(got[k], v)
+        self.assertEqual(rows, 16)
+
+    def test_what_a_hook_of_a_job_runs_with(self):
+        """A hook reads how the job ended from its environment, so every name is there even where the record
+        holds none: a hook under `set -u` reads all of them. The reason a failure with no reason of its own
+        carries is its exit code."""
+        names = ("PP_QUEUE", "PP_QUEUE_JOB", "PP_QUEUE_EVENT", "PP_QUEUE_RC", "PP_QUEUE_REASON",
+                 "PP_QUEUE_LOG", "PP_QUEUE_CWD", "PP_QUEUE_TAG")
+        rows = 0
+        for event in ("failed", "done"):
+            for rc in (None, 0, 7):
+                for reason in (None, "killed"):
+                    rows += 1
+                    job = {"id": 5, "queue": "dl", **({} if rc is None else {"rc": rc}),
+                           **({} if reason is None else {"reason": reason})}
+                    got = jobpolicy.hook_env(job, event)
+                    with self.subTest(event=event, rc=rc, reason=reason):
+                        self.assertEqual(sorted(got), sorted(names))
+                        self.assertEqual(got["PP_QUEUE_EVENT"], event)
+                        self.assertEqual(got["PP_QUEUE_RC"], "" if rc is None else str(rc))
+                        want = reason or (f"exit {rc}" if event == "failed" and rc is not None else "")
+                        self.assertEqual(got["PP_QUEUE_REASON"], want)
+        self.assertEqual(rows, 12)
+
+    # -- select: the forms a selection takes -----------------------------------------------------------------
+    def test_which_jobs_a_selection_names(self):
+        """An id, a range and a tag matched whole, over the records they are read against: in the order the
+        specs were given, each id once, and the ids of one spec in id order. A form that names no record
+        gives back nothing, for the verb to refuse."""
+        records = [{"id": 3, "tag": "sweep", "queue": "a"}, {"id": 5, "tag": "sweep", "queue": "b"},
+                   {"id": 12, "tag": "once", "queue": "a"}]
+        rows = [("5", ["5"], [5]), ("one id", ["12"], [12]), ("an id nothing holds", ["99"], []),
+                ("a range over several", ["3-5"], [3, 5]),
+                ("a range over one", ["12-12"], [12]),
+                ("a range over none", ["6-11"], []),
+                ("a tag over several", ["sweep"], [3, 5]),
+                ("a tag over one", ["once"], [12]),
+                ("a tag nothing carries", ["nope"], []),
+                ("two specs, in the order given", ["12", "3-5"], [12, 3, 5]),
+                ("each id once, however many specs name it", ["sweep", "3", "3-5"], [3, 5]),
+                ("one spec, as a string", "sweep", [3, 5])]
+        for what, selection, want in rows:
+            with self.subTest(what):
+                self.assertEqual(jobpolicy.select(records, selection), want)
+        for spec, form in (("7", "id"), ("12-15", "range"), ("sweep", "tag"), ("12-", "tag"), ("", "tag")):
+            self.assertEqual(jobpolicy.kind(spec), form)
+
+    # -- admit: what one launch pass starts, and what the head waits for -------------------------------------
+    def pool(self, name="slots", scope=None, mx=3, probe=None, settle=30.0):
+        return {"name": name, "scope": scope, "where": f"[resources] {name}", "max": mx, "probe": probe,
+                "every": 30.0, "settle": settle}
+
+    def seen(self, pools, cards=None, probes=None, cards_t=1000.0):
+        by: dict = {}
+        for p in pools:
+            by.setdefault(p["name"], []).append(p)
+        return {"q": "default", "pools": pools, "by_name": by, "cards": cards, "cards_t": cards_t,
+                "probes": probes or {}, "cards_why": "", "where": "/cfg/config.toml"}
+
+    def job(self, jid, needs=None, **kw):
+        return {"id": jid, "queue": "default", "state": "queued", "prio": 10, "needs": needs or {"slots": 1},
+                **kw}
+
+    def test_what_one_launch_pass_admits(self):
+        """One pass, over every class of pool and every way one can be held: a number, a reading, a settle
+        window, and nothing providing it at all. Strict head-of-line unless the pass backfills, and a job
+        waiting out a retry's delay is skipped rather than waited for, so it never becomes the head."""
+        now = 2000.0
+        a, b = self.job(1), self.job(2)
+        rows = [
+            ("both fit", [self.pool(mx=3)], {}, [a, b], [], False, [1, 2], None),
+            ("the head fits and the next does not", [self.pool(mx=1)], {}, [a, b], [], False, [1], 2),
+            ("a running job counts against the max", [self.pool(mx=1)], {}, [a], [self.job(9, state="running")],
+             False, [], 1),
+            ("one queue's own pool counts that queue's jobs alone",
+             [self.pool(scope="default", mx=1)], {}, [a], [{**self.job(9, state="running"), "queue": "other"}],
+             False, [1], None),
+            ("a shared pool counts every queue's", [self.pool(mx=1)], {},
+             [a], [{**self.job(9, state="running"), "queue": "other"}], False, [], 1),
+            ("nothing provides what a job needs", [self.pool(mx=3)], {},
+             [self.job(1, needs={"nodes": 1})], [], False, [], 1),
+            ("a probe that says there is room", [self.pool(name="nodes", mx=None, probe="free")],
+             {(None, "nodes"): {"t": 1000.0, "value": 4}}, [self.job(1, needs={"nodes": 2})], [], False,
+             [1], None),
+            ("a probe that says there is not", [self.pool(name="nodes", mx=None, probe="free")],
+             {(None, "nodes"): {"t": 1000.0, "value": 1}}, [self.job(1, needs={"nodes": 2})], [], False,
+             [], 1),
+            ("a probe that failed", [self.pool(name="nodes", mx=None, probe="free")],
+             {(None, "nodes"): {"t": 1000.0, "value": None, "error": "exit 1"}},
+             [self.job(1, needs={"nodes": 2})], [], False, [], 1),
+            ("a probe being read now", [self.pool(name="nodes", mx=None, probe="free")],
+             {(None, "nodes"): {"t": 1000.0, "value": None, "running": True}},
+             [self.job(1, needs={"nodes": 2})], [], False, [], 1),
+            ("a reading older than what a running job took",
+             [self.pool(name="nodes", mx=None, probe="free", settle=30.0)],
+             {(None, "nodes"): {"t": 1000.0, "value": 2}},
+             [self.job(1, needs={"nodes": 2})],
+             [{**self.job(9, state="running", needs={"nodes": 2}), "started": 990.0}], False, [], 1),
+            ("a reading taken after that job started",
+             [self.pool(name="nodes", mx=None, probe="free", settle=30.0)],
+             {(None, "nodes"): {"t": 1000.0, "value": 2}},
+             [self.job(1, needs={"nodes": 2})],
+             [{**self.job(9, state="running", needs={"nodes": 2}), "started": 900.0}], False, [1], None),
+        ]
+        for what, pools, probes, queued, running, backfill, starts, blocked in rows:
+            with self.subTest(what):
+                p = jobpolicy.admit({"queued": queued, "running": running}, self.seen(pools, probes=probes),
+                                    {"backfill": backfill, "now": now})
+                self.assertEqual([j["id"] for j, _card in p.starts], starts)
+                self.assertEqual(None if p.blocked[0] is None else p.blocked[0]["id"], blocked)
+                if blocked is not None:
+                    self.assertTrue(p.blocked[1], "a job that did not fit says why")
+
+    def test_the_head_of_the_queue_and_the_jobs_behind_it(self):
+        """Strict head-of-line by priority: the first job that does not fit ends the pass, so a big job is
+        never starved by small ones. With backfill the pass goes on past it, and the job that did not fit is
+        still the one the head waits for. A job in its retry delay is skipped, not waited for."""
+        now = 2000.0
+        big, small = self.job(1, needs={"slots": 3}), self.job(2, needs={"slots": 1})
+        delayed = self.job(3, needs={"slots": 1}, not_before=now + 60)
+        for backfill in (False, True):
+            with self.subTest(backfill=backfill, fits="the head, and what it took leaves no room"):
+                p = jobpolicy.admit({"queued": [big, small], "running": []}, self.seen([self.pool(mx=3)]),
+                                    {"backfill": backfill, "now": now})
+                self.assertEqual([j["id"] for j, _c in p.starts], [1])   # backfill invents no room
+                self.assertEqual(p.blocked[0]["id"], 2)
+            with self.subTest(backfill=backfill, fits="the head, with room behind it"):
+                p = jobpolicy.admit({"queued": [big, small], "running": []}, self.seen([self.pool(mx=4)]),
+                                    {"backfill": backfill, "now": now})
+                self.assertEqual([j["id"] for j, _c in p.starts], [1, 2])
+                self.assertIsNone(p.blocked[0])
+            with self.subTest(backfill=backfill, fits="not the head"):
+                p = jobpolicy.admit({"queued": [big, small], "running": []}, self.seen([self.pool(mx=2)]),
+                                    {"backfill": backfill, "now": now})
+                self.assertEqual([j["id"] for j, _c in p.starts], [2] if backfill else [])
+                self.assertEqual(p.blocked[0]["id"], 1)     # the head is what the queue waits for, either way
+        with self.subTest("a job in its delay is skipped and never the head"):
+            p = jobpolicy.admit({"queued": [delayed, small], "running": []}, self.seen([self.pool(mx=3)]),
+                                {"backfill": False, "now": now})
+            self.assertEqual([j["id"] for j, _c in p.starts], [2])
+            self.assertIsNone(p.blocked[0])
+        with self.subTest("what the pass has taken counts against the next job in it"):
+            p = jobpolicy.admit({"queued": [small, self.job(4, needs={"slots": 1})], "running": []},
+                                self.seen([self.pool(mx=1)]), {"backfill": False, "now": now})
+            self.assertEqual([j["id"] for j, _c in p.starts], [2])
+            self.assertEqual(p.blocked[0]["id"], 4)
+
+    def test_which_card_a_job_takes(self):
+        """A GPU pool is per card: the budget is the pool's max, or the card's own total less 2 GB, and what
+        nvidia-smi cannot see yet is what a job launched inside the settle window took. The card with the most
+        free memory that fits is the one the job takes."""
+        now, cards = 2000.0, [card(0, total=24, used=20), card(1, total=24, used=4)]
+        pools = [self.pool(name="gpu_gb", mx=None, settle=30.0), self.pool(name="slots", mx=3)]
+        want = self.job(1, needs={"gpu_gb": 8, "slots": 1})
+        # the budget of a pool with no max of its own is the card's total less 2 GB
+        self.assertEqual(jobpolicy.gpu_budget(pools[0], cards[0]), 22.0)
+        self.assertEqual(jobpolicy.gpu_budget({**pools[0], "max": 10}, cards[0]), 10)
+        with self.subTest("the card that fits"):
+            p = jobpolicy.admit({"queued": [want], "running": []}, self.seen(pools, cards=cards),
+                                {"backfill": False, "now": now})
+            self.assertEqual([(j["id"], c) for j, c in p.starts], [(1, 1)])
+        with self.subTest("a card another job has reserved"):
+            on = [{**self.job(9, state="running", needs={"gpu_gb": 20}), "gpu": 1, "started": 100.0}]
+            p = jobpolicy.admit({"queued": [want], "running": on}, self.seen(pools, cards=cards),
+                                {"backfill": False, "now": now})
+            self.assertEqual(p.starts, ())
+            self.assertIn("reserved", p.blocked[1])
+        with self.subTest("a job launched inside the settle window, which the reading cannot see"):
+            # the cards say 20 free on card 1, and 8 of it is a job launched since that reading: a job that
+            # needs 16 does not fit, though the pool's own number leaves room for it
+            wide = [{**self.pool(name="gpu_gb", mx=24, settle=30.0), "where": "[resources] gpu_gb"}]
+            big = self.job(1, needs={"gpu_gb": 16})
+            on = [{**self.job(9, state="running", needs={"gpu_gb": 8}), "gpu": 1, "started": 1990.0}]
+            p = jobpolicy.admit({"queued": [big], "running": on},
+                                self.seen(wide, cards=[card(0, total=24, used=24), card(1, total=24, used=4)],
+                                          cards_t=1980.0), {"backfill": False, "now": now})
+            self.assertEqual(p.starts, ())
+            self.assertIn("not allocated yet", p.blocked[1])
+        with self.subTest("no card at all"):
+            p = jobpolicy.admit({"queued": [want], "running": []}, self.seen(pools, cards=None),
+                                {"backfill": False, "now": now})
+            self.assertEqual(p.starts, ())
+            self.assertIn("nvidia-smi", p.blocked[1])
+
+    def test_what_can_never_fit_is_refused_before_it_is_queued(self):
+        """`check` is the same arithmetic asked at add time: a need nothing provides, and one larger than
+        every budget there is, are refused where the job is queued rather than waited for forever."""
+        pools = [self.pool(name="slots", mx=3), self.pool(name="gpu_gb", mx=None)]
+        seen = self.seen(pools, cards=[card(0, total=24)])
+        self.assertIsNone(jobpolicy.check({"slots": 1, "gpu_gb": 20}, seen))
+        self.assertIn("nothing provides 'nodes'", jobpolicy.check({"nodes": 1}, seen))
+        self.assertIn("/cfg/config.toml", jobpolicy.check({"nodes": 1}, seen))      # and the file to set it in
+        self.assertIn("no card's budget is that large", jobpolicy.check({"gpu_gb": 23}, seen))
+        self.assertIn("[resources] slots = 3", jobpolicy.check({"slots": 4}, seen))
+        self.assertIn("sees no GPU", jobpolicy.check({"gpu_gb": 1}, self.seen(pools, cards=None)))
+
+    def test_every_rule_gives_the_same_answer_twice_and_changes_nothing(self):
+        """Pure: the records and the readings a rule is handed come back as they were, and the same input
+        twice gives the same value. So a table is the whole of the rule."""
+        now = 2000.0
+        state = {"queued": [self.job(1), self.job(2)], "running": [self.job(9, state="running")]}
+        seen = self.seen([self.pool(mx=2)])
+        before = json.dumps([state, {k: v for k, v in seen.items() if k != "probes"}], sort_keys=True)
+        first = jobpolicy.admit(state, seen, {"backfill": False, "now": now})
+        again = jobpolicy.admit(state, seen, {"backfill": False, "now": now})
+        self.assertEqual([j["id"] for j, _c in first.starts], [j["id"] for j, _c in again.starts])
+        self.assertEqual(json.dumps([state, {k: v for k, v in seen.items() if k != "probes"}],
+                                    sort_keys=True), before)
+        job = {"id": 5, "queue": "dl", "rcfile": "/rc/x", "env": {"A": "1"}, "shell_env": {}}
+        was = json.dumps(job, sort_keys=True)
+        self.assertEqual(jobpolicy.job_env(job, 0), jobpolicy.job_env(job, 0))
+        self.assertEqual(json.dumps(job, sort_keys=True), was)
+
+
 class TestWhatTheTextNames(QueueCase):
     """A sentence that names a file or a variable is read as the thing to go and look for, so each one is
     checked against the code that writes it."""
