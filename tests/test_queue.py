@@ -3910,10 +3910,10 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
     # two leaves the hook owed, and the next worker runs it again: the hook of one outcome runs twice. The
     # other order loses the hook of an outcome whose worker ends before it, and a hook that never fires is
     # the worse of the two, so what this order costs is a second run and never none.
-    @unittest.expectedFailure
-    def test_a_hook_that_ran_is_never_run_twice(self):
-        """The hook of an outcome runs once. A worker that ends between the hook's own start and the record of
-        it leaves a record that says the hook is owed, and the next worker reads that record."""
+
+    def test_a_hook_whose_worker_died_while_starting_it_runs_again_and_no_more(self):
+        """A hook runs at least once. A worker that ends between the hook's own start and the record of it leaves a
+        record that says the hook is owed, so the next worker starts it again, and a worker after that does not."""
         f = self.hook_file()
         j = self.add("--on-fail", f"echo x >> {f}", cmd="exit 3")
         w = jobq.Worker("default")
@@ -3927,7 +3927,10 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         self.assertIsNone(rec.get("hooks"))
         w2 = jobq.Worker("default")
         self.run_until(w2, lambda: not w2.hooks and "hook_due" not in jobq.find(j))
-        self.assertEqual(self.ran(f), 1, "the hook ran again for an outcome it had already run for")
+        self.assertEqual(self.ran(f), 2)
+        w3 = jobq.Worker("default")
+        w3.tick()
+        self.assertEqual((self.ran(f), len(jobq.find(j)["hooks"])), (2, 1))
 
     def test_a_requeue_that_lost_its_worker_keeps_one_history_entry(self):
         """A requeue is one change of one record: the attempt that ended goes into the history, the fields of
