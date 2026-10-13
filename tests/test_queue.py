@@ -3694,9 +3694,11 @@ class TestThePolicyTables(unittest.TestCase):
 
     # -- matches: --retry-if over the text it is handed, exhaustive ------------------------------------------
     def test_what_retry_if_matches_over_every_pattern(self):
-        """`--retry-if` is read against the failure's own reason and the tail of the job's log, as one text.
-        No pattern matches anything, since a job with no pattern is retried on any failure; a pattern that
-        cannot be compiled matches nothing, so a typo retries nothing rather than everything."""
+        """`--retry-if` is read against the failure's own reason and the tail of the job's log. The tail is
+        matched where the facts are read (`tail_hit`) and the reason inside the decision, so one pattern over
+        the two reads the same as it did over one text. No pattern matches anything, since a job with no
+        pattern is retried on any failure; a pattern that cannot be compiled matches nothing, so a typo
+        retries nothing rather than everything."""
         rows = []
         for pat, holds in ((None, True), ("^lost$", True), ("CUDA out of memory", None),
                            ("nothing like it", False), ("(unclosed", False)):
@@ -3705,8 +3707,24 @@ class TestThePolicyTables(unittest.TestCase):
                 rows.append((pat, tail, want))
                 with self.subTest(pattern=pat, tail=bool(tail)):
                     job = {"id": 1} if pat is None else {"id": 1, "retry_if": pat}
-                    self.assertEqual(jobpolicy.matches(job, "lost", tail), want)
+                    self.assertEqual(jobpolicy.matches(job, "lost", jobpolicy.tail_hit(job, tail)), want)
         self.assertEqual(len(rows), 10)
+
+    def test_the_log_tail_is_matched_where_the_facts_are_read(self):
+        """I12. The decision is made inside the store's transaction, where every reader of every queue waits
+        for the scope, and the tail of a job's log is matched against a pattern its caller wrote: a nested
+        group over a line that does not match it backtracks exponentially, and a worker matching one in there
+        holds the one store lock for as long as it takes.
+
+        So the match is a fact, read with the others and before the scope, and the decision is made from that
+        value: a failure whose tail matched is retried while attempts are left, and one whose tail did not is
+        final, and neither reads the tail."""
+        job = {"id": 1, "queue": "default", "attempt": 1, "retries": 1, "retry_if": "(a+)+$"}
+        self.assertFalse(jobpolicy.tail_hit(job, "a" * 18 + "b"), "out here, where nothing waits for it")
+        again = jobpolicy.decide(job, jobpolicy.facts(False, rc=1, rc_at=100.0, now=100.0, hit=True))
+        self.assertEqual((again.do, again.attempt), (jobpolicy.AGAIN, 2))
+        final = jobpolicy.decide(job, jobpolicy.facts(False, rc=1, rc_at=100.0, now=100.0, hit=False))
+        self.assertEqual((final.do, final.state, final.rc), (jobpolicy.ENDED_AS, "failed", 1))
 
     # -- look: what one look at a worker's claim says, exhaustive --------------------------------------------
     def test_what_one_look_at_a_workers_claim_says(self):
@@ -5485,6 +5503,29 @@ class TestTheStoreUnderTwoActors(InjectedCase):
             self.assertIn(row[0][1], jobstore.STATES, row)
         self.assertEqual((seen[0][0][1], seen[-1][0][1]), ("held", "failed"))   # it looked through the whole
         self.assertGreater(len({st for row in seen for _i, st in row}), 1, seen)
+
+    def test_a_log_tail_is_matched_with_no_scope_of_the_store_held(self):
+        """I12. Nothing that can block runs inside the store's transaction, and --retry-if is a pattern its
+        caller wrote, matched against 200 lines of the job's own output: one nested group over a line that
+        does not match backtracks exponentially, and a worker matching one inside the scope would hold the
+        one store lock for as long as it took, leaving every queue on the machine unreadable.
+
+        So the match is one of the facts, taken before the scope: another process asks for the store lock
+        from inside the match itself and is given it."""
+        asked, real = [], jobpolicy.tail_hit
+
+        def hit(job, tail):
+            asked.append(self.asking_for_the_store())
+            return real(job, tail)
+        j = self.add("--retries", "1", "--retry-if", "(a+)+$", cmd="echo aaaaaaaaaaaab; exit 1")
+        w = jobq.worker_for("default")
+        w.tick()
+        self.the_run_is_over(j)
+        with mock.patch.object(jobcore.policy, "tail_hit", hit):
+            w.tick()
+        self.assertEqual(asked, ["took it"])
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["attempt"]), ("failed", 1))     # the tail does not match it
 
     def test_a_write_of_a_copy_from_outside_the_scope_is_refused(self):
         """A record a scope writes is a record that scope read. A copy read before the scope, and a copy of

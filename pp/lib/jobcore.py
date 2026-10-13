@@ -223,9 +223,10 @@ class Worker:
     def _facts(self, j: dict, now: float) -> policy.Facts:
         """What is true of this running job besides its record, all of it read here and nothing decided:
         whether a run of it is live, the exit code that run wrote and when, the signal its own child died of,
-        and the log tail --retry-if matches against.
+        and whether --retry-if matches the tail of its log.
 
-        Read before the transaction, since none of it is store state and a log tail can be long."""
+        Read before the transaction, since none of it is store state, a log tail can be long and the pattern
+        it is matched against is the caller's own: the match belongs out here with the reading (I12)."""
         held = lock.Claim.holder(jobstore.run_claim(self.queue, j["id"]))
         p = self.children.get(j["id"])
         if held is not None or (p is not None and p.poll() is None):
@@ -239,7 +240,7 @@ class Worker:
         self.children.pop(j["id"], None)
         rc, ended = ended_on_its_own(j) or (None, None)
         return policy.facts(False, p.poll() if p is not None else None, rc, ended, now=now,
-                            tail=self.tail(j, 200) if policy.wants_tail(j, rc) else "")
+                            hit=policy.wants_tail(j, rc) and policy.tail_hit(j, self.tail(j, 200)))
 
     def _step(self, j: dict, facts: policy.Facts) -> policy.Action:
         """The one decision about one job, and the action it names, carried out: what is store state in one

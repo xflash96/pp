@@ -54,7 +54,9 @@ class Facts:
     rc, rc_at   the exit code this attempt wrote and when it wrote it (`ended_on_its_own`), or None for both.
     sig     the signal the attempt's process died of, where this worker started it and so holds the child.
     now     the time the facts were read at, which is the only clock the decision has.
-    tail    the job's log as --retry-if matches against it, read where the job asks for one.
+    hit     whether --retry-if matches the tail of this attempt's log (`tail_hit`), matched where the facts
+            were read: a pattern of the caller's own takes as long as it likes over a tail, and the decision
+            runs inside the store's transaction (I12).
     """
 
     held: bool
@@ -62,7 +64,7 @@ class Facts:
     rc_at: float | None = None
     sig: int | None = None
     now: float = 0.0
-    tail: str = ""
+    hit: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,10 +124,10 @@ def attempt_of(job: dict, rc: int | None, reason: str | None, ended: float) -> d
 
 
 def facts(held: bool, code: int | None = None, rc: int | None = None, rc_at: float | None = None,
-          now: float = 0.0, tail: str = "") -> Facts:
+          now: float = 0.0, hit: bool = False) -> Facts:
     """The facts about one running job, from the readings the core took: whether a run of it is live, the exit
-    code it wrote and when, the status of a child this worker holds, the time those were read at, and the log
-    tail --retry-if matches against.
+    code it wrote and when, the status of a child this worker holds, the time those were read at, and whether
+    --retry-if matched the tail of its log.
 
     While the run is live none of the rest counts for anything, since the command itself can write the exit
     code file, so those facts are dropped here rather than read by the decision. A child's status below zero
@@ -133,7 +135,7 @@ def facts(held: bool, code: int | None = None, rc: int | None = None, rc_at: flo
     if held:
         return Facts(held=True, now=now)
     return Facts(held=False, rc=rc, rc_at=rc_at, sig=-code if code is not None and code < 0 else None,
-                 now=now, tail=tail)
+                 now=now, hit=hit)
 
 
 def wants_tail(job: dict, rc: int | None) -> bool:
@@ -141,13 +143,29 @@ def wants_tail(job: dict, rc: int | None) -> bool:
     return rc != 0 and bool(job.get("retry_if"))
 
 
-def matches(job: dict, why: str, tail: str) -> bool:
-    """Whether --retry-if matches this failure: its reason, or the tail of the job's log."""
+def tail_hit(job: dict, tail: str) -> bool:
+    """Whether --retry-if matches the tail of this attempt's log.
+
+    Matched where the facts are read and never inside the decision: the pattern is the caller's own and the
+    tail is 200 lines of the job's own output, so one nested group over a line that does not match backtracks
+    for as long as it likes. The decision runs inside the store's transaction, where every reader of every
+    queue waits for the scope (I12), and what it reads is this one value."""
     pat = job.get("retry_if")
-    if not pat:
-        return True
+    return bool(pat) and _searches(pat, tail)
+
+
+def matches(job: dict, why: str, hit: bool) -> bool:
+    """Whether --retry-if matches this failure: its reason, or the tail of the job's log (`tail_hit`, read
+    with the other facts). A job with no pattern is retried on any failure."""
+    pat = job.get("retry_if")
+    return not pat or hit or _searches(pat, why)
+
+
+def _searches(pat: str, text: str) -> bool:
+    """Whether this pattern is anywhere in this text, ^ and $ anchoring per line. A pattern that cannot be
+    compiled matches nothing, so a typo retries nothing rather than everything."""
     try:
-        return re.search(pat, why + "\n" + tail, re.M) is not None   # ^ $ per line
+        return re.search(pat, text, re.M) is not None
     except re.error:
         return False
 
@@ -248,7 +266,7 @@ def _or_again(job: dict, facts: Facts, rc: int | None, reason: str | None, ended
     attempt, retries = int(job.get("attempt", 1)), int(job.get("retries") or 0)
     why = reason or f"exit {rc}"
     left = attempt <= retries
-    if left and matches(job, why, facts.tail):
+    if left and matches(job, why, facts.hit):
         now = ended or facts.now
         base = job.get("retry_delay")
         delay = min(float(RETRY_DELAY if base is None else base) * 2 ** (attempt - 1), RETRY_DELAY_CAP)
