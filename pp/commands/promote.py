@@ -11,12 +11,13 @@ relink, and nothing registered ever runs a half-edited tree.
     pp promote --again             promote even when HEAD already is the current release
     pp promote status [--json]     every promoted target: current release, how far the source is ahead, links
     pp promote ls NAME             releases, newest first (* = current)
-    pp promote rollback NAME [--to STAMP] [-y]   flip back to the previous release, rerun `after`; a release
-                                   whose own `after`/`verify` failed is skipped (ls marks it); --to picks any
+    pp promote rollback NAME [--to STAMP] [-n] [-y]   flip back to the previous release, rerun `after`; a
+                                   release whose own `after`/`verify` failed is skipped (ls marks it); --to
+                                   picks any
     pp promote diff NAME           what the source has that the current release does not
-    pp promote link NAME           reassert the links
+    pp promote link NAME [-n]      reassert the links
     pp promote gc NAME [--keep N] [-n]   prune old releases and leftover staging dirs, after asking
-    pp promote init [PATH]         write a starter .pp.toml
+    pp promote init [PATH] [-n]    write a starter .pp.toml
 NAME is a promoted target's name, or a path into its project.
 
 .pp.toml at the project root:
@@ -536,6 +537,11 @@ def _link_plan(t: Target, force: bool) -> list[dict]:
     return plan
 
 
+def _link_line(l: dict) -> str:
+    """One link of a plan, as every verb that shows a plan prints it."""
+    return f"  {l['kind']:<9} {l['path']} -> {l['target']}  [{l['action']}{': ' + l['why'] if l['why'] else ''}]"
+
+
 def _link_blockers(plan: list[dict]) -> list[str]:
     return [f"{l['path']} is {l['why']}" + ("; pass --force-links to replace it" if l["foreign"] else "")
             for l in plan if l["action"] == "conflict"]
@@ -937,7 +943,7 @@ def _print_plan(t: Target, f: Facts, plan: list[dict], cur: str | None, a, alrea
             ["after", t.cfg.get("after") or "-"], ["verify", t.cfg.get("verify") or "-"], ["keep", keep]]
     print(ui.table(rows, indent="  "))
     for l in plan:
-        print(f"  {l['kind']:<9} {l['path']} -> {l['target']}  [{l['action']}{': ' + l['why'] if l['why'] else ''}]")
+        print(_link_line(l))
 
 
 def _status_row(name: str, src: str) -> dict:
@@ -1041,6 +1047,7 @@ def cmd_rollback(argv: list[str]) -> int:
     ap = ui.parser("promote rollback", "flip `current` back to the previous release (or --to one), rerun `after`")
     ap.add_argument("name", nargs="?")
     ap.add_argument("--to", help="a stamp (or unique prefix of one)")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show the flip and the `after` it would rerun")
     ap.add_argument("-y", "--yes", action="store_true")
     a = ap.parse_args(argv)
     t = _resolve(a.name)
@@ -1058,6 +1065,11 @@ def cmd_rollback(argv: list[str]) -> int:
         target = t.previous(cur)
         if not target:
             ui.die(f"{t.name}: no release older than {cur} kept", 1)
+    if a.dry_run:
+        print(ui.table([["target", t.name], ["current", cur], ["roll back to", target],
+                        ["rev", (t.info(target).get("rev") or "?")[:12]],
+                        ["after", t.cfg.get("after") or "-"]], indent="  "))
+        return 0
     if not ui.confirm(f"roll {t.name} back {cur} -> {target}?", a.yes):
         return 2
     with _lock(t), ExitStack() as scope:
@@ -1119,11 +1131,18 @@ def cmd_link(argv: list[str]) -> int:
     ap = ui.parser("promote link", "reassert a target's links and dev_links")
     ap.add_argument("name", nargs="?")
     ap.add_argument("--force-links", action="store_true")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show each link and what stands in its way")
     ap.add_argument("-y", "--yes", action="store_true")
     a = ap.parse_args(argv)
     t = _resolve(a.name)
     plan = _link_plan(t, a.force_links)
     blockers = _link_blockers(plan)
+    if a.dry_run:
+        for l in plan:
+            print(_link_line(l))
+        for b in blockers:
+            print(f"  - {b}")
+        return 2 if blockers else 0
     if blockers:
         for b in blockers:
             print(f"  - {b}", file=sys.stderr)
@@ -1181,6 +1200,7 @@ keep = 5
 def cmd_init(argv: list[str]) -> int:
     ap = ui.parser("promote init", "write a starter [promote] table into PATH/.pp.toml")
     ap.add_argument("path", nargs="?", default=".")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show the table it would add, write nothing")
     a = ap.parse_args(argv)
     root = paths.expand(a.path)
     f = os.path.join(root, config.PROJECT_FILE)
@@ -1195,8 +1215,13 @@ def cmd_init(argv: list[str]) -> int:
     source = "git" if config.git_root(root) else "tree"
     head = (f'# pp project config. `pp promote -n` previews, `pp promote` releases.\n# name = "{name}"\n\n'
             if not have else "" if have.endswith("\n\n") else "\n" if have.endswith("\n") else "\n\n")
+    added = head + STARTER.format(source=source, name=name)
+    if a.dry_run:
+        print(f"would {'add to' if have else 'write'} {f}:")
+        print(added, end="")
+        return 0
     # in one step: what the file had, the gap and the new table land together, or the file stays as it was
-    paths.write_text(f, have + head + STARTER.format(source=source, name=name))
+    paths.write_text(f, have + added)
     print(f"wrote [promote] to {f}; edit it, then `pp promote -n`")
     return 0
 

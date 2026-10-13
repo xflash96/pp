@@ -254,6 +254,33 @@ class TestPromote(Base):
         # the source is still ahead: promoting again moves forward
         self.assertEqual(self.pp(self.repo, "--again")[0], 0)
 
+    def test_the_plan_of_rollback_link_and_init_changes_nothing(self):
+        """Every verb that changes something shows its plan under -n and changes nothing, so an agent looks
+        before it acts: the flip rollback would do, the links link would write, the table init would add."""
+        self.make_repo()
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        self.write("v", "2")
+        self.commit()
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        now, revlog = self.current(), self.revlog()
+        self.assertEqual(self.pp("rollback", "demo", "-n")[0], 0)
+        self.assertEqual((self.current(), self.revlog()), (now, revlog))
+
+        os.remove(self.link)
+        self.assertEqual(self.pp("link", "demo", "-n")[0], 0)
+        self.assertFalse(os.path.lexists(self.link))
+        self.write(self.link, "precious", root="/")               # a file in the way is a blocker under -n too
+        self.assertEqual(self.pp("link", "demo", "-n")[0], 2)
+        with open(self.link) as f:
+            self.assertEqual(f.read(), "precious")
+
+        d = os.path.join(self.tmp, "fresh")
+        os.makedirs(d)
+        self.assertEqual(self.pp("init", d, "-n")[0], 0)
+        self.assertEqual(os.listdir(d), [])
+        self.assertEqual(self.pp("init", d)[0], 0)                 # and then the same table is written
+        self.assertTrue(os.path.exists(os.path.join(d, ".pp.toml")))
+
     def test_preflight_mutates_nothing_and_lists_every_blocker(self):
         self.make_repo()
         os.makedirs(os.path.dirname(self.link))
