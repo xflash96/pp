@@ -2073,8 +2073,7 @@ class TestWorkerClaim(QueueCase):
             rec = real(q)
             looks.append(rec)
             # the worker writes its record exactly between the look that found none and the next one
-            gate.once(lambda: claim.write({**self.me(), "started": time.time(), "backfill": False,
-                                           "waiting": None}))
+            gate.once(lambda: claim.write({**self.me(), "waiting": None}))
             return rec
         with mock.patch.object(jobq, "worker", records_itself), \
                 mock.patch.object(jobq, "_start_worker", lambda q: started.append(q) or mock.Mock(pid=-1)):

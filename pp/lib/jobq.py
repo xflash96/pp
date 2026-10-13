@@ -1192,7 +1192,6 @@ class Worker:
         self.hooks: list[proc.Child] = []            # kept only to reap them
         self.backfill = backfill
         self.pstart = me.start if me else None
-        self.started = time.time()
         self.waiting: dict | None = None    # {id, tag, why, t}: what the head of the queue waits for
         self.said = None                    # (id, reason) last logged, without the detail after ';'
         self.serving = 0        # stops of this queue in flight at the last tick: while any is, the wait is short
@@ -1202,16 +1201,11 @@ class Worker:
 
     def record(self) -> dict:
         """What this worker says about itself while it holds its claim, which is where `status` reads it."""
-        return {"pid": os.getpid(), "pstart": self.pstart, "started": self.started, "backfill": self.backfill,
-                "waiting": self.waiting}
+        return {"pid": os.getpid(), "pstart": self.pstart, "waiting": self.waiting}
 
     def _publish(self):
         if self.claim is not None:
             self.claim.write(self.record())
-
-    def set_backfill(self, on: bool):
-        self.backfill = on
-        self._publish()
 
     def tick(self):
         self.carry_out()        # the one actor that signals this queue's jobs and records how one ended
@@ -1571,8 +1565,8 @@ def _worker_log(q: str, create: bool = False) -> str:
 
 
 def worker(q: str) -> dict | None:
-    """Queue q's live worker as it records itself: {pid, pstart, started, backfill, waiting}. None when the
-    queue has no live worker.
+    """Queue q's live worker as it records itself: {pid, pstart, waiting}. None when the queue has no live
+    worker.
 
     Only a worker ever holds the claim on worker.lock, and it holds it for as long as it runs: that is what
     being up means. A worker that was killed leaves it free at once, and one that is alive holds it however
@@ -1789,7 +1783,7 @@ def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int
                     period = float(poll or cfg.get("poll", 2))
                     idle_exit = float(cfg.get("idle_exit", 600))
                     if from_cfg and bool(cfg.get("backfill", False)) != w.backfill:
-                        w.set_backfill(bool(cfg.get("backfill", False)))
+                        w.backfill = bool(cfg.get("backfill", False))
                         log(f"backfill {'on' if w.backfill else 'off'} (config)")
                 except config.ConfigError as e:
                     bad = str(e)
