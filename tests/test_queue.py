@@ -1488,7 +1488,7 @@ class TestHooks(QueueCase):
         self.assertEqual(text(f).strip(), "timeout")
         self.assertEqual([h["event"] for h in jobstore.find(j)["hooks"]], ["failed"])
         said = " ".join(queue_cmd.__doc__.split())       # the sentences the help owns, not how it wraps them
-        self.assertIn("on a final timeout, on_fail fires.", said)
+        self.assertIn("on a final timeout on_fail fires.", said)
         self.assertIn('is recorded "killed" and fires no hook', said)
 
     def test_a_hook_its_worker_did_not_get_to_fire_is_fired_by_the_next_one(self):
@@ -3146,9 +3146,11 @@ class TestTheDecision(unittest.TestCase):
                                 for due in (True, False):
                                     for sig in (None, 9):
                                         for pat in (None, "nothing in this log"):
-                                            yield {"held": held, "rc": rc, "stop": kind, "grace_up": grace_up,
-                                                   "attempt": attempt, "left": left, "due": due, "sig": sig,
-                                                   "retry_if": pat, **self.facts_of(kind)}
+                                            for late in (True, False):
+                                                yield {"held": held, "rc": rc, "stop": kind, "late": late,
+                                                       "grace_up": grace_up, "attempt": attempt, "left": left,
+                                                       "due": due, "sig": sig, "retry_if": pat,
+                                                       **self.facts_of(kind)}
 
     def case(self, r: dict):
         """The job record and the facts one row stands for."""
@@ -3163,14 +3165,29 @@ class TestTheDecision(unittest.TestCase):
         return job, jobpolicy.Facts(held=r["held"], rc=r["rc"], rc_at=self.rc_at(r), sig=r["sig"], now=self.NOW)
 
     # -- what each row's action is -------------------------------------------------------------------------
-    @staticmethod
-    def rc_at(r: dict):
-        return None if r["rc"] is None else TestTheDecision.RC_AT
+    def went(self, r: dict):
+        """When the first thing went out for this row's stop, or None where nothing has."""
+        st = self.stop(r["stop"], r["grace_up"]) or {}
+        return st.get("sent") or st.get("kill9")
+
+    def rc_at(self, r: dict):
+        """When the attempt wrote its exit code: a second after the first thing went out for its stop, or a
+        second before it, which is what decides whose outcome that code is (I10)."""
+        if r["rc"] is None:
+            return None
+        went = self.went(r)
+        return self.RC_AT if went is None else (went + 1 if r["late"] else went - 1)
+
+    def late(self, r: dict) -> bool:
+        """Whether the code this attempt wrote came after its stop went out, which an attempt that wrote none
+        counts as, since there is no code of its own to stand instead."""
+        return r["rc"] is None or (self.went(r) is not None and r["late"])
 
     @staticmethod
     def sweep(r: dict) -> bool:
-        """Whether anything left in the job's group goes with it: a stop was asked of it, and not refused."""
-        return r["any"] and not r["denied"]
+        """Whether anything left in the job's group goes with it: it wrote no exit code of its own, or a stop
+        was asked of it and not refused."""
+        return r["rc"] is None or (r["any"] and not r["denied"])
 
     @staticmethod
     def own(r: dict) -> str | None:
@@ -3230,24 +3247,24 @@ class TestTheDecision(unittest.TestCase):
              lambda r: r["held"] and not r["any"],
              lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             # its run is over, so its exit code is the command's last word and this is where it ends
-            ('A job a kill\'s signal stopped is recorded "killed" and fires no hook, unless it wrote its own '
-             "exit code as the kill arrived, and then it keeps that code and fires the hook for it.",
-             lambda r: not r["held"] and r["asked"] and r["out"],
-             lambda r: self.ends(r["rc"], None if r["rc"] is not None else "killed", self.rc_at(r),
-                                 self.sweep(r),
-                                 None if r["rc"] is None else ("done" if r["rc"] == 0 else "failed"))),
-            ("A job a kill wrote a stop for that no signal of pp's ever reached ends with its own outcome, "
-             "the exit code it wrote or the signal it died of, and fires the hook that outcome owes.",
+            ('A job a kill\'s signal stopped is recorded "killed" and fires no hook; an exit code the attempt '
+             "wrote after that signal went out is kept as the attempt's code.",
+             lambda r: not r["held"] and r["asked"] and r["out"] and self.late(r),
+             lambda r: self.ends(r["rc"], "killed", self.rc_at(r), self.sweep(r), None)),
+            ("A job that wrote its own exit code before a kill's signal went out, or that a kill wrote a stop "
+             "for that no signal of pp's ever reached, ends with its own outcome, the exit code it wrote or "
+             "the signal it died of, and fires the hook that outcome owes.",
              lambda r: not r["held"] and r["asked"],
              lambda r: self.ends(r["rc"], self.own(r), self.rc_at(r), self.sweep(r),
                                  "done" if r["rc"] == 0 else "failed")),
             ("An exit code of 0 is done, and on_done fires.",
-             lambda r: not r["held"] and r["rc"] == 0,
+             lambda r: not r["held"] and r["rc"] == 0 and not self.late(r),
              lambda r: self.ends(0, None, self.rc_at(r), self.sweep(r), "done")),
-            ("A timeout's stop pp signalled or was refused, with no exit code of the attempt's own, is a "
-             "timeout, which may be retried; on a final timeout, on_fail fires.",
-             lambda r: not r["held"] and r["rc"] is None and (r["out"] or r["denied"]),
-             lambda r: self.failure(r, None, "timeout", None, self.sweep(r))),
+            ("A timeout's stop pp signalled or was refused is a timeout, which may be retried; an exit code "
+             "the attempt wrote after that stop went out is kept as the attempt's code, and on a final "
+             "timeout on_fail fires.",
+             lambda r: not r["held"] and self.late(r) and (r["out"] or r["denied"]),
+             lambda r: self.failure(r, r["rc"], "timeout", self.rc_at(r), self.sweep(r))),
             ("Anything else is the job's own failure, the exit code it wrote or the signal it died of, "
              "retried while an attempt is left and --retry-if matches it, and on_fail fires on the last.",
              lambda r: not r["held"],
@@ -3266,7 +3283,7 @@ class TestTheDecision(unittest.TestCase):
             seen.add(what)
             job, facts = self.case(r)
             self.assertEqual(jobpolicy.decide(job, facts), then(r), f"{what}: {r}")
-        self.assertEqual(n, 4224)                                   # 2*3*11*2*2*2*2*2*2 rows
+        self.assertEqual(n, 8448)                               # 2*3*11*2*2*2*2*2*2*2 rows
         self.assertEqual(seen, {what for what, _w, _t in rules})    # and every rule is a row of its own
         # both sides of the delay's cap are a row here, so neither arm can go quiet under a later constant
         self.assertGreater(self.DELAY * 2 ** (max(self.ATTEMPTS) - 1), jobpolicy.RETRY_DELAY_CAP)
@@ -3317,24 +3334,44 @@ class TestTheDecision(unittest.TestCase):
         worker_wrote_it = {**job, "stop": {**job["stop"], "timeout": True}}
         self.assertEqual(jobpolicy.decide(worker_wrote_it, over).do, jobpolicy.AGAIN)      # a timeout may be retried
 
-    def test_a_code_the_attempt_wrote_at_its_timeout_is_its_own_outcome(self):
-        """The rule the help, CONTRIBUTING and `decide` all state: an attempt that wrote its own exit code as
-        the timeout's signal arrived keeps that code and ends as it would have without the timeout. So a 0 is
-        done and fires on_done, 7 is that failure, and `--retry-if '^timeout$'` matches an attempt that wrote
-        no code of its own."""
-        job = {"id": 1, "queue": "default", "state": "running", "attempt": 1, "retries": 3,
-               "retry_delay": self.DELAY, "retry_if": "^timeout$", "on_fail": "echo failed",
-               "on_done": "echo done",
-               "stop": {"by": "timeout", "timeout": True, "t": self.NOW - 60, "grace": self.GRACE,
-                        "sent": self.NOW - 50}}
-        wrote_0 = jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=0, rc_at=self.RC_AT, now=self.NOW))
-        self.assertEqual((wrote_0.do, wrote_0.state, wrote_0.reason, wrote_0.hook),
-                         (jobpolicy.ENDED_AS, "done", None, "done"))
-        wrote_7 = jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=7, rc_at=self.RC_AT, now=self.NOW))
-        self.assertEqual((wrote_7.do, wrote_7.rc, wrote_7.reason), (jobpolicy.ENDED_AS, 7, None))
-        self.assertIn("exit 7", wrote_7.not_retried)        # and /^timeout$/ is not what that failure is
-        wrote_none = jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=None, now=self.NOW))
-        self.assertEqual((wrote_none.do, wrote_none.reason), (jobpolicy.AGAIN, "timeout"))
+    def test_a_code_written_after_the_stop_went_out_is_that_stops_outcome(self):
+        """A stop decides the reason (I10): an exit code the attempt wrote after its stop went out is that
+        stop's outcome, killed or timeout, with the code kept as the attempt's own. A container runner writes
+        the code of a container the stop command ended, so without this rule a kill or a timeout of a
+        container job would read as the job's own failure.
+
+        A code the attempt wrote before anything went out for that stop is its own outcome, as it was: it
+        ended on its own as the stop arrived, and it fires the hook that outcome owes."""
+        sent = self.NOW - 50
+        timed = {"id": 1, "queue": "default", "state": "running", "attempt": 1, "retries": 3,
+                 "retry_delay": self.DELAY, "retry_if": "^timeout$", "on_fail": "echo failed",
+                 "on_done": "echo done",
+                 "stop": {"by": "timeout", "timeout": True, "t": self.NOW - 60, "grace": self.GRACE,
+                          "sent": sent}}
+        killed = {**timed, "stop": {"by": "ann", "t": self.NOW - 60, "grace": self.GRACE, "sent": sent}}
+
+        def decide(job, rc, rc_at):
+            return jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=rc, rc_at=rc_at, now=self.NOW))
+        # after the stop went out: the stop's outcome, and the code is kept
+        late = decide(timed, 137, sent + 1)
+        self.assertEqual((late.do, late.state, late.rc, late.reason), (jobpolicy.AGAIN, None, 137, "timeout"))
+        zero = decide(timed, 0, sent + 1)       # a runtime that exits 0 for a container it was told to end
+        self.assertEqual((zero.do, zero.rc, zero.reason), (jobpolicy.AGAIN, 0, "timeout"))
+        kill = decide(killed, 137, sent + 1)
+        self.assertEqual((kill.do, kill.state, kill.rc, kill.reason, kill.hook),
+                         (jobpolicy.ENDED_AS, "failed", 137, "killed", None))
+        # before it: the attempt's own outcome, and the hook that outcome owes
+        own = decide(timed, 0, sent - 1)
+        self.assertEqual((own.do, own.state, own.reason, own.hook), (jobpolicy.ENDED_AS, "done", None, "done"))
+        seven = decide(timed, 7, sent - 1)
+        self.assertEqual((seven.do, seven.rc, seven.reason), (jobpolicy.ENDED_AS, 7, None))
+        self.assertIn("exit 7", seven.not_retried)      # and /^timeout$/ is not what that failure is
+        mine = decide(killed, 7, sent - 1)
+        self.assertEqual((mine.do, mine.rc, mine.reason, mine.hook),
+                         (jobpolicy.ENDED_AS, 7, None, "failed"))
+        # and an attempt that wrote no code of its own is the stop's outcome, with no code to keep
+        none = decide(timed, None, None)
+        self.assertEqual((none.do, none.rc, none.reason), (jobpolicy.AGAIN, None, "timeout"))
 
     def test_a_second_stop_merges_into_the_one_on_the_record(self):
         """One stop per run of a job: what went out is all the decision and the waiting verb have to go on, so

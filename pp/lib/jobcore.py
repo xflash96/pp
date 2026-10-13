@@ -160,6 +160,7 @@ class Worker:
         self.queue = queue
         self.children: dict[int, proc.Child] = {}    # jobs this worker launched; others are adopted
         self.hooks: list[proc.Child] = []            # kept only to reap them
+        self.stops: dict[int, proc.Child] = {}       # a stop command per job: reaped onto that stop's rc
         self.backfill = backfill
         self.pstart = me.start if me else None
         self.waiting: dict | None = None    # {id, tag, why, t}: what the head of the queue waits for
@@ -186,6 +187,7 @@ class Worker:
         self.carry_out()        # the one actor that signals this queue's jobs and records how one ended
         watchers()              # and the leases of the waits a signal ended, swept where the queue is read
         self.hooks = [h for h in self.hooks if h.poll() is None]
+        self._reap_stops()      # and the exit code each stop command of its own had
         if not self.stopping():
             self.launch()   # last: a broken config raises here, after ended jobs are recorded
 
@@ -231,13 +233,11 @@ class Worker:
             # them, before its parent can read how it ended.
             if held is not None:
                 self._adopt(j, held)
-            return policy.Facts(held=True, now=now)
+            return policy.facts(True, now=now)
         self.children.pop(j["id"], None)
-        code = p.poll() if p is not None else None
         rc, ended = ended_on_its_own(j) or (None, None)
-        tail = self.tail(j, 200) if rc != 0 and j.get("retry_if") else ""
-        return policy.Facts(held=False, rc=rc, rc_at=ended, sig=-code if code is not None and code < 0 else None,
-                     now=now, tail=tail)
+        return policy.facts(False, p.poll() if p is not None else None, rc, ended, now=now,
+                            tail=self.tail(j, 200) if policy.wants_tail(j, rc) else "")
 
     def _step(self, j: dict, facts: policy.Facts) -> policy.Action:
         """The one decision about one job, and the action it names, carried out: what is store state in one
@@ -264,6 +264,10 @@ class Worker:
                 jobstore._requeue(s, cur, a)
             elif a.do == policy.ENDED_AS:
                 jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
+        if a.sweep and (cmd := policy.stop_command(cur)):
+            # after the scope, since starting a process in one would make every reader of the store wait for
+            # it: nobody asked for this stop, so nothing is recorded for it and no outcome rests on it
+            self.hooks += [h for h in [self._stop(cur, cmd)] if h is not None]
         if a.do in (policy.TERM, policy.KILL9):
             self._send(cur, a)
             return a
@@ -286,7 +290,12 @@ class Worker:
         did, which is all the decision about this job has to go on."""
         stop = job.get("stop") or {}
         sig, mark = (signal.SIGTERM, "sent") if a.do == policy.TERM else (signal.SIGKILL, "kill9")
-        outcome = self._signal_group(job, sig)
+        # the project's command in place of the SIGTERM, where the job carries one. pp's own grace and SIGKILL
+        # follow it either way, so a stop command that could not start leaves the job no worse off than 0.1.1
+        cmd = policy.stop_command(job) if a.do == policy.TERM else None
+        outcome = "alive" if cmd else self._signal_group(job, sig)
+        if cmd and (h := self._stop(job, cmd)) is not None:
+            self.stops[job["id"]] = h   # the worker reaps it, and its exit code lands on this stop
         if outcome is None or outcome == "gone":
             return          # nothing to signal: its run is starting, or it is over and the next pass says how
         now = time.time()
@@ -296,8 +305,35 @@ class Worker:
                 return
             cur["stop"]["denied" if outcome == "denied" else mark] = now
             s.save(cur)
-        self.say("stop", job, {"outcome": outcome, "sig": sig, "grace": stop.get("grace"),
+        self.say("stop", job, {"outcome": outcome, "sig": sig, "cmd": cmd, "grace": stop.get("grace"),
                                "group": cur.get("pgid")})
+
+    def _stop(self, job: dict, cmd: str) -> proc.Child | None:
+        """The project's stop command, started detached in the job's directory with the job's own environment,
+        its output appended to the job's log: the one thing that reaches work the runner started elsewhere.
+        -> the child, so its caller says what becomes of its exit code, or None where it could not start.
+
+        It goes out in place of the SIGTERM to the job's group, and pp's own grace and SIGKILL follow it
+        unchanged. It runs through the construct a hook uses, so it cannot hold up the one worker that serves
+        the whole queue."""
+        try:
+            with open(job["log"], "a") as f:
+                return proc.spawn(["/bin/sh", "-c", cmd], group="own", stdin="none", env="scrubbed",
+                                  add_env=policy.job_env(job), cwd=job["cwd"], stdout=f, stderr=proc.STDOUT)
+        except OSError as e:
+            self.say("stop-failed", job, {"cmd": cmd, "error": str(e)})
+            return None
+
+    def _reap_stops(self):
+        """The exit code each stop command of this worker's had, onto the stop it carried out, once it has
+        ended. A stop pp has not seen end keeps `rc` null, so null never reads as "it worked"."""
+        for jid in [jid for jid, h in self.stops.items() if h.poll() is not None]:
+            h = self.stops.pop(jid)
+            with jobstore.txn() as s:
+                cur = s.job(jid)
+                if cur and cur.get("stop"):
+                    cur["stop"]["rc"] = h.poll()
+                    s.save(cur)
 
     def _adopt(self, j: dict, held: dict):
         """Complete the record of a running job from its claim. The wrapper writes its own pid in there, so a
@@ -450,8 +486,6 @@ class Worker:
         for the others: they would be left with no process, and read as lost."""
         jid = j["id"]
         argv = list(j.get("runner") or []) + list(j["cmd"])
-        env = policy.job_env(j)
-        at = 0
         try:
             # the environment file the runner is handed, readable by this user alone, before anything starts
             paths.write_text(j["envfile"], policy.env_file(j), mode=0o600)
@@ -461,7 +495,8 @@ class Worker:
                 f.flush()
                 at = f.tell()   # where this attempt's own output begins, which is what --retry-if reads from
                 p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
-                               env="scrubbed", add_env=env, cwd=j["cwd"], stdout=f, stderr=proc.STDOUT)
+                               env="scrubbed", add_env=policy.job_env(j), cwd=j["cwd"], stdout=f,
+                               stderr=proc.STDOUT)
         except Exception as e:
             with jobstore.txn() as s:
                 cur = s.job(jid, must_be=("running",))
@@ -491,16 +526,14 @@ class Worker:
     def _note(self, j: dict | None, why: str = ""):
         """Record what the head of the queue waits for, in this worker's own claim where `status` reads it,
         whenever it changes; log it only when its reason changes, not its detail after ';'."""
-        now = None if j is None else {"id": j["id"], "tag": j.get("tag"), "why": why, "t": time.time()}
-        if (self.waiting or {}).get("id") == (now or {}).get("id") \
-                and (self.waiting or {}).get("why") == (now or {}).get("why"):
+        note = policy.noting(self.waiting, self.said, j, why, time.time())
+        if not note.change:
             return              # the same job, waiting for the same thing
-        self.waiting = now
+        self.waiting = note.rec
         self._publish()
-        key = None if j is None else (j["id"], why.split(";")[0])
-        if key is not None and key != self.said:
+        if note.say:
             self.say("waiting", j, {"why": why})
-        self.said = key
+        self.said = note.key
 
 
 def _worker_claim(q: str) -> str:

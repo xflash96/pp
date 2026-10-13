@@ -208,20 +208,34 @@ job is what happens to it.
     Once the run is over the exit code the attempt wrote is the command's last word, and the job ends here. A
     stop someone asked for is never retried.
 
-    A job a kill's signal stopped is recorded "killed" and fires no hook, unless it wrote its own exit code
-    as the kill arrived, and then it keeps that code and fires the hook for it.
-    A job a kill wrote a stop for that no signal of pp's ever reached ends with its own outcome, the exit
-    code it wrote or the signal it died of, and fires the hook that outcome owes.
+    A job a kill's signal stopped is recorded "killed" and fires no hook; an exit code the attempt wrote
+    after that signal went out is kept as the attempt's code.
+    A job that wrote its own exit code before a kill's signal went out, or that a kill wrote a stop for that
+    no signal of pp's ever reached, ends with its own outcome, the exit code it wrote or the signal it died
+    of, and fires the hook that outcome owes.
     An exit code of 0 is done, and on_done fires.
-    A timeout's stop pp signalled or was refused, with no exit code of the attempt's own, is a timeout, which
-    may be retried; on a final timeout, on_fail fires.
+    A timeout's stop pp signalled or was refused is a timeout, which may be retried; an exit code the attempt
+    wrote after that stop went out is kept as the attempt's code, and on a final timeout on_fail fires.
     Anything else is the job's own failure, the exit code it wrote or the signal it died of, retried while an
     attempt is left and --retry-if matches it, and on_fail fires on the last.
 
+A stop decides the reason: the exit code an attempt wrote after its stop went out is that stop's outcome,
+killed or timeout, and the code is kept as the attempt's own. A container runner writes the code of a
+container the stop command ended, so without that rule a kill or a timeout of a container job would read as
+the job's own failure.
+
 One run of a job carries one stop. A kill's ask on a timeout's stop makes it a kill, a second ask keeps what
 has gone out and only shortens the grace, and a refused stop is asked for again. `show` and --json say whose
-stop it is, when it was asked for, what has gone out for it and whether pp was refused, so nobody waits for a
-stop that is not going to be carried out.
+stop it is, when it was asked for, what has gone out for it, its command's exit code where it had one, and
+whether pp was refused, so nobody waits for a stop that is not going to be carried out.
+
+Where a job's work is reached by the project's stop command, that command goes out in place of the SIGTERM to
+the job's process group, detached, in the job's directory, with the job's own environment: its output goes to
+the job's log and its exit code onto the stop's `rc`. The grace and the SIGKILL that follow are unchanged, so
+a container that ignores its own shutdown is still ended on time, and `stop.rc: null` means pp has not seen
+that command end rather than that it worked. Anything left in the job's process group when its run is over
+goes with it, and a run that ended with no exit code of its own runs that stop command once more, so nothing
+the runner started outlives the attempt that started it.
 
 A job's record names the files that are its own: its log, the exit code each attempt wrote, and the log of
 each hook that ran for it. `drop` and `clean` take those with the record, so neither leaves a file behind that

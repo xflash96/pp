@@ -871,10 +871,10 @@ class Lab(QueueJourney):
         return job[name]
 
     def stop_of(self, job: dict) -> str | None:
-        """The stop command the job carries, wherever the record keeps it: a field of its own, or `cmd` on the
-        stop the job was asked for."""
-        stop = self.field(job, "stop")
-        return stop.get("cmd") if isinstance(stop, dict) else stop
+        """The stop command the job carries, from the field of its own the record keeps it in, beside the
+        runner it was resolved with. `stop` is the stop the job was asked for, and carries that command's own
+        exit code where it ran."""
+        return self.field(job, "stop_cmd")
 
     def ended(self, jid) -> bool:
         return self.state(jid) in ("done", "failed")

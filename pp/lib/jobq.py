@@ -132,10 +132,13 @@ def _voice(q: str, log=None):
             say(f"{'done' if job['state'] == 'done' else 'FAILED'} {jid} {tag} "
                 f"rc={job.get('rc')}{why} {ui.human_duration(job.get('seconds'))}")
         elif kind == "stop":
-            word = ("SIGTERM to its group" if f["sig"] == signal.SIGTERM else
+            word = (f"the project's stop command: {_text(f['cmd'])}" if f.get("cmd") else
+                    "SIGTERM to its group" if f["sig"] == signal.SIGTERM else
                     f"SIGKILL after {ui.human_duration(float(f['grace'] or 0))}")
             say(f"stop {jid} {tag} ({(job.get('stop') or {}).get('by')}): "
                 + (f"not allowed to signal its group {f['group']}" if f["outcome"] == "denied" else word))
+        elif kind == "stop-failed":
+            say(f"the stop command of {jid} {tag} could not start: {f['error']}")
         elif kind == "group-gone":
             say(f"nothing to signal in job {jid}'s group {f['group']}: it is gone")
         elif kind == "adopted":
@@ -1197,6 +1200,7 @@ def cmd_show(a) -> int:
             ["command", _text(shlex.join(list(j.get("runner") or []) + list(j.get("cmd") or [])))],
             ["needs", _needs_str(j.get("needs")) or "slots 1"], ["prio", j.get("prio")],
             ["stop", _text(j.get("stop_cmd")) or "-"],
+            ["container", _text(j.get("container")) or "-"],
             ["attempt", f"{j.get('attempt', 1)}/{int(j.get('retries') or 0) + 1}"
              + (f"  retry delay {ui.human_duration(j.get('retry_delay'))}" if j.get("retries") else "")
              + (f"  retry if /{j['retry_if']}/" if j.get("retry_if") else "")],
@@ -1219,6 +1223,7 @@ def cmd_show(a) -> int:
                               if st.get("was") else f"{_text(st.get('by'))} asked at {when}")
                      + (", SIGTERM sent" if st.get("sent") else ", nothing signalled")
                      + (", SIGKILL sent" if st.get("kill9") else "")
+                     + (f", its command exited {st['rc']}" if st.get("rc") is not None else "")
                      # a denied stop is not in flight: say so, or it reads as one still being carried out
                      + (f"; pp is not allowed to signal its group {j.get('pgid')}, so nothing more goes out"
                         if st.get("denied") else "")])
@@ -1408,9 +1413,12 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
     else:
         # the grace on the record, which is the shorter of every ask (`jobpolicy.merge_stop`) and the one the SIGKILL
         # went out after, not the one this kill asked for
+        went = ("the project's stop command" if policy.stop_command(cur) else "SIGTERM")
         how = (f"SIGKILL after {float(stop.get('grace') or 0):g}s" if stop.get("kill9")
-               else "stopped on SIGTERM")
-        print(f"killed {jid} ({how})  {_name(cur)}")
+               else f"stopped on {went}")
+        # a stop command that failed is said with its code: pp will not report a stop it did not achieve
+        said = "" if not stop.get("rc") else f"; the project's stop command failed (exit {stop['rc']})"
+        print(f"killed {jid} ({how}){said}  {_name(cur)}")
     return 0
 
 

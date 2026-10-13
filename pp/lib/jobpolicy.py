@@ -121,6 +121,26 @@ def attempt_of(job: dict, rc: int | None, reason: str | None, ended: float) -> d
             **{k: job.get(k) for k in KEPT}}
 
 
+def facts(held: bool, code: int | None = None, rc: int | None = None, rc_at: float | None = None,
+          now: float = 0.0, tail: str = "") -> Facts:
+    """The facts about one running job, from the readings the core took: whether a run of it is live, the exit
+    code it wrote and when, the status of a child this worker holds, the time those were read at, and the log
+    tail --retry-if matches against.
+
+    While the run is live none of the rest counts for anything, since the command itself can write the exit
+    code file, so those facts are dropped here rather than read by the decision. A child's status below zero
+    is the signal it died of."""
+    if held:
+        return Facts(held=True, now=now)
+    return Facts(held=False, rc=rc, rc_at=rc_at, sig=-code if code is not None and code < 0 else None,
+                 now=now, tail=tail)
+
+
+def wants_tail(job: dict, rc: int | None) -> bool:
+    """Whether this attempt has a log tail for --retry-if to match: a failure, and a pattern to match it."""
+    return rc != 0 and bool(job.get("retry_if"))
+
+
 def matches(job: dict, why: str, tail: str) -> bool:
     """Whether --retry-if matches this failure: its reason, or the tail of the job's log."""
     pat = job.get("retry_if")
@@ -171,25 +191,37 @@ def decide(job: dict, facts: Facts) -> Action:
         if not stop.get("kill9") and facts.now - float(stop["sent"]) >= float(stop.get("grace") or 0):
             return Action(KILL9)
         return Action(NOTHING)      # signalled, and inside the grace it was given
-    # its run is over: how it ended is recorded here, and nothing of it is signalled again. A stop that was
-    # asked of it takes its group with it, so a command that held the signal back does not outlive the job.
-    sweep = bool(stop) and not stop.get("denied")
+    # its run is over: how it ended is recorded here, and nothing of it is signalled again. Anything left in
+    # its group goes with it, so a command that held the signal back does not outlive the job.
+    sweep = facts.rc is None or (bool(stop) and not stop.get("denied"))
     own = None if facts.rc is not None else (f"signal {facts.sig}" if facts.sig else "lost")
-    if asked and out:
-        # a kill's signal stopped it: "killed", and no hook, unless it wrote its own code as the kill arrived
-        return _ends(job, facts.rc, None if facts.rc is not None else "killed", facts.rc_at, sweep,
-                     None if facts.rc is None else ("done" if facts.rc == 0 else "failed"))
+    late = facts.rc is None or after(stop, facts.rc_at)
+    if asked and out and late:
+        # a kill's signal stopped it: "killed", and no hook. A code the attempt wrote after that signal went
+        # out is that stop's outcome, and the code is kept
+        return _ends(job, facts.rc, "killed", facts.rc_at, sweep, None)
     if asked:
-        # a kill wrote the stop and no signal of pp's ever went out, so the job ended as it ended: that
-        # outcome, and the hook it owes. A job a kill has touched is never retried, whatever it had left
+        # it wrote its own code before the stop went out, or no signal of pp's ever went out for that stop:
+        # the job ended as it ended, and the hook that outcome owes fires. A job a kill touched is never retried
         return _ends(job, facts.rc, own, facts.rc_at, sweep, "done" if facts.rc == 0 else "failed")
-    if facts.rc == 0:
+    if facts.rc == 0 and not late:
         return _ends(job, 0, None, facts.rc_at, sweep, "done")
-    if facts.rc is None and (out or stop.get("denied")):
+    if late and (out or stop.get("denied")):
         # a timeout's stop: pp's signal ended it, or pp was refused it and the attempt is over at its timeout
-        return _or_again(job, facts, None, "timeout", None, sweep)
+        return _or_again(job, facts, facts.rc, "timeout", facts.rc_at, sweep)
     # it ended on its own: the code it wrote, the signal it died of, or nothing at all
     return _or_again(job, facts, facts.rc, own, facts.rc_at, sweep)
+
+
+def after(stop: dict, rc_at: float | None) -> bool:
+    """Whether the attempt wrote its exit code after the first thing went out for this stop.
+
+    A stop decides the reason: a container runner writes the code of a container the stop command ended (137),
+    so without this a kill or a timeout of a container job would read as the job's own failure. The code is
+    kept either way, and what it decides is the reason (I10). A stop nothing has gone out for has no time to
+    compare against, so no code is ever late for one."""
+    went = stop.get("sent") or stop.get("kill9")
+    return went is not None and rc_at is not None and rc_at >= went
 
 
 def hook_due(job: dict, event: str | None) -> str | None:
@@ -222,6 +254,31 @@ def _or_again(job: dict, facts: Facts, rc: int | None, reason: str | None, ended
     # attempts were left, but retry_if says this failure is not worth one
     nr = f"neither the reason ({why}) nor the log tail matches /{job.get('retry_if')}/" if left else None
     return _ends(job, rc, reason, ended, sweep, "failed", nr)
+
+
+@dataclass(frozen=True)
+class Note:
+    """What the worker says about the head of its queue: the record `status` reads it from, the key a repeated
+    line is kept from repeating by, whether this is a change of what the queue waits for, and whether it is
+    worth a line of the worker's log."""
+
+    rec: dict | None = None
+    key: tuple | None = None
+    change: bool = False
+    say: bool = False
+
+
+def noting(waiting: dict | None, said, job: dict | None, why: str, now: float) -> Note:
+    """What the head of the queue waits for, as the worker records it: published whenever the job or its
+    reason changes, and logged only where the reason itself changes.
+
+    The detail after ';' is what fluctuates (a reading, an amount free), so it is part of the record and not
+    of the key a line is kept from repeating by: a queue whose head waits for the same pool says so once."""
+    rec = None if job is None else {"id": job["id"], "tag": job.get("tag"), "why": why, "t": now}
+    key = None if job is None else (job["id"], why.split(";")[0])
+    change = ((waiting or {}).get("id"), (waiting or {}).get("why")) != ((rec or {}).get("id"),
+                                                                        (rec or {}).get("why"))
+    return Note(rec, key, change, change and key is not None and key != said)
 
 
 def in_flight(job: dict, action: Action) -> bool:
