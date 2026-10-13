@@ -813,6 +813,22 @@ class TestWorker(QueueCase):
         self.assertEqual(self.call("drop", f"{a}-{b}", "-y")[0], 0)
         self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
 
+    def test_a_job_already_in_the_state_a_verb_moves_it_to_is_left_as_it_is(self):
+        """A held job counts as already held under `hold`, and a queued job as already queued under
+        `release`: the state suits the verb, so the job is left as it is and the exit is 0. A driver that
+        holds a parked stage again, or releases a stage it released before, is not an error the second time.
+        The states these two do refuse, running and ended, are exit 2 as before."""
+        j = self.add(cmd="true")
+        self.assertEqual((self.call("release", "--no-start", str(j))[0], self.state(j)), (0, "queued"))
+        self.assertEqual((self.call("hold", str(j))[0], self.state(j)), (0, "held"))
+        rc, _out, err = self.call("hold", str(j))
+        self.assertEqual((rc, self.state(j)), (0, "held"), err)
+        self.assertEqual((self.call("release", "--no-start", str(j))[0], self.state(j)), (0, "queued"))
+        done = self.add(cmd="true")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(done) == "done")
+        self.assertEqual(self.call("hold", str(done))[0], 2)
+        self.assertEqual(self.call("release", "--no-start", str(done))[0], 2)
+
     def test_a_retry_is_owned_by_the_session_that_asked_for_it(self):
         """The new job is this session's, not the session's that queued the job it repeats, so `wait --mine`
         in the session that asked for the retry hears how it ends."""

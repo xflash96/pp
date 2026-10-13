@@ -1572,6 +1572,11 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
     for j in jobs:
         if j["id"] in was:
             cur = was[j["id"]]
+            if cur["state"] == dst:
+                # already where the verb puts it: the state suits the verb, so the job is left as it is and
+                # this is no refusal. A driver that holds a stage twice is not an error the second time
+                print(f"{j['id']} is already {dst}  {_name(cur)}")
+                continue
             if j["_bulk"]:
                 if verb != "drop":          # drop's plan listed them already
                     skipped.append(cur)
