@@ -716,7 +716,7 @@ HELP_SECTIONS = ("A first project whose work runs in a container, in four steps"
                  "Containers, and anything else a runner starts elsewhere",
                  "Settings: one default, one key, one flag, one order", "Where a job's output goes",
                  "Timeouts and retries", "Hooks, on the FINAL outcome of a job", "Workers, and after a reboot",
-                 "Agents", "What pp queue leaves to you, on purpose")
+                 "Agents", "What is left to you, on purpose")
 
 
 # A runner of the shape a container runner has, and the fault a stop command closes: the work it starts is in a
@@ -933,7 +933,6 @@ class Lab(QueueJourney):
 class TestTheFirstLook(Lab):
     """Steps 0 to 2: read one page, install and look, and describe the machine once."""
 
-    @unittest.expectedFailure
     def test_the_help_is_one_page_and_names_every_section(self):
         """`pp help queue` is the page this journey follows. Its three spellings each exit 0. The page holds
         every section heading the contract names, each a line of its own. Every line fits in 118 columns."""

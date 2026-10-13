@@ -1986,8 +1986,7 @@ def _parser(prog: str, doc: str, add_args=None):
     _selectors(p)
     p.add_argument("-f", "--follow", action="store_true")
     p.add_argument("-n", "--lines", type=int, default=40)
-    p = sp("kill", help="stop running jobs: the whole process group is signalled; a job the signal stopped "
-                        "fires no hook")
+    p = sp("kill", help="stop running jobs")
     p.add_argument("ids", nargs="*", metavar="ID")
     _selectors(p)
     _flag_override(p, BY_SCOPE["job"]["grace"],
@@ -2020,8 +2019,8 @@ def _parser(prog: str, doc: str, add_args=None):
                    help="only those ended before AGE ago (30m, 12h, 7d; a bare number is days)")
     p.add_argument("-n", "--dry-run", action="store_true")
     p.add_argument("-y", "--yes", action="store_true")
-    for name, hlp in (("wait", "block until jobs end, then print the outcomes (exit 0 ok, 1 failed or dropped, 3 timeout)"),
-                      ("watch", "a line per event (start, retry, outcome) as it happens; exits like wait")):
+    for name, hlp in (("wait", "block until jobs end, then print each outcome"),
+                      ("watch", "a line per event as it happens; exits like wait")):
         p = sp(name, help=hlp)
         p.add_argument("ids", nargs="*", metavar="ID")
         _selectors(p)
@@ -2030,9 +2029,8 @@ def _parser(prog: str, doc: str, add_args=None):
         g.add_argument("--mine", action="store_true", help="every job this agent session queued that is live, or ended without a wait/watch of this session reporting it")
         p.add_argument("--timeout", metavar="DUR", type=_dur_flag(),
                        help="give up after DUR (90s, 30m, 2h, 1d; a bare number is seconds) and exit 3")
-        p.add_argument("--poll", metavar="DUR", type=_dur_flag(), default=2.0,
-                       help="between looks (default 2s)")
-        p.add_argument("--tail", type=int, default=15, help="log lines shown with a failure (default 15)")
+        p.add_argument("--poll", metavar="DUR", type=_dur_flag(), default=2.0, help="between looks")
+        p.add_argument("--tail", type=int, default=15, help="log lines shown with a failure")
         p.add_argument("--no-start", action="store_true", help="do not start a worker for queued jobs")
     p = sp("work", help="run a queue's worker in the foreground")
     p = sp("worker", help="start | stop | status of the background workers")
