@@ -3080,27 +3080,19 @@ def run_cli(argv: list[str], prog: str, default_queue: str, doc: str, prepare_jo
     scope = a.scope = [q] if q else None
     if q is not None:
         open_queue(q)       # a queue named with -q is opened once here, whatever the verb does with it
-    if a.verb == "add":
-        if cmd and a.cmd:
-            ui.die(f"{prog} add: put the whole command after --", 2)
-        return cmd_add(a, cmd or a.cmd, q or default_queue, prepare_job)
-    if a.verb in ("status", "ls"):
-        return cmd_status(a, scope)
-    verbs = {"show": cmd_show, "note": cmd_note, "log": cmd_log, "kill": cmd_kill, "reprio": _reprio, "retry": cmd_retry}
-    if a.verb in verbs:
-        return verbs[a.verb](a)
-    if a.verb == "drop":
-        return _transition(a, ("queued", "held"), None, "drop", "dropped")
-    if a.verb == "hold":
-        return _transition(a, ("queued",), "held", "hold", "held")
-    if a.verb == "release":
-        return _transition(a, ("held",), "queued", "release", "released")
-    if a.verb == "clean":
-        return cmd_clean(a, scope)
-    if a.verb in ("wait", "watch"):
-        return cmd_wait(a, scope, stream=a.verb == "watch")
-    if a.verb == "work":
-        return work(q or default_queue, a.backfill, a.poll)
-    if a.verb == "worker":
-        return cmd_worker(a, q, default_queue, scope)
-    return 2
+    if a.verb == "add" and cmd and a.cmd:
+        ui.die(f"{prog} add: put the whole command after --", 2)
+    # one row per verb: what it is called with is in the row, and nothing else is keyed on a verb's name. The
+    # call is held back until the verb is chosen, so a verb's own options are read on that verb's path only
+    verbs = {"add": lambda: cmd_add(a, cmd or a.cmd, q or default_queue, prepare_job),
+             "status": lambda: cmd_status(a, scope), "ls": lambda: cmd_status(a, scope),
+             "show": lambda: cmd_show(a), "note": lambda: cmd_note(a), "log": lambda: cmd_log(a),
+             "kill": lambda: cmd_kill(a), "reprio": lambda: _reprio(a), "retry": lambda: cmd_retry(a),
+             "drop": lambda: _transition(a, ("queued", "held"), None, "drop", "dropped"),
+             "hold": lambda: _transition(a, ("queued",), "held", "hold", "held"),
+             "release": lambda: _transition(a, ("held",), "queued", "release", "released"),
+             "clean": lambda: cmd_clean(a, scope),
+             "wait": lambda: cmd_wait(a, scope), "watch": lambda: cmd_wait(a, scope, stream=True),
+             "work": lambda: work(q or default_queue, a.backfill, a.poll),
+             "worker": lambda: cmd_worker(a, q, default_queue, scope)}
+    return verbs[a.verb]() if a.verb in verbs else 2
