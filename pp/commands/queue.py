@@ -292,11 +292,13 @@ Agents
     are told how the job ended, with a failure's log tail, without polling. `wait --mine` is every job this session
     queued that is live, or that ended without a wait or watch of this session reporting it; `wait --idle` waits until
     nothing is queued or running, which a held job does not hold. `wait --timeout DUR` and `watch --timeout DUR` take
-    the duration spellings --timeout on add takes (90s, 30m, 2h, 1d, and a bare number is seconds) but no `none`,
-    and have no default: without one, a wait waits. A wait over a stage with a job still held is the one that needs
-    it, since that wait never returns on its own, and exit 3 is a real outcome there. Exit statuses: 0 it worked; 1
-    a job failed or was dropped, or a config file is wrong; 2 a usage error or a refusal; 3 wait or watch gave up at
-    its --timeout; 130 interrupted. So `wait --prefix s1_ && ./next.sh` is a whole driver.
+    the duration spellings --timeout on add takes (90s, 30m, 2h, 1d, and a bare number is seconds) but no `none`, and
+    have no default: without one, a wait waits. A wait over a stage with a job still held is the one that needs it,
+    since that wait never returns on its own, and exit 3 is a real outcome there. Exit statuses: 0 it worked; 1 a job
+    failed or was dropped, or a config file is wrong; 2 a usage error or a refusal; 3 wait or watch gave up at its
+    --timeout; 130 interrupted. So `wait --prefix s1_ && ./next.sh` is a whole driver where a failure is meant to stop
+    it; a campaign that expects failures writes `;` and reads each outcome, since exit 1 is a failed or dropped job
+    and a wrong config alike.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not
     from the text, and ignore a field you do not know. One object per job, out of that job's record. The fields to
     count on: id, state (queued, held, running, done, failed), queue, tag, project, cwd, cmd and runner (each an
