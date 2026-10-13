@@ -4581,6 +4581,10 @@ class InjectedCase(QueueCase):
         """How many times a hook that appends one line has run."""
         return text(path).count("x") if os.path.exists(path) else 0
 
+    def lines(self, path: str) -> list[str]:
+        """What each run of a command that appends one line wrote."""
+        return text(path).split() if os.path.exists(path) else []
+
     def gate(self, name: str = "go") -> str:
         """The path a gated command of this test waits for."""
         return os.path.join(self.work, name)
@@ -5208,7 +5212,7 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         self.nothing_of_the_job_is_left(w, j)
         with jobstore.txn() as s:
             cur = s.job(j, must_be=("running",))
-            cur["stop_cmd"] = f"echo x >> {where}"
+            cur["stop_cmd"] = f"echo ${{PP_QUEUE_CONTAINER}} >> {where}"
             s.save(cur)
         return j, w
 
@@ -5229,22 +5233,43 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         # same case as `lost`, and either way the attempt wrote no exit code of its own
         self.assertEqual((rec["state"], rec["reason"], rec.get("rc")), ("failed", "signal 9", None))
         self.assertIsNone(rec.get("stop"), "the sweep's stop was recorded as one somebody asked for")
-        journey.until(lambda: self.ran(ran) == 1, timeout=30, what="the stop command the sweep ran")
+        journey.until(lambda: len(self.lines(ran)) == 1, timeout=30, what="the stop command the sweep ran")
+        self.assertEqual(self.lines(ran), [rec["container"]])   # with this attempt's own name in it
         for _ in range(3):
             w.tick()
-        self.assertEqual(self.ran(ran), 1)
+        self.assertEqual(len(self.lines(ran)), 1)
         # a kill whose stop command went out at the stop site: its code is recorded, and the sweep runs none
         k, w2 = self.a_running_job_whose_stop_is_a_command(ran, gate="go2")
         self.a_kill_asks(k, grace=30.0)
         w2.tick()
-        journey.until(lambda: self.ran(ran) == 2, timeout=30, what="the stop command the kill ran")
+        journey.until(lambda: len(self.lines(ran)) == 2, timeout=30, what="the stop command the kill ran")
         journey.until(lambda: jobstore.find(k)["stop"].get("rc") == 0, timeout=30,
                       what="the exit code that command had, on the stop it carried out")
         self.the_run_ends_with_no_code(k)
         for _ in range(3):
             w2.tick()
         self.assertEqual(jobstore.find(k)["reason"], "killed")
-        self.assertEqual(self.ran(ran), 2, "the sweep ran a stop command that had already gone out")
+        self.assertEqual(len(self.lines(ran)), 2, "the sweep ran a stop command that had already gone out")
+
+    def test_the_sweep_of_a_retried_attempt_names_that_attempts_own_container(self):
+        """A requeue takes the attempt's own names off the record, and the sweep's stop command is started
+        after that scope: it is given the attempt that ended, so it names the container that attempt started
+        and the next attempt begins beside nothing the last one left."""
+        ran = self.sb.path("what-the-stop-command-did")
+        j, w = self.a_running_job_whose_stop_is_a_command(ran)
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur.update(retries=1, retry_delay=0.01)
+            s.save(cur)
+        was = jobstore.find(j)["container"]
+        self.the_run_ends_with_no_code(j)
+        w.tick()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["attempt"]), ("queued", 2))      # back in its queue for another
+        self.assertNotIn("container", rec)                                   # that attempt's name has gone
+        self.assertEqual(rec["history"][0]["container"], was)
+        journey.until(lambda: self.lines(ran) == [was], timeout=30,
+                      what="the stop command the sweep ran, naming the attempt that ended")
 
     def test_a_sweep_runs_once_per_attempt_whose_run_is_over(self):
         """The sweep of a stopped job's group runs where its run is over: the SIGKILL goes out inside the

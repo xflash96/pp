@@ -253,6 +253,7 @@ class Worker:
             if cur is None:
                 return policy.Action(policy.NOTHING)      # nothing else records a running job: there is nothing to record
             a = policy.decide(cur, facts)
+            was = dict(cur)     # this attempt's own names, which a requeue below takes off the record
             if a.sweep:
                 # the leader of this job's group is gone and its run is over, so anything left in that group
                 # goes too: a command that held the signal back does not outlive the job
@@ -264,10 +265,10 @@ class Worker:
                 jobstore._requeue(s, cur, a)
             elif a.do == policy.ENDED_AS:
                 jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
-        if cmd := policy.swept_stop(cur, a):
+        if cmd := policy.swept_stop(was, a):
             # after the scope, since starting a process in one would make every reader of the store wait for
             # it: nobody asked for this stop, so nothing is recorded for it and no outcome rests on it
-            self.hooks += [h for h in [self._stop(cur, cmd)] if h is not None]
+            self.hooks += [h for h in [self._stop(was, cmd)] if h is not None]
         if a.do in (policy.TERM, policy.KILL9):
             self._send(cur, a)
             return a
