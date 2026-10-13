@@ -616,14 +616,13 @@ def _qcfg(q: str, empty_ok: bool = True) -> dict:
 
 
 def _mem_total_gb() -> float:
+    """What this machine's memory comes to, which `mem_gb = "auto"` is. libc counts it in pages, and a page
+    count times the page size is /proc/meminfo's MemTotal to within one page, which a pool in whole GB cannot
+    tell apart. 0.0 where it cannot be read, which `auto` then refuses on."""
     try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) / 1024 / 1024
-    except OSError:
-        pass
-    return 0.0
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2 ** 30
+    except (ValueError, OSError):
+        return 0.0
 
 
 CARDS_WHY = ""      # why the last _cards() gave None, for the messages that report it ("" when it had no card)
