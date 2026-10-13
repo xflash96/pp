@@ -4469,6 +4469,7 @@ class TestWhatASettingRefuses(QueueCase):
         ("need = { tok = 0 }", ("--need", "tok=0"), "positive number"),
         ("need = 3", None, "a table"),
         ('env = { "A=B" = "v" }', None, "NUL"),
+        ('env = { "A\\nPATH" = "/evil" }', ("--env", "A\nPATH=/evil"), "newline"),
         ('env = { A = "one\\ntwo" }', ("--env", "A=one\ntwo"), "newline"),
         ("prio = 1.5", ("--prio", "1.5"), "whole number"),
     )
@@ -4535,12 +4536,21 @@ class TestWhatASettingRefuses(QueueCase):
         self.config("slots = 3", 'poll = "0.5"')
         self.assertEqual(jobq._qcfg("default")["poll"], 0.5)
 
-    def test_an_environment_name_holds_no_equals_and_a_value_one_line(self):
+    def test_an_environment_name_holds_no_equals_or_newline_and_a_value_one_line(self):
         """The job's environment is handed to a runner as one line per variable. A flag's NAME=VALUE splits
         on its first `=`, so `--env A=B=v` is the variable A with the value B=v, and only a table can write
-        a name that holds one."""
+        a name that holds one.
+
+        A name holding a newline is refused for the same reason as a value holding one: it would make two
+        lines of the file the runner reads out of one variable, and the second of them any name at all. What
+        that file never holds is read against the name declared, so a name that smuggled a newline past it
+        would put this machine's PATH in the one file whose contract is that it holds none."""
         j = jobstore.find(self.add("--env", "A=B=v"))
         self.assertEqual(j["env"], {"A": "B=v"})
+        before = sorted(x["id"] for x in jobstore.jobs())
+        rc, _out, err = self.call("add", "--no-start", "--cwd", self.work, "--env", "A\nPATH=/evil",
+                                  "--", "true")
+        self.assertEqual((rc, sorted(x["id"] for x in jobstore.jobs())), (2, before), err)
         self.config("slots = 3", 'env = { "A=B" = "v" }')
         with self.assertRaises(config.ConfigError) as cm:
             jobq._qcfg("default")

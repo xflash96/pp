@@ -600,8 +600,9 @@ def env_file(job: dict) -> str:
     something wherever the runner starts the work.
 
     It holds nothing else of this machine's (NEVER_IN_ENVFILE), so a runner may hand the whole file to a
-    container without shadowing the image's python or naming a host path inside it. A name holding `=` or NUL
-    and a value holding a newline are refused when the job is added, so no value can corrupt the file."""
+    container without shadowing the image's python or naming a host path inside it. A name holding `=`, NUL or
+    a newline and a value holding a newline are refused when the job is added, so one variable is one line of
+    this file and neither half of a declaration can corrupt it."""
     env = job_env(job)
     names = [k for k in (job.get("env") or {})] + list(IN_ENVFILE)
     return "".join(f"{k}={env[k]}\n" for k in names if k in env and k not in NEVER_IN_ENVFILE)
@@ -1132,10 +1133,13 @@ def pairs(v) -> dict:
 
 
 def one_line(name: str, v) -> str:
-    """One variable of a job's environment: a name without `=` or NUL, and a value on one line, because the
-    environment is handed to a runner as one line per variable."""
-    if "=" in name or "\0" in name:
-        raise ValueError(f"'{name}': a name holds neither = nor NUL")
+    """One variable of a job's environment: a name without `=`, NUL or a newline, and a value on one line,
+    because the environment is handed to a runner as one line per variable.
+
+    A newline in a name would make two lines of that file out of one variable, and the second of them any name
+    at all: a NEVER_IN_ENVFILE name among them, since what that list is read against is the name declared."""
+    if "=" in name or "\0" in name or "\n" in name:
+        raise ValueError(f"'{name}': a name holds no =, NUL or newline")
     s = str(v)
     if "\n" in s:
         raise ValueError(f"'{name}': a value holds no newline")

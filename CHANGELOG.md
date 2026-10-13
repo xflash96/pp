@@ -47,7 +47,7 @@ and a timeout reach work that is not in the job's process group.
   machine's: no `PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX`, `CONDA_DEFAULT_ENV`
   or `PP_QUEUE_RCFILE`. The record names it, and it goes with the record.
 - An `--env` value, or a `[queue] env` value, holding a newline is refused,
-  and so is a name holding `=` or NUL.
+  and so is a name holding `=`, NUL or a newline.
 - An exit code an attempt wrote while a stop of it was going out is that
   stop's outcome, killed or timeout, with the code kept as `rc`.
 - `pp queue kill --grace DUR` takes a duration and overrides the job's own

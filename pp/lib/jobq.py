@@ -253,7 +253,7 @@ SETTINGS = (
        refuses="0, a negative, nan, inf; a name no pool provides, named at add time"),
     _S("env", "job", "strings", default={}, merge=True, repeat=True, metavar="K=V",
        says="set in the job's environment; wins over the project's [queue] env",
-       refuses="a name holding = or NUL; a value holding a newline"),
+       refuses="a name holding =, NUL or a newline; a value holding a newline"),
     _S("log", "job", "path", field="log_pattern", metavar="PATH",
        says="where this job's output goes: {tag} and {id} are filled in, under the project root",
        refuses="another placeholder; '..'; a relative path that leaves the project root"),

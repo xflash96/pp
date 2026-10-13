@@ -277,7 +277,7 @@ add's --env K=V; and then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE, PP_QUEUE_CONT
 CUDA_VISIBLE_DEVICES, the cards --gpu-gb reserved, unset where it reserved none.
 PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what it meant where
 you typed it, and a variable you export before `pp queue add` reaches the job only through the worker that add
-started: pass a token with --env or the project's env. An env name may hold no = or NUL and a value no newline.
+started: pass a token with --env or [queue] env. An env name holds no =, NUL or newline, a value no newline.
 --json gives the names of a job's own variables with every value as ***, and `show` neither.
 
 Agents
