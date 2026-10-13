@@ -1861,6 +1861,25 @@ class TestStatusWait(QueueCase):
         self.assertEqual(self.state(held), "held")          # never named, so never waited for
         self.assertNotIn(str(held), out + err)
 
+    def test_a_bare_wait_stops_waiting_for_a_job_held_while_it_waits(self):
+        """A job queued when a bare wait listed it and held before it ended is a job that wait named none of:
+        a parked stage is normal, so the wait ends with the jobs that did end instead of sitting there until
+        something releases it.
+
+        One thread does every step: the wait's own pass is what ticks the worker, so the hold lands between
+        two passes of it and nothing waits for a clock."""
+        self.config("slots = 1")
+        ran = self.add(cmd="true")
+        parked = self.add(cmd="true")           # queued behind it: one slot
+        gate = journey.Gate()
+
+        def each_pass():
+            gate.once(lambda: self.call("hold", str(parked)))    # the wait listed both; this parks one
+        with self.one_thread(each_pass):
+            rc, out, err = self.call("wait", "--poll", "0.01", "--timeout", "5")
+        self.assertEqual((rc, gate.ran), (0, 1), out + err)
+        self.assertEqual((self.state(ran), self.state(parked)), ("done", "held"))
+
     def test_nothing_to_wait_for(self):
         self.assertEqual(self.call("wait", "--no-start")[0], 0)
         self.assertEqual(self.call("wait", "--idle", "--no-start")[0], 0)

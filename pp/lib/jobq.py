@@ -1699,8 +1699,9 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
     are the selection.
 
     A held job is not ended, so a wait that named one waits for it and says so in one line. The two forms
-    that name no job name none held either: a bare wait takes the jobs that are queued or running, and
-    --idle counts those two states, so a parked stage leaves neither waiting forever."""
+    that name no job name none held either: a bare wait takes the jobs that are queued or running and lets
+    go of one that is parked while it waits, and --idle counts those two states, so a parked stage leaves
+    neither waiting forever."""
     verb = "watch" if stream else "wait"
     specs = _specs(a)
     if specs and (a.idle or a.mine):
@@ -1789,10 +1790,22 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         if not targets:
             say("nothing queued or running")
             return 0
-    held = [j["id"] for j in (jobcore.find(t) for t in targets) if j and j["state"] == "held"]
-    if held:
-        print(f"[{_PROG} {verb}] note: {', '.join(map(str, held))} held, so this waits forever. "
-              f"`pp {_PROG} release` them", file=sys.stderr)
+    bare = not specs and not a.mine     # the form that names no job, so it names none held either
+    noted: set = set()                  # the held jobs this wait has named, each named in one line once
+
+    def held_now(cur: dict) -> set:
+        """The jobs of this pass that are held, in one line the first time each one is seen. -> the ones a
+        bare wait is no longer waiting for, which is all of them there: a selection is what asks for a job,
+        so a wait that named one waits for it held, and a bare wait named none."""
+        held = {t for t, j in cur.items() if j and j["state"] == "held"}
+        new = sorted(held - noted)
+        if new:
+            noted.update(new)
+            print(f"[{_PROG} {verb}] note: {', '.join(map(str, new))} held, so this "
+                  + ("does not wait for them" if bare else "waits forever")
+                  + f". `pp {_PROG} release` them", file=sys.stderr)
+        return held if bare else set()
+
     with jobcore.watching(targets, None, verb):
         prev: dict = {}
         told: set = set()
@@ -1800,6 +1813,10 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         blamed: set = set()     # the queues this loop has said no worker came up for, which it says once
         while True:
             cur = {t: jobcore.find(t) for t in targets}
+            parked = held_now(cur)      # a job held while this waits: a bare wait drops it and returns
+            if parked:
+                targets = [t for t in targets if t not in parked]
+                cur = {t: j for t, j in cur.items() if t not in parked}
             if stream:
                 if not prev:
                     say(f"[{_PROG} watch] " + ", ".join(f"{t} {cur[t]['state'] if cur[t] else 'gone'}" for t in targets))
