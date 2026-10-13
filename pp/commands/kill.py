@@ -32,13 +32,14 @@ anything but TERM, INT, QUIT or KILL, or `--no-escalate`): a target meant to sur
 """
 from __future__ import annotations
 
+import argparse
 import os
 import pwd
 import re
 import shutil
 import signal
 
-from pp.lib import proc, ui
+from pp.lib import jobpolicy, proc, ui
 
 
 def _user(uid: int) -> str:
@@ -141,6 +142,16 @@ def cmd_ports(a) -> int:
     return 0
 
 
+def _duration(raw: str) -> float:
+    """--grace's value: a duration in the one spelling every duration pp takes has, read by the one parser
+    (`jobpolicy.duration`). A bare number is seconds, as it always was, and a value that is not finite is
+    refused where it is read rather than becoming a wait with no end."""
+    try:
+        return jobpolicy.duration(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def main(argv: list[str]) -> int:
     ap = ui.parser("kill", __doc__)
     ap.add_argument("targets", nargs="*", metavar="TARGET", help="PID, :PORT, or a regex over the command line")
@@ -148,8 +159,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("-y", "--yes", action="store_true", help="do not ask (patterns, docker stop)")
     ap.add_argument("-s", "--signal", default="TERM", help="signal to send first (default TERM)")
     ap.add_argument("-9", dest="nine", action="store_true", help="SIGKILL straight away")
-    ap.add_argument("--grace", type=float, default=3.0,
-                    help="seconds before escalating to SIGKILL (default 3; after TERM, INT or QUIT only)")
+    ap.add_argument("--grace", metavar="DUR", type=_duration, default=3.0,
+                    help="how long before escalating to SIGKILL (90s, 2m; a bare number is seconds; "
+                         "default 3; after TERM, INT or QUIT only)")
     ap.add_argument("--no-escalate", action="store_true", help="send the signal only; never SIGKILL")
     ap.add_argument("--tree", action="store_true", help="also every descendant of each target")
     ap.add_argument("-x", "--exact", action="store_true", help="pattern is the exact process name (comm, or its program's file name)")

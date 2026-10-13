@@ -74,6 +74,19 @@ class TestKill(unittest.TestCase):
         self.assertIn("killed", r.stdout)
         self.assertTrue(p.dead())
 
+    def test_the_grace_is_a_duration_in_the_one_spelling_every_duration_has(self):
+        """--grace takes a duration: a bare number is seconds, as it always was, and 2m is 120 of them. A
+        value that is no duration, or that is not finite, is a usage error where it is read, since a wait
+        with no end is the worst outcome."""
+        r = subprocess.run([sys.executable, PP, "kill", "--grace", "2m", "-n", "999999"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)       # nothing matched, and the value was read
+        for bad in ("nope", "", "inf", "nan", "-1"):
+            r = subprocess.run([sys.executable, PP, "kill", "--grace", bad, "-n", "999999"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("--grace", r.stderr, bad)
+
     def test_port(self):
         code = ("import socket, sys, time; s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen();"
                 "print(s.getsockname()[1], flush=True); time.sleep(60)")
