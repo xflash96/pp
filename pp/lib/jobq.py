@@ -2042,7 +2042,7 @@ def _in_delay(not_before: float | None, now: float | None = None) -> str:
     return ui.human_duration(max(float(not_before or 0) - (now or time.time()), 0))
 
 
-def _section(rows: list[list], tag: int, width: int, indent: str = "  ") -> list[str]:
+def _section(rows: list[list], tag: int, width: int) -> list[str]:
     """One section of `pp queue status` as its lines: one table, so every row of it lines up, with the column
     at `tag` cut until the widest row fits a terminal `width` wide.
 
@@ -2054,7 +2054,7 @@ def _section(rows: list[list], tag: int, width: int, indent: str = "  ") -> list
     keep = max((ui.width(str(r[tag])) for r in rows), default=0)
     while True:
         out = ui.table([[ui.cut(str(v), keep) if i == tag else v for i, v in enumerate(r)] for r in rows],
-                       indent=indent).splitlines()
+                       indent="  ").splitlines()
         if keep <= 8 or max((ui.width(ln) for ln in out), default=0) <= width:
             return out
         keep -= 1
@@ -2067,9 +2067,10 @@ def _without_empty_tail(row: list) -> list:
     return out
 
 
-def _latest_note(j: dict, width: int = 60) -> str:
+def _latest_note(j: dict) -> str:
+    """The last note on a job, as a row of `pp queue status` shows it: one line, cut to 60 characters."""
     notes = j.get("notes") or []
-    return ("note: " + _text(notes[-1]["text"].replace("\n", " "), width)) if notes else ""
+    return ("note: " + _text(notes[-1]["text"].replace("\n", " "), 60)) if notes else ""
 
 
 def public(j: dict) -> dict:
@@ -2234,7 +2235,9 @@ def cmd_status(a, scope: list[str] | None) -> int:
     # what each queue's worker is, through the one construct, so the hints that nothing launches or records
     # this queue's jobs come back from the one answer it gave
     workers = {q: worker_now(q) for q in _scope_list(scope)}
-    qs = [q for q in _scope_list(scope)
+    # the queues those workers are of, so this view comes of one listing of the store: a queue another process
+    # creates between two listings would otherwise be one this has no worker for
+    qs = [q for q in workers
           if scope is not None or any(j["queue"] == q for j in all_jobs) or workers[q].how != DOWN]
     if a.here or a.project:
         want = a.project or project_name(os.getcwd())
