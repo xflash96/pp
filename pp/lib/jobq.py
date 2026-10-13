@@ -907,7 +907,8 @@ AGAIN = "again"             # back to its queue for another attempt
 class Facts:
     """What is true of one running job apart from its record, read before the decision and never inside it.
 
-    held    a run of this attempt is live: its own wrapper holds the job's run claim. While it is held the
+    held    a run of this attempt is live: its own wrapper holds the job's run claim, or this worker started
+            that wrapper and has not reaped it yet. While it is held the
             attempt's exit code counts for nothing, since the command itself can write that file ($PP_QUEUE_RCFILE
             is in its environment); a code is the command's last word only once the run is over.
     rc, rc_at   the exit code this attempt wrote and when it wrote it (`ended_on_its_own`), or None for both.
@@ -1270,12 +1271,16 @@ class Worker:
 
         Read before the transaction, since none of it is store state and a log tail can be long."""
         held = lock.Claim.holder(_run_claim(self.queue, j["id"]))
-        if held is not None:
+        p = self.children.get(j["id"])
+        if held is not None or (p is not None and p.poll() is None):
             # a run of it is live, whatever its record holds: it is never lost, and never started again. Its
-            # exit code is not read at all here: while the run is live it says nothing (Facts).
-            self._adopt(j, held)
+            # exit code is not read at all here: while the run is live it says nothing (Facts). A wrapper this
+            # worker started is live until this worker reaps it: a process closes its files, the claim among
+            # them, before its parent can read how it ended.
+            if held is not None:
+                self._adopt(j, held)
             return Facts(held=True, now=now)
-        p = self.children.pop(j["id"], None)
+        self.children.pop(j["id"], None)
         code = p.poll() if p is not None else None
         rc, ended = ended_on_its_own(j) or (None, None)
         tail = "\n".join(log_tail(j, 200)) if rc != 0 and j.get("retry_if") else ""

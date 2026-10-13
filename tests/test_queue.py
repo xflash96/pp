@@ -806,6 +806,31 @@ class TestWorker(QueueCase):
         self.assertEqual(jobq.find(j)["reason"], "killed")
         journey.until(lambda: not any(proc.alive(k) for k in kids), timeout=5, what="its group to be clear")
 
+    def test_a_run_is_live_until_its_worker_reaps_it(self):
+        """A dying process closes its files, the run claim among them, before its parent can read how it
+        ended. So a tick can find the claim free and the wrapper not yet reapable: the run is still live then,
+        and its end is read once the worker reaps it, never guessed as lost."""
+        j = self.add(cmd="sleep 30")
+        w = jobq.Worker("default")
+        w.tick()
+        rec = jobq.find(j)
+        journey.until(lambda: proc.descendants(rec["pid"]), timeout=5, what="the job's command")
+        for k in proc.descendants(rec["pid"]):
+            self.addCleanup(journey.kill_pid, k)
+        real = jobq.lock.Claim.holder.__func__
+
+        def holder(cls, path):          # the wrapper's claim as the kernel shows it once its files are closed
+            r = real(cls, path)
+            return None if r and r.get("pid") == rec["pid"] else r
+
+        with mock.patch.object(jobq.lock.Claim, "holder", classmethod(holder)):
+            w.tick()
+        self.assertEqual(self.state(j), "running")
+        wrapper = proc.Handle.recorded(rec["pid"], rec["pstart"])
+        self.assertEqual(proc.signal_pid(wrapper, signal.SIGKILL), "alive")
+        self.run_until(w, lambda: self.state(j) == "failed")
+        self.assertEqual(jobq.find(j)["reason"], "signal 9")
+
     def test_kill_over_a_range_asks_first_then_stops_each(self):
         """A range is a selection: it is shown first, -n only shows, -y goes ahead, and every job it named
         that is running is stopped and reported."""
