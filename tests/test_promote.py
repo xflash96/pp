@@ -819,6 +819,38 @@ class TestABadValue(Base):
             with self.subTest(line=line):
                 self.bad(line, says)
 
+    def test_a_link_path_through_a_variable_is_an_absolute_path(self):
+        """A link path is judged as pp expands it: `$HOME/...` lands in one place whatever directory pp ran in."""
+        src = os.path.join(self.tmp, "viahome")
+        self.write(".pp.toml", '[promote]\nsource = "tree"\nlinks = { "$HOME/.local/bin/viahome" = "f.txt" }\n',
+                   root=src)
+        self.write("f.txt", "x", root=src)
+        rc, out, err = self.pp(src)
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.islink(os.path.join(self.sb.home, ".local", "bin", "viahome")))
+
+    def test_a_bad_value_stops_every_verb_but_status(self):
+        """A verb that acts on a target reads its hooks, its links and its keep from that config. With a value
+        pp refuses there, gc would remove past the keep the user set and rollback would flip with no `after`."""
+        src = os.path.join(self.tmp, "kept")
+        self.write(".pp.toml", 'name = "kept"\n[promote]\nsource = "tree"\nkeep = 1\n', root=src)
+        rel = os.path.join(self.sb.data, "releases", "kept")
+        for i in range(3):
+            self.write("f.txt", str(i), root=src)
+            self.assertEqual(self.pp(src)[0], 0)
+        self.write(".pp.toml", 'name = "kept"\n[promote]\nsource = "tree"\nkeep = 1\nexclude = "*.log"\n', root=src)
+        before = (sorted(os.listdir(rel)), os.readlink(os.path.join(rel, "current")))
+        self.sb.chdir()
+        for argv in (("gc", "kept", "--keep", "0", "-y"), ("rollback", "kept", "-y"), ("ls", "kept")):
+            with self.subTest(argv=argv):
+                rc, out, err = self.pp(*argv)
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn("exclude", err)
+        self.assertEqual((sorted(os.listdir(rel)), os.readlink(os.path.join(rel, "current"))), before)
+        rc, out, err = self.pp("status")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("kept", out)
+
     def test_a_name_that_is_not_one_path_component(self):
         """`name` names the releases directory, and `gc` removes directories under it: `name = ".."` made that
         directory the data directory itself, and two promotes removed every release of every project."""

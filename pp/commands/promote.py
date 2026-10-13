@@ -193,7 +193,7 @@ def _checked(data: dict, root: str) -> dict:
             raise config.ConfigError(f"{where} [promote] {key} = {links!r}: a table of link path = path in the "
                                      f"release ({{ \"~/.local/bin/x\" = \"bin/x\" }})")
         for p in links:
-            if not (os.path.isabs(p) or p.startswith("~")):
+            if not os.path.isabs(os.path.expanduser(os.path.expandvars(p))):
                 raise config.ConfigError(f"{where} [promote] {key}: the link path {p!r} is relative, so where the "
                                          f"link lands would follow the directory pp ran in: an absolute path, or ~")
     return cfg
@@ -259,8 +259,9 @@ def _register(t: Target):
         reg[t.name] = {"source": t.source}
 
 
-def _resolve(arg: str | None) -> Target:
-    """A NAME argument: a registered target, or a path into a project (default: cwd)."""
+def _resolve(arg: str | None, survey: bool = False) -> Target:
+    """A NAME argument: a registered target, or a path into a project (default: cwd). `survey` is status's: there
+    a value pp refuses in a target's config is a line about that target, and every other verb refuses it."""
     reg = _registry()
     if arg is None:
         root, data = config.find_project(None)
@@ -275,11 +276,13 @@ def _resolve(arg: str | None) -> Target:
             try:
                 cfg = _checked(data, root)
             except config.ConfigError as e:
-                # one target's bad value must not end a verb over the registry: `status` surveys every target,
-                # and `pp promote` in that project is where the refusal belongs
+                # one target's bad value must not end `status`, which surveys every target. Any other verb
+                # would act without the hooks, the links and the keep that config sets, so it refuses
                 bad = str(e)
         if not os.path.isdir(src):
             ui.warn(f"{arg}: its source {src} is gone; releases only, no hooks or links")
+        elif bad and not survey:
+            ui.die(f"bad config: {bad}", 1)
         elif bad:
             ui.warn(f"bad config: {bad}; releases only, no hooks or links")
         elif not cfg:
@@ -907,7 +910,7 @@ def _print_plan(t: Target, f: Facts, plan: list[dict], cur: str | None, a, alrea
 
 
 def _status_row(name: str, src: str) -> dict:
-    t = _resolve(name)
+    t = _resolve(name, survey=True)
     cur = t.current()
     info = t.info(cur)
     row = {"name": name, "source": src, "mode": t.mode, "current": cur, "rev": info.get("rev"),
