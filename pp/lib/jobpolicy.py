@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 # The built-in defaults the declaration's rows point at (pp/lib/jobq.py, SETTINGS). A rule below falls back
 # to one of them for a record written before that row was a setting of the job.
-TIMEOUT_GRACE = 10.0    # between a timeout's stop of a job and the SIGKILL that follows it
+GRACE = 10.0            # between a stop of a job and the SIGKILL that follows, for a timeout and a kill alike
 PRIO = 10
 RETRY_DELAY = 30.0
 RETRY_DELAY_CAP = 3600.0
@@ -108,6 +108,18 @@ def matches(job: dict, why: str, tail: str) -> bool:
         return False
 
 
+def grace(job: dict) -> float:
+    """The gap between a stop of this job and the SIGKILL that follows it: one number of the job's own,
+    resolved onto its record at add time, and the built-in default for a record that carries no such key,
+    which is one written before that row was a setting. A grace of 0 is the job's own answer and not an
+    absent one, so a job that asks to be SIGKILLed at once is.
+
+    A timeout's stop and a kill of the job both take this number, and `kill --grace` overrides it for the
+    jobs that kill names."""
+    g = job.get("grace")
+    return GRACE if g is None else float(g)
+
+
 def decide(job: dict, facts: Facts) -> Action:
     """What is to be done about this running job: one action, from its record and the facts read with it.
 
@@ -129,7 +141,7 @@ def decide(job: dict, facts: Facts) -> Action:
         if not stop:
             due = (job.get("timeout") and job.get("started")
                    and facts.now - float(job["started"]) >= float(job["timeout"]))
-            return Action(TIME_UP, t=facts.now, grace=TIMEOUT_GRACE) if due else Action(NOTHING)
+            return Action(TIME_UP, t=facts.now, grace=grace(job)) if due else Action(NOTHING)
         if stop.get("sent") is None:
             return Action(TERM)
         if not stop.get("kill9") and facts.now - float(stop["sent"]) >= float(stop.get("grace") or 0):
@@ -505,7 +517,7 @@ class Setting:
     printed   its default is printed in the help, so a release that changes it is a break
     field     the record field a per-job row lands in, where that is not the row's own name
     unit      what a bare number means, for a duration
-    lo, hi     the bounds the row gives
+    lo, hi    the bounds the row gives
     none_ok   `none` is a value of this row, and so is 0: no bound
     auto_ok   "auto" is a value of this row: the size the machine knows of itself
     merge     a table, merged key by key, instead of a scalar taken whole from one source

@@ -262,6 +262,9 @@ SETTINGS = (
        says="shell command run on the final failure; none: no hook", refuses="a non-string"),
     _S("on_done", "job", "command", metavar="CMD",
        says="shell command run on success; none: no hook", refuses="a non-string"),
+    _S("grace", "job", "duration", default=policy.GRACE, printed=True, metavar="DUR",
+       says="between a stop of the job and the SIGKILL that follows it (default 10s)",
+       refuses='""; a non-finite value'),
 
     # Per queue: `[queue.NAME]` in config.toml, and no flag. Its worker re-reads the table every loop, so a
     # limit changes under running jobs; a flag would freeze what config can otherwise change.
@@ -333,6 +336,12 @@ def _dur_flag(unit: str = "s"):
         except ValueError as e:
             raise argparse.ArgumentTypeError(str(e)) from None
     return read
+
+
+def _flag_override(p, row: policy.Setting, says: str) -> None:
+    """A row's flag on a verb other than `add`, where that verb overrides the resolved value on the record
+    for the jobs it names. One row, so the flag takes exactly what the key takes."""
+    p.add_argument(row.flag, metavar=row.metavar, type=_typed(row), default=policy.NOTSET, help=says)
 
 
 def _flag(p, row: policy.Setting) -> None:
@@ -1227,6 +1236,10 @@ def cmd_kill(a) -> int:
     how it ended, so one actor ends a job and its outcome is recorded once. A worker this started launches the
     queue's queued jobs too, as the worker an `add` starts does.
 
+    The grace is the job's own, resolved onto its record at add time, and `--grace DUR` overrides it for the
+    jobs this kill names. A kill runs from any directory against jobs of any project, so the record is the
+    only honest source for it.
+
     A job named as queued or held is refused, since it has no process: `drop` removes it. A job this kill read
     as running may be back in its queue for a retry by the time the stop is written. It has no process then,
     so the transaction ends it there."""
@@ -1245,7 +1258,8 @@ def cmd_kill(a) -> int:
             ui.warn(f"{_PROG}: job {jid} is {j['state']}, not running; {hint}")
             rc = 2
             continue
-        out = jobcore.ask_stop(jid, _by(), float(a.grace))
+        grace = policy.grace(j) if a.grace is policy.NOTSET else a.grace
+        out = jobcore.ask_stop(jid, _by(), grace)
         if out["did"] == "ended":
             print(f"job {jid} already {out['was']}")
             continue
@@ -1253,11 +1267,11 @@ def cmd_kill(a) -> int:
             # it went back to its queue for a retry: no process exists, so that is where it ended
             print(f"killed {jid} (it was {out['was']}, with no process to stop)  {_text(j.get('tag'))}")
             continue
-        asked.append((j, out["t"]))
-    for q in sorted({j["queue"] for j, _t in asked}):
+        asked.append((j, out["t"], grace))
+    for q in sorted({j["queue"] for j, _t, _g in asked}):
         _worker_up(q, wake=True)     # the queue's worker is what carries these stops out
-    for j, t in asked:
-        rc = max(rc, _await_stop(j, float(a.grace), t))
+    for j, t, grace in asked:
+        rc = max(rc, _await_stop(j, grace, t))
     return rc
 
 
@@ -1690,7 +1704,8 @@ def _parser(prog: str, doc: str, add_args=None):
     p = sp("kill", help="stop running jobs: the whole process group is signalled; a job the signal stopped "
                         "fires no hook")
     p.add_argument("ids", nargs="+")
-    p.add_argument("--grace", type=float, default=10, help="seconds between SIGTERM and SIGKILL")
+    _flag_override(p, BY_SCOPE["job"]["grace"],
+                   "the gap before the SIGKILL for the jobs this kill names (default: each job's own)")
     p.add_argument("-n", "--dry-run", action="store_true", help="only show which jobs it would stop")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask about a range or a shared tag")
     for name, hlp in (("drop", "remove queued/held jobs"), ("hold", "park queued jobs"), ("release", "un-park held jobs")):

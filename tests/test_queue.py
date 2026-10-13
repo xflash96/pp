@@ -3091,6 +3091,7 @@ class TestTheDecision(unittest.TestCase):
 
     NOW = 2000.0
     GRACE = 10.0
+    JOB_GRACE = 7.0         # the job's own, which a timeout's stop takes and no constant of pp's does
     RC_AT = 1990.0          # when the code was written, which is when the job really ended
     DELAY = 20.0
 
@@ -3148,7 +3149,7 @@ class TestTheDecision(unittest.TestCase):
         job = {"id": 1, "queue": "default", "state": "running", "tag": "t", "attempt": r["attempt"],
                "retries": r["attempt"] + 2 if r["left"] else 0, "retry_delay": self.DELAY,
                "retry_if": r["retry_if"], "timeout": 60.0, "started": self.NOW - (120 if r["due"] else 1),
-               "on_fail": "echo failed", "on_done": "echo done"}
+               "grace": self.JOB_GRACE, "on_fail": "echo failed", "on_done": "echo done"}
         st = self.stop(r["stop"], r["grace_up"])
         if st is not None:
             job["stop"] = st
@@ -3206,7 +3207,7 @@ class TestTheDecision(unittest.TestCase):
              lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             ("A job with no stop whose own timeout has run out gets a timeout's stop.",
              lambda r: r["held"] and not r["any"] and r["due"],
-             lambda r: jobpolicy.Action(jobpolicy.TIME_UP, t=self.NOW, grace=jobpolicy.TIMEOUT_GRACE)),
+             lambda r: jobpolicy.Action(jobpolicy.TIME_UP, t=self.NOW, grace=self.JOB_GRACE)),
             ("A job with no stop whose time is not up is left as it is.",
              lambda r: r["held"] and not r["any"],
              lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
@@ -3751,6 +3752,7 @@ class TestTheSettingsTable(unittest.TestCase):
         ("retry_if", "job", "--retry-if", "[queue] retry_if, [queue.NAME] retry_if", None, False),
         ("on_fail", "job", "--on-fail", "[queue] on_fail, [queue.NAME] on_fail", None, False),
         ("on_done", "job", "--on-done", "[queue] on_done, [queue.NAME] on_done", None, False),
+        ("grace", "job", "--grace", "[queue] grace, [queue.NAME] grace", 10.0, True),
         ("poll", "queue", "", "[queue.NAME] poll", 2.0, True),
         ("idle_exit", "queue", "", "[queue.NAME] idle_exit", 600.0, True),
         ("backfill", "queue", "", "[queue.NAME] backfill", False, True),
@@ -3864,6 +3866,7 @@ class TestTheSettingsSources(QueueCase):
         ("retry_if", 'retry_if = "OOM"', ("--retry-if", "reset"), ("retry_if", "OOM", "reset")),
         ("on_fail", 'on_fail = "true"', ("--on-fail", "false"), ("on_fail", "true", "false")),
         ("on_done", 'on_done = "true"', ("--on-done", "false"), ("on_done", "true", "false")),
+        ("grace", 'grace = "90s"', ("--grace", "5s"), ("grace", 90.0, 5.0)),
         ("cpu", "cpu = 2", ("--cpu", "3"), ("needs.cpu", 2, 3)),
         ("mem_gb", "mem_gb = 4", ("--mem-gb", "5"), ("needs.mem_gb", 4, 5)),
         ("need", "need = { tok = 1 }", ("--need", "tok=2"), ("needs.tok", 1, 2)),
@@ -3939,15 +3942,15 @@ class TestTheSettingsSources(QueueCase):
     def test_a_retry_carries_every_row_the_record_holds(self):
         """A retry is a new job of the same work, so it carries what the old one was given rather than
         resolving the settings of the day it is re-queued."""
-        self.config("slots = 3", 'retry_delay = "90s"')
+        self.config("slots = 3", 'grace = "90s"')
         j = self.add("--timeout", "2h", "--retries", "1")
         w = jobq.worker_for("default")
         self.run_until(w, lambda: self.state(j) in jobstore.ENDED)
-        self.config("slots = 3", 'retry_delay = "1s"')      # changed under it, and the retry keeps the old one
+        self.config("slots = 3", 'grace = "1s"')        # changed under it, and the retry keeps the old one
         rc, out, err = self.call("retry", str(j), "--no-start")
         self.assertEqual(rc, 0, err)
         new = jobstore.find(int(re.search(r"\b(\d+)\b", out.split("\n")[0]).group(1)))
-        self.assertEqual((new["retry_delay"], new["timeout"], new["retries"]), (90.0, 7200.0, 1))
+        self.assertEqual((new["grace"], new["timeout"], new["retries"]), (90.0, 7200.0, 1))
 
 
 class TestWhatASettingRefuses(QueueCase):
@@ -3966,6 +3969,7 @@ class TestWhatASettingRefuses(QueueCase):
         ('timeout = "soon"', ("--timeout", "soon"), "not a duration"),
         ("timeout = nan", ("--timeout", "nan"), "duration"),
         ("timeout = 1e10", ("--timeout", "1e10"), "duration"),
+        ('grace = ""', ("--grace", ""), "say how long"),
         ('retry_if = "(unclosed"', ("--retry-if", "(unclosed"), "unterminated"),
         ("cpu = 0", ("--cpu", "0"), "positive number"),
         ("cpu = -2", ("--cpu", "-2"), "positive number"),
@@ -4049,6 +4053,46 @@ class TestWhatASettingRefuses(QueueCase):
         with self.assertRaises(config.ConfigError) as cm:
             jobq._qcfg("default")
         self.assertIn("A=B", str(cm.exception))
+
+
+class TestTheJobsGrace(QueueCase):
+    """`grace` is one setting of the job and one number: the gap between a stop of it and the SIGKILL that
+    follows, whoever asked. A timeout's stop takes the job's own, `kill` takes it too, and `kill --grace`
+    overrides it for the jobs that kill names."""
+
+    def test_a_timeouts_stop_carries_the_jobs_own_grace(self):
+        """Not a constant of pp's: a container project that wants a longer shutdown sets `grace` once and
+        both a timeout and a kill of its jobs take it."""
+        j = self.add("--timeout", "60", "--grace", "90s", cmd="sleep 30")
+        w = jobq.worker_for("default")
+        w.tick()
+        self.started_earlier(j, 120)        # its time is up, so the next tick writes a timeout's stop
+        w.tick()
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual((stop["by"], stop["timeout"], stop["grace"]), ("timeout", True, 90.0))
+
+    def test_a_kill_takes_the_jobs_own_grace_and_grace_overrides_it(self):
+        """A kill runs from any directory against jobs of any project, so the record is the only honest
+        source for the grace; `--grace` is what overrides it, and nothing else does."""
+        a = self.add("--grace", "90s", cmd="sleep 30")
+        b = self.add("--grace", "90s", cmd="sleep 30")
+        w = jobq.worker_for("default")
+        w.tick()
+        with self.one_thread():
+            self.call("kill", str(a), "-y")
+            self.assertEqual(jobstore.find(a)["stop"]["grace"], 90.0)
+            self.call("kill", str(b), "--grace", "0.2", "-y")
+            self.assertEqual(jobstore.find(b)["stop"]["grace"], 0.2)
+
+    def test_the_grace_of_a_record_written_before_the_row_was_one(self):
+        """A job queued by an older pp carries no grace, and the built-in default stands for it, so an
+        untouched project sees the same ten seconds it saw before. A grace of 0 on the record is that job's
+        own answer: the SIGKILL follows the stop at once."""
+        job = {"id": 1, "queue": "default", "timeout": 60.0, "started": 0.0}
+        self.assertEqual(jobpolicy.grace(job), 10.0)
+        self.assertEqual(jobpolicy.grace({**job, "grace": None}), 10.0)
+        self.assertEqual(jobpolicy.grace({**job, "grace": 0}), 0.0)
+        self.assertEqual(jobpolicy.grace({**job, "grace": 2.5}), 2.5)
 
 
 class TestWhatTheTextNames(QueueCase):

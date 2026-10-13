@@ -7,10 +7,14 @@ its sources.
 
 - Each setting of a job is a key of a project's `.pp.toml [queue]` as well
   as of `[queue.NAME]`: `timeout`, `retries`, `retry_delay`, `retry_if`,
-  `on_fail`, `on_done`, `prio`, `gpu_gb`, `cpu`, `mem_gb`, `need` and
-  `env`. The first source that gives a setting wins, in this order:
+  `on_fail`, `on_done`, `prio`, `gpu_gb`, `cpu`, `mem_gb`, `need`, `env`
+  and `grace`. The first source that gives a setting wins, in this order:
   `add`'s flag, the project's `[queue]`, the queue's `[queue.NAME]`, the
   built-in default. `env` and `need` merge key by key.
+- `grace` is one setting of the job: `--grace DUR` on `add`, the `grace`
+  key, the resolved value on the record, and 10s by default. A timeout's
+  stop and a kill of that job both take it, and `pp queue kill --grace DUR`
+  overrides it for the jobs that kill names.
 - Durations are read one way everywhere: `90s`, `30m`, `2h`, `1d`, a bare
   number of seconds, `.5` and `1.5h`, and `none` where a setting offers it.
   An empty value, a value that is not finite and one over 1e9 seconds are

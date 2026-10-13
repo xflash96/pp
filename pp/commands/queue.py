@@ -28,6 +28,7 @@ quota). A job is retried, timed out and reported as you ask.
     pp queue wait --mine                               (an agent) every job this session queued that is live
                                                        or whose end no wait/watch in this session reported yet
     pp queue kill 12                                   waits while the worker stops it: killed 12 (stopped on SIGTERM)
+    pp queue kill 12 --grace 2m                        ... giving it longer than its own grace to end
     pp queue drop 13    pp queue retry 11    pp queue reprio 14 0
     pp queue drop 20-29 -n                             a range or a shared tag: shows what it would do, then asks
     pp queue hold 15    pp queue release 15    pp queue clean --older 7d
@@ -54,9 +55,12 @@ value as ***, and `show` prints neither, so a secret you pass stays in the job's
 
 Timeouts and retries
     --timeout DUR      the worker SIGTERMs the job's process group after DUR (90s, 30m, 2h, 1d) and SIGKILLs
-                       it 10s later; the attempt fails with reason "timeout", and what that comes to is
-                       under "How a job ends" below. `none` (or 0): no timeout, even when the queue has a
-                       default one
+                       it once the job's grace is up; the attempt fails with reason "timeout", and what that
+                       comes to is under "How a job ends" below. `none` (or 0): no timeout, even when the
+                       queue has a default one
+    --grace DUR        between a stop of the job and the SIGKILL that follows it (default 10s), for a
+                       timeout and for a kill of that job alike. `pp queue kill --grace DUR` overrides it
+                       for the jobs that kill names.
     --retries N        re-run a failure up to N more times, with the SAME id: back to the queue after
     --retry-delay DUR  (default 30s, doubling each attempt, at most 1h). A job waiting out its delay never
                        holds up the queue. `wait` and `log -f` follow it across attempts.
@@ -134,7 +138,7 @@ rewritten in place is for a moment; remove it to use the defaults:
     retry_if = "Connection reset|503"
     on_fail = "notify-send 'pp job failed'"     # a shell command; default: none
     on_done = "none"
-    prio = 5             # ... and every other per-job key: env, need, gpu_gb, cpu, mem_gb
+    grace = "30s"        # ... and every other per-job key: prio, env, need, gpu_gb, cpu, mem_gb
     idle_exit = 600      # the worker exits after this long with nothing queued or running
     poll = 2             # worker loop period, seconds
     backfill = false     # let later jobs that fit start while the head waits
