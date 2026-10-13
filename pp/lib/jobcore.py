@@ -288,14 +288,14 @@ class Worker:
 
         The signal goes out first and is recorded after, so a record that says a signal went out is one that
         did, which is all the decision about this job has to go on."""
-        stop = job.get("stop") or {}
         sig, mark = (signal.SIGTERM, "sent") if a.do == policy.TERM else (signal.SIGKILL, "kill9")
         # the project's command in place of the SIGTERM, where the job carries one. pp's own grace and SIGKILL
-        # follow it either way, so a stop command that could not start leaves the job no worse off than 0.1.1
+        # follow it either way, and a command that could not start sent nothing: pp's own signal goes out for
+        # that stop instead, so the job is left no worse off than 0.1.1
         cmd = policy.stop_command(job) if a.do == policy.TERM else None
-        outcome = "alive" if cmd else self._signal_group(job, sig)
-        if cmd and (h := self._stop(job, cmd)) is not None:
-            self.stops[job["id"]] = h   # the worker reaps it, and its exit code lands on this stop
+        h = self._stop(job, cmd) if cmd else None
+        self.stops.update({job["id"]: h} if h is not None else {})   # the worker reaps it onto this stop
+        outcome = "alive" if h is not None else self._signal_group(job, sig)
         if outcome is None or outcome == "gone":
             return          # nothing to signal: its run is starting, or it is over and the next pass says how
         now = time.time()
@@ -304,9 +304,11 @@ class Worker:
             if cur is None or not cur.get("stop"):
                 return
             cur["stop"]["denied" if outcome == "denied" else mark] = now
+            if cmd and h is None:
+                cur["stop"]["rc"] = 127     # the code a shell gives a command it could not run
             s.save(cur)
-        self.say("stop", job, {"outcome": outcome, "sig": sig, "cmd": cmd, "grace": stop.get("grace"),
-                               "group": cur.get("pgid")})
+        self.say("stop", job, {"outcome": outcome, "sig": sig, "cmd": cmd if h is not None else None,
+                               "grace": (job.get("stop") or {}).get("grace"), "group": cur.get("pgid")})
 
     def _stop(self, job: dict, cmd: str) -> proc.Child | None:
         """The project's stop command, started detached in the job's directory with the job's own environment,

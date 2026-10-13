@@ -4731,10 +4731,10 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
     """The four steps of a stop, with the worker ending between two of them each time: what the record says
     went out, what really went out, and what the next worker does about the rest of it."""
 
-    def a_job_whose_run_is_live(self, *args, cmd=None) -> tuple:
+    def a_job_whose_run_is_live(self, *args, cmd=None, cwd=None) -> tuple:
         """A running job of this test's, with its run live and this test's worker holding its wrapper. -> the
         job's id and that worker."""
-        j = self.add(*args, cmd=cmd or self.gated())
+        j = self.add(*args, cmd=cmd or self.gated(), cwd=cwd)
         w = jobq.worker_for("default")
         w.tick()
         self.assertEqual(self.state(j), "running")
@@ -4774,6 +4774,29 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         w.carry_out()
         self.assertEqual(went, [(signal.SIGTERM, None)])        # the record was marked after this went out
         self.assertIsNotNone(jobstore.find(j)["stop"]["sent"])
+
+    def test_a_stop_command_that_could_not_start_leaves_the_stop_to_pps_own_signal(self):
+        """What went out for a stop is recorded after it went out, so a record that says a signal went out is
+        a record of one that did. A project's stop command that cannot start sends nothing: pp's own signal
+        goes out for that stop instead, and the code of a command that could not run is recorded for it, so
+        the record says the project's stop failed rather than saying a stop went out that never did."""
+        ran = self.sb.path("what-the-stop-command-did")
+        sub = os.path.join(self.work, "sub")
+        os.mkdir(sub)
+        j, w = self.a_job_whose_run_is_live(cwd=sub)
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = f"echo x >> {ran}"
+            s.save(cur)
+        os.rmdir(sub)           # the job's own directory, which that command starts in, is gone
+        self.a_kill_asks(j, grace=10.0)
+        went = self.recording()
+        w.carry_out()
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual(went, [signal.SIGTERM])        # what the record says went out is what did
+        self.assertIsNotNone(stop["sent"])
+        self.assertEqual(stop["rc"], 127)
+        self.assertFalse(os.path.exists(ran), "a command that could not start ran")
 
     def test_a_grace_that_is_up_escalates_once_and_only_once(self):
         """The SIGKILL of a stop whose grace is up goes out once. A worker that ends between the grace being
