@@ -1026,7 +1026,7 @@ def _after_str(ids: list, live: set) -> str:
 OF_THE_BATCH = ("queue", "from_", "hold", "no_start")
 
 
-def cmd_add(a, cmd: list[str], q: str, prepare_job, ap=None) -> int:
+def cmd_add(a, cmd: list[str], q: str, prepare_job, ap) -> int:
     """Queue one job per command: the one this command line names, or one per line of a campaign file.
 
     A line of a campaign file is the rest of an `add` command line: its own flags, then `--`, then the
@@ -1078,7 +1078,11 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job, ap=None) -> int:
                "shell_env": shell_env, "needs": needs, "owner": owner, "attempt": 1,
                **{r.on_record: gave[r.name] for r in JOB_ROWS if r.on_record != "needs"}}
         if la.after:
-            job["after"] = _after(la.after, refuse)
+            # read once per value, however many lines carry it: a campaign file whose lines all name one
+            # stage reads the store once instead of once a line
+            if la.after not in waits:
+                waits[la.after] = _after(la.after, refuse)
+            job["after"] = list(waits[la.after])
         if prepare_job:
             prepare_job(job, la, project)
         return job
@@ -1089,7 +1093,8 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job, ap=None) -> int:
     qc, owner = _qcfg(q), session.caller()
     shell_env = {k: os.environ[k] for k in CAPTURED_ENV if k in os.environ}
     state = "held" if a.hold else "queued"
-    base = ap.parse_args(["add"]) if ap is not None else a      # what the parser gives a line that gave none
+    base = ap.parse_args(["add"])        # what the parser gives a line that gave a flag none of its own
+    waits: dict = {}                    # the ids each --after value came to, read once per value
     records = []
     for n, flags, c in lines:
         refuse = refusing(n)

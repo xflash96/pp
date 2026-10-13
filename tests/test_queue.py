@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -4349,6 +4350,19 @@ class TestTheSettingsSources(QueueCase):
         self.config("slots = 3", "retries = 2")
         self.assertEqual(self.held(self.add(cwd=self.project("retries = 7")), "retries"), 7)
 
+    def test_every_row_works_on_a_line_of_a_campaign_file(self):
+        """A line of a campaign file is read by `add`'s own parser, so every per-job row of the declaration
+        works on a line the day its flag lands, and a line's own flag wins over the `add`'s. This is the
+        whole of what makes a campaign file keep up with the settings table."""
+        path = self.sb.path("campaign.txt")
+        for name, _table, flag, (field, _want, won) in self.SOURCES:
+            with self.subTest(setting=name):
+                with open(path, "w") as fh:
+                    fh.write(f"{shlex.join(flag)} -- true\n")
+                rc, out, err = self.call("add", "--no-start", "--cwd", self.work, "--from", path)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(self.held(int(out.split()[-1]), field), won)
+
     def test_a_table_merges_key_by_key_and_a_scalar_is_taken_whole(self):
         """env and need merge key by key, with the same order per key, so a project adds one variable to the
         queue's without naming the rest. Every other row is taken whole from one source."""
@@ -5711,6 +5725,8 @@ class TestAnUnmetAfter(InjectedCase):
                 self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
         plain = self.add()
         self.assertNotIn("after", jobstore.find(plain))         # absent on a job that names none
+        parked = self.add("--hold", "--after", str(first))      # both together: held, and still waiting
+        self.assertEqual((self.state(parked), jobstore.find(parked)["after"]), ("held", [first]))
 
 
 if __name__ == "__main__":
