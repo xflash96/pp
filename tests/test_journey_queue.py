@@ -1148,7 +1148,6 @@ class TestTheCampaign(Lab):
         self.pp("queue", "add", "-q", "lab", "--from", "-", "--no-start", input="\n".join(bad) + "\n", code=2)
         self.assertEqual(self.all_ids(), before)
 
-    @unittest.expectedFailure
     def test_a_stage_waits_for_the_stage_before_it(self):
         """A job added with --after is queued until every job that selection named has ended. It is skipped
         rather than waited for, so it never becomes the head of its queue and a job behind it still starts. A

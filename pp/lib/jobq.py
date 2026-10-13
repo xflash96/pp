@@ -994,6 +994,32 @@ def _given(a, row: policy.Setting):
         ui.die(f"{_PROG}: {row.flag}: {e}", 2)
 
 
+def _after(spec: str, refuse) -> list[int]:
+    """The ids `--after SPEC` names, read as the job is queued. One flag's value, so it is one or more
+    selections separated by commas rather than several argv words.
+
+    Read once, here: the record keeps the ids, so a tag added to later is not picked up and a campaign file
+    is reproducible. An id no job has is a typo, and a job that waits forever for it is the worst outcome,
+    so one is a usage error and nothing is queued. That also makes a forward reference impossible, which is
+    what lets a campaign file be read top to bottom."""
+    specs = [w for w in (word.strip() for word in spec.split(",")) if w]
+    if not specs:
+        refuse("--after names the jobs to wait for: an id, a range (12-15) or a tag, separated by commas")
+    try:
+        return sorted({j["id"] for j in _resolve(specs)})    # machine-wide: an id names one job
+    except SystemExit:
+        refuse(f"--after {_text(spec, 80)}: it names a job that does not exist")
+
+
+# What a job's `--after` is still waiting for, as a view says it: one of two sentences, so `status` and
+# `show` say the same thing about the same record.
+def _after_str(ids: list, live: set) -> str:
+    """The jobs an `--after` named: the ids, and how many of them have not ended. A job whose record is gone
+    counts as ended, so an id nothing names is satisfied."""
+    left = [i for i in ids if i in live]
+    return _ranges(sorted(ids)) + (f" ({len(left)} still to end)" if left else " (all ended)")
+
+
 # The arguments of one `add`, which are the batch's and no line's of a campaign file: the queue the jobs go
 # to, the file the lines were read from, whether they are parked, and whether a worker starts for them. A
 # line that names one is refused, since a file cannot say it for the jobs of another line.
@@ -1051,6 +1077,8 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job, ap=None) -> int:
         job = {"queue": q, "tag": la.tag, "project": project_name(cwd), "cwd": cwd, "cmd": c, "runner": [],
                "shell_env": shell_env, "needs": needs, "owner": owner, "attempt": 1,
                **{r.on_record: gave[r.name] for r in JOB_ROWS if r.on_record != "needs"}}
+        if la.after:
+            job["after"] = _after(la.after, refuse)
         if prepare_job:
             prepare_job(job, la, project)
         return job
@@ -1135,6 +1163,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
     else:
         keep = lambda js: js   # noqa: E731
     running_all = [j for j in all_jobs if j["state"] == "running"]
+    live = {j["id"] for j in all_jobs if j["state"] in jobstore.LIVE}   # what an unmet `after` waits for
     per: dict = {}
     bad: list[str] = []         # a broken config stops launches, not this view of what is running
 
@@ -1222,6 +1251,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
                 why = waiting["why"] if waiting and waiting.get("id") == j["id"] else ""
                 nb = j.get("not_before") or 0
                 extra = " ".join(x for x in (_attempt_str(j), f"retry in {_in_delay(nb, now)}" if nb > now else "",
+                                             f"after {_after_str(j['after'], live)}" if j.get("after") else "",
                                              ui.c("waiting: " + why, "yellow") if why else "", _latest_note(j)) if x)
                 row = [j["id"], f"p{j.get('prio')}", _name(j), f"[{_text(j.get('project'))}]",
                        _needs_str(j.get("needs"))]
@@ -1308,6 +1338,8 @@ def cmd_show(a) -> int:
                      # a denied stop is not in flight: say so, or it reads as one still being carried out
                      + (f"; pp is not allowed to signal its group {j.get('pgid')}, so nothing more goes out"
                         if st.get("denied") else "")])
+    if j.get("after"):      # what it waits for besides a pool: the jobs it named when it was queued
+        rows.append(["after", _after_str(j["after"], {x["id"] for x in jobcore.jobs(jobstore.LIVE)})])
     if j.get("not_retried"):
         rows.append(["not retried", j["not_retried"]])
     if j.get("retry_of"):
@@ -1890,6 +1922,10 @@ def _parser(prog: str, doc: str, add_args=None):
     for row in JOB_ROWS + PROJECT_ROWS:     # one flag per row that has one, from the one declaration
         _flag(p, row)
     p.add_argument("--cwd", help="run there (default: here); also picks the project")
+    p.add_argument("--after", metavar="SELECTION",
+                   help="wait until every job this names has ended, whatever the outcome: ids, ranges and "
+                        "tags separated by commas (41,42 / 41-66 / s1_eval,s1_report), read as the job is "
+                        "added and kept as ids on its record")
     p.add_argument("--hold", action="store_true", help="park it as held until released")
     p.add_argument("--no-start", action="store_true", help="do not start a worker")
     p.add_argument("--from", dest="from_", metavar="FILE", help="one command per line; - for stdin")

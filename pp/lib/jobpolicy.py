@@ -360,10 +360,19 @@ def gpu_budget(p: dict, card: dict) -> float:
     return p["max"] if p["max"] is not None else round(max(card["total_gb"] - 2, 0), 1)
 
 
-def ready(queued: list[dict], now: float) -> list[dict]:
-    """The queued jobs a pass may start. A job waiting out a retry's delay is skipped, not waited for, so it
-    never becomes the head of its queue."""
-    return [j for j in queued if (j.get("not_before") or 0) <= now]
+def ready(queued: list[dict], now: float, live=()) -> list[dict]:
+    """The queued jobs a pass may start: the ones whose retry delay is up and whose `after` is met.
+
+    A job that is not ready is skipped, not waited for, so it never becomes the head of its queue and the
+    jobs behind it still start (I17). A retry's delay and an unmet `after` are the same filter, which is why
+    neither can hold a queue up.
+
+    `live` is every queue's queued, held and running jobs, because an id names one job machine-wide: an
+    `after` is met when no id in it names a job that is still one of those three, and an id whose record is
+    gone counts as ended, so a dropped job frees the stage behind it (I26)."""
+    waiting = {j["id"] for j in live}
+    return [j for j in queued
+            if (j.get("not_before") or 0) <= now and not waiting.intersection(j.get("after") or ())]
 
 
 def check(needs: dict, seen: dict) -> str | None:
@@ -447,19 +456,20 @@ def fits(job: dict, running: list[dict], seen: dict) -> tuple[bool, str, int | N
 def admit(state: dict, seen: dict, settings: dict) -> Pass:
     """One launch pass: which of the queued jobs start, on which card, and what the head waited for.
 
-    state is the records the pass read inside its own transaction: {queued, running}, the queued ones of this
-    queue in run order (prio, then id) and every queue's running ones, since a shared pool counts them all.
-    settings is {backfill, now}.
+    state is the records the pass read inside its own transaction: {queued, live}, the queued ones of this
+    queue in run order (prio, then id) and every queue's queued, held and running ones. One listing with no
+    queue filter answers both of the questions that need every queue: a shared pool counts every queue's
+    running jobs, and an id an `after` names is machine-wide (I26). settings is {backfill, now}.
 
     Strict head-of-line by priority: the first job that does not fit ends the pass, so a big job is never
     starved by small ones. With backfill the pass goes on past it, and the job that did not fit is still the
-    one the head waits for. A job waiting out a retry's delay is skipped, not waited for (`ready`), so it
-    never becomes the head. What this pass has taken counts against the next job in it, as the record it is
-    about to become: on the card it took, and launched now, so a reading older than its settle window does
-    not show the next job room that is already taken."""
-    running = list(state["running"])
+    one the head waits for. A job that is not ready, by its retry delay or by its `after`, is skipped and
+    not waited for (`ready`), so it never becomes the head. What this pass has taken counts against the next
+    job in it, as the record it is about to become: on the card it took, and launched now, so a reading older
+    than its settle window does not show the next job room that is already taken."""
+    running = [j for j in state["live"] if j["state"] == "running"]
     starts, blocked = [], (None, "")
-    for job in ready(state["queued"], settings["now"]):
+    for job in ready(state["queued"], settings["now"], state["live"]):
         ok, why, card = fits(job, running, seen)
         if not ok:
             if blocked[0] is None:

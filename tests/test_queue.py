@@ -3909,6 +3909,12 @@ class TestThePolicyTables(unittest.TestCase):
         return {"id": jid, "queue": "default", "state": "queued", "prio": 10, "needs": needs or {"slots": 1},
                 **kw}
 
+    def pass_read(self, queued, running=(), held=()):
+        """What one launch pass read inside its own transaction: this queue's queued jobs in run order, and
+        every queue's live ones under one listing with no queue filter, which is where a shared pool's count
+        and an unmet `after` both come from."""
+        return {"queued": list(queued), "live": list(queued) + list(running) + list(held)}
+
     def test_what_one_launch_pass_admits(self):
         """One pass, over every class of pool and every way one can be held: a number, a reading, a settle
         window, and nothing providing it at all. Strict head-of-line unless the pass backfills, and a job
@@ -3952,7 +3958,7 @@ class TestThePolicyTables(unittest.TestCase):
         ]
         for what, pools, probes, queued, running, backfill, starts, blocked in rows:
             with self.subTest(what):
-                p = jobpolicy.admit({"queued": queued, "running": running}, self.seen(pools, probes=probes),
+                p = jobpolicy.admit(self.pass_read(queued, running), self.seen(pools, probes=probes),
                                     {"backfill": backfill, "now": now})
                 self.assertEqual([j["id"] for j, _card in p.starts], starts)
                 self.assertEqual(None if p.blocked[0] is None else p.blocked[0]["id"], blocked)
@@ -3962,33 +3968,57 @@ class TestThePolicyTables(unittest.TestCase):
     def test_the_head_of_the_queue_and_the_jobs_behind_it(self):
         """Strict head-of-line by priority: the first job that does not fit ends the pass, so a big job is
         never starved by small ones. With backfill the pass goes on past it, and the job that did not fit is
-        still the one the head waits for. A job in its retry delay is skipped, not waited for."""
+        still the one the head waits for.
+
+        A job that is not ready is skipped and not waited for, by its retry delay or by its `after`, so it
+        never becomes the head and the jobs behind it still start. An `after` is met when no id in it names
+        a job that is queued, held or running in any queue, and an id whose record is gone counts as
+        ended."""
         now = 2000.0
         big, small = self.job(1, needs={"slots": 3}), self.job(2, needs={"slots": 1})
         delayed = self.job(3, needs={"slots": 1}, not_before=now + 60)
         for backfill in (False, True):
             with self.subTest(backfill=backfill, fits="the head, and what it took leaves no room"):
-                p = jobpolicy.admit({"queued": [big, small], "running": []}, self.seen([self.pool(mx=3)]),
+                p = jobpolicy.admit(self.pass_read([big, small]), self.seen([self.pool(mx=3)]),
                                     {"backfill": backfill, "now": now})
                 self.assertEqual([j["id"] for j, _c in p.starts], [1])   # backfill invents no room
                 self.assertEqual(p.blocked[0]["id"], 2)
             with self.subTest(backfill=backfill, fits="the head, with room behind it"):
-                p = jobpolicy.admit({"queued": [big, small], "running": []}, self.seen([self.pool(mx=4)]),
+                p = jobpolicy.admit(self.pass_read([big, small]), self.seen([self.pool(mx=4)]),
                                     {"backfill": backfill, "now": now})
                 self.assertEqual([j["id"] for j, _c in p.starts], [1, 2])
                 self.assertIsNone(p.blocked[0])
             with self.subTest(backfill=backfill, fits="not the head"):
-                p = jobpolicy.admit({"queued": [big, small], "running": []}, self.seen([self.pool(mx=2)]),
+                p = jobpolicy.admit(self.pass_read([big, small]), self.seen([self.pool(mx=2)]),
                                     {"backfill": backfill, "now": now})
                 self.assertEqual([j["id"] for j, _c in p.starts], [2] if backfill else [])
                 self.assertEqual(p.blocked[0]["id"], 1)     # the head is what the queue waits for, either way
-        with self.subTest("a job in its delay is skipped and never the head"):
-            p = jobpolicy.admit({"queued": [delayed, small], "running": []}, self.seen([self.pool(mx=3)]),
-                                {"backfill": False, "now": now})
-            self.assertEqual([j["id"] for j, _c in p.starts], [2])
+        for backfill in (False, True):
+            with self.subTest(backfill=backfill, what="a job in its delay is skipped and never the head"):
+                p = jobpolicy.admit(self.pass_read([delayed, small]), self.seen([self.pool(mx=3)]),
+                                    {"backfill": backfill, "now": now})
+                self.assertEqual([j["id"] for j, _c in p.starts], [2])
+                self.assertIsNone(p.blocked[0])
+            # an unmet `after` is the same filter as a delay: the job is skipped, the jobs behind it start,
+            # and it never becomes the head, which is why a stage that waits cannot hold a queue up
+            for what, live, starts in (("queued elsewhere", [self.job(9, queue="other")], [2]),
+                                       ("held elsewhere", [self.job(9, queue="other", state="held")], [2]),
+                                       ("running elsewhere", [self.job(9, queue="other", state="running",
+                                                                       needs={})], [2]),
+                                       ("its record gone", [], [3, 2])):
+                waits = self.job(3, after=[9])
+                with self.subTest(backfill=backfill, after=what):
+                    p = jobpolicy.admit(self.pass_read([waits, small], live), self.seen([self.pool(mx=3)]),
+                                        {"backfill": backfill, "now": now})
+                    self.assertEqual([j["id"] for j, _c in p.starts], starts)
+                    self.assertIsNone(p.blocked[0])
+        with self.subTest("one id of an after that has ended and one that has not"):
+            p = jobpolicy.admit(self.pass_read([self.job(3, after=[8, 9])], [self.job(9, queue="other")]),
+                                self.seen([self.pool(mx=3)]), {"backfill": False, "now": now})
+            self.assertEqual(p.starts, ())
             self.assertIsNone(p.blocked[0])
         with self.subTest("what the pass has taken counts against the next job in it"):
-            p = jobpolicy.admit({"queued": [small, self.job(4, needs={"slots": 1})], "running": []},
+            p = jobpolicy.admit(self.pass_read([small, self.job(4, needs={"slots": 1})]),
                                 self.seen([self.pool(mx=1)]), {"backfill": False, "now": now})
             self.assertEqual([j["id"] for j, _c in p.starts], [2])
             self.assertEqual(p.blocked[0]["id"], 4)
@@ -4004,12 +4034,12 @@ class TestThePolicyTables(unittest.TestCase):
         self.assertEqual(jobpolicy.gpu_budget(pools[0], cards[0]), 22.0)
         self.assertEqual(jobpolicy.gpu_budget({**pools[0], "max": 10}, cards[0]), 10)
         with self.subTest("the card that fits"):
-            p = jobpolicy.admit({"queued": [want], "running": []}, self.seen(pools, cards=cards),
+            p = jobpolicy.admit(self.pass_read([want]), self.seen(pools, cards=cards),
                                 {"backfill": False, "now": now})
             self.assertEqual([(j["id"], c) for j, c in p.starts], [(1, 1)])
         with self.subTest("a card another job has reserved"):
             on = [{**self.job(9, state="running", needs={"gpu_gb": 20}), "cards": [1], "started": 100.0}]
-            p = jobpolicy.admit({"queued": [want], "running": on}, self.seen(pools, cards=cards),
+            p = jobpolicy.admit(self.pass_read([want], on), self.seen(pools, cards=cards),
                                 {"backfill": False, "now": now})
             self.assertEqual(p.starts, ())
             self.assertIn("reserved", p.blocked[1])
@@ -4019,13 +4049,13 @@ class TestThePolicyTables(unittest.TestCase):
             wide = [{**self.pool(name="gpu_gb", mx=24, settle=30.0), "where": "[resources] gpu_gb"}]
             big = self.job(1, needs={"gpu_gb": 16})
             on = [{**self.job(9, state="running", needs={"gpu_gb": 8}), "cards": [1], "started": 1990.0}]
-            p = jobpolicy.admit({"queued": [big], "running": on},
+            p = jobpolicy.admit(self.pass_read([big], on),
                                 self.seen(wide, cards=[card(0, total=24, used=24), card(1, total=24, used=4)],
                                           cards_t=1980.0), {"backfill": False, "now": now})
             self.assertEqual(p.starts, ())
             self.assertIn("not allocated yet", p.blocked[1])
         with self.subTest("no card at all"):
-            p = jobpolicy.admit({"queued": [want], "running": []}, self.seen(pools, cards=None),
+            p = jobpolicy.admit(self.pass_read([want]), self.seen(pools, cards=None),
                                 {"backfill": False, "now": now})
             self.assertEqual(p.starts, ())
             self.assertIn("nvidia-smi", p.blocked[1])
@@ -4109,7 +4139,7 @@ class TestThePolicyTables(unittest.TestCase):
         """Pure: the records and the readings a rule is handed come back as they were, and the same input
         twice gives the same value. So a table is the whole of the rule."""
         now = 2000.0
-        state = {"queued": [self.job(1), self.job(2)], "running": [self.job(9, state="running")]}
+        state = self.pass_read([self.job(1), self.job(2)], [self.job(9, state="running")])
         seen = self.seen([self.pool(mx=2)])
         before = json.dumps([state, {k: v for k, v in seen.items() if k != "probes"}], sort_keys=True)
         first = jobpolicy.admit(state, seen, {"backfill": False, "now": now})
@@ -4247,7 +4277,7 @@ class TestTheSettingsTable(unittest.TestCase):
         rows = jobq.JOB_ROWS + jobq.PROJECT_ROWS
         self.assertEqual({r.flag for r in rows} - flags, set(), "these rows have no flag on add")
         self.assertEqual(flags - {r.flag for r in rows},
-                         {"--help", "--queue", "--tag", "--cwd", "--hold", "--no-start", "--from"})
+                         {"--help", "--queue", "--tag", "--cwd", "--after", "--hold", "--no-start", "--from"})
 
 
 class TestTheSettingsSources(QueueCase):
@@ -5617,6 +5647,71 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
             for _ in range(3):
                 w.carry_out()
             self.assertEqual(went, [(signal.SIGKILL, group)])
+
+
+class TestAnUnmetAfter(InjectedCase):
+    """What a job that names the jobs it waits for is held by, and where that is read."""
+
+    def test_an_unmet_after_is_read_across_every_queue(self):
+        """An id names one job machine-wide, so a launch pass reads the jobs an `after` names with no queue
+        filter, inside its own transaction. Stage one in another queue than stage two is the fault this
+        guards: a pass reading its own queue alone would find no record for a stage-one job sitting
+        elsewhere and would start stage two at once.
+
+        A job that is queued, held or running has not ended, in any queue. A job whose record is gone has,
+        so dropping one frees the stage behind it instead of deadlocking it."""
+        self.config("slots = 3", q="lab")
+        self.config("slots = 3", q="r1")
+        one, gone = self.add(q="lab"), self.add(q="lab")
+        two = self.add("--after", f"{one},{gone}", q="r1")
+        self.assertEqual(jobstore.find(two)["after"], sorted([one, gone]))
+        wl, wr = jobq.worker_for("lab"), jobq.worker_for("r1")
+        wr.tick()
+        self.assertEqual(self.state(two), "queued")             # both are queued, in another queue
+        self.assertEqual(self.call("hold", str(one))[0], 0)
+        wr.tick()
+        self.assertEqual(self.state(two), "queued")             # a held job has not ended either
+        self.assertEqual(self.call("drop", "-y", str(gone))[0], 0)
+        wr.tick()
+        self.assertEqual(self.state(two), "queued")             # the other one is still there
+        self.assertEqual(self.call("release", "--no-start", str(one))[0], 0)
+        self.run_until(wl, lambda: self.state(one) == "done")
+        self.run_until(wr, lambda: self.state(two) == "done")
+
+    def test_a_job_that_waits_never_becomes_the_head_of_its_queue(self):
+        """A job whose `after` is unmet is skipped, not waited for, so a job behind it in run order still
+        starts and the queue is never held up by a stage that is waiting (I17)."""
+        self.config("slots = 1")
+        one = self.add(q="lab")
+        waits = self.add("--after", str(one), "--prio", "0")
+        behind = self.add("--prio", "5")
+        w = jobq.worker_for("default")
+        self.run_until(w, lambda: self.state(behind) == "done")
+        self.assertEqual(self.state(waits), "queued")           # better priority, and never the head
+        self.run_until(jobq.worker_for("lab"), lambda: self.state(one) == "done")
+        self.run_until(w, lambda: self.state(waits) == "done")
+
+    def test_an_after_is_read_as_the_job_is_added_and_an_id_no_job_has_is_refused(self):
+        """The selection is read once, as the job is queued, and the record keeps the ids: a tag added to
+        later is not picked up, which is what makes a campaign file reproducible. An id no job has is a typo
+        and a job waiting forever for it is the worst outcome, so it is a usage error and nothing is queued.
+        A job may name a tag, and then it waits for the jobs that carried it at that moment."""
+        first = self.add("--tag", "s1_eval")
+        named = self.add("--after", "s1_eval")
+        self.assertEqual(jobstore.find(named)["after"], [first])
+        later = self.add("--tag", "s1_eval")                    # a second job of that name, added after
+        self.assertEqual(jobstore.find(named)["after"], [first])
+        self.assertNotIn(later, jobstore.find(named)["after"])
+        before = sorted(j["id"] for j in jobstore.jobs())
+        for spec in ("999999", "9-99", "s1_nothing", ","):
+            with self.subTest(after=spec):
+                rc, _out, err = self.call("add", "--no-start", "--cwd", self.work, "--after", spec,
+                                          "--", "true")
+                self.assertEqual(rc, 2, err)
+                self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
+        plain = self.add()
+        self.assertNotIn("after", jobstore.find(plain))         # absent on a job that names none
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -449,7 +449,9 @@ class Worker:
             # admitting from a shared pool and a verb may have changed the job since it was listed (prio, a note)
             with jobstore.txn() as s:
                 here = [cur for j in queued if (cur := s.job(j["id"], must_be=("queued",))) is not None]
-                p = policy.admit({"queued": here, "running": s.jobs("running")}, seen,
+                # every queue's live jobs, with no queue filter: a shared pool counts every queue's running
+                # ones, and an id an unmet `after` names is machine-wide (I26)
+                p = policy.admit({"queued": here, "live": s.jobs(jobstore.LIVE)}, seen,
                                  {"backfill": self.backfill, "now": now})
                 for cur, card in p.starts:
                     # the run claim before the record says running, so a reader never sees a running job with
