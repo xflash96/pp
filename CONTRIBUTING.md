@@ -149,6 +149,13 @@ These rules keep pp working as commands come and go:
   command, two workers, a signal and a write) go through a construct that
   is written once. "The constructs" below is the list of them, and a check
   added at one call site is not a fix.
+- A test checks a contract, not a wording. Every sentence pp prints may be
+  reworded in a patch, so a test asserts an exit status, a `--json` field, a
+  record field, a file's existence or its mode, an id, or a state, and nothing
+  else. Where a test has to know that pp said something, it asserts the field
+  the sentence was made from. Two exceptions are written down where they are
+  made: a journey types the examples of `pp help NAME`, and one journey step
+  holds the headings and the line width of `pp help queue`.
 - A test of a construct checks what the construct promises. A test that
   runs a second actor at an exact step keeps one fix from coming back
   (`TestTwoAtOnce` in `tests/test_queue.py`). That step goes through
@@ -248,6 +255,54 @@ replacing a whole file in one step goes through `paths.write_json`.
 `paths.self_cmd` and `cmd._source_tree` tell the three apart.
 `tests/test_cmd.py` and `ci/package` keep the installed case working, and
 the journeys in `tests/test_journey_cmd.py` the other two.
+
+### The queue's four modules, and what may go where
+
+The line between them is mechanism against policy, and a change goes to the
+module whose job it is:
+
+- `pp/lib/jobstore.py` is the record store and its transaction: one lock, no
+  timing, no process, no signal. A field a record gains and a write a verb
+  hands over go here.
+- `pp/lib/jobcore.py` is the worker and the claims: starting, stopping,
+  reaping and adopting a job's processes, the worker's loop, and the watchers.
+  A bug here loses a job, which is why it is the module held still.
+- `pp/lib/jobpolicy.py` is every rule that is values in and one value out: how
+  a job ends, what a selection names, what a setting comes to, what a job's
+  environment is. A rule goes here, and a table tests it.
+- `pp/lib/jobq.py` is the verbs, the views, the readings, the one settings
+  declaration and the CLI, and `pp/commands/queue.py` is the command and its
+  help. Every sentence a user reads is worded here.
+
+The store and the worker together are the core. These rules hold that line,
+and `tests/test_constructs.py` reads the source for each:
+
+- The boundary rule. Outside the core no function takes the store lock, and
+  none starts a job, a runner, a stop command, a hook or a worker, or signals
+  a job, a worker or a process group: a verb goes through the core's API, where
+  every write is one call and one whole transaction. Two sites outside it run a
+  process of their own, and both are named exemptions: `reading`, which runs a
+  user's probe under that probe's own claim, and `_cards`, which runs
+  nvidia-smi.
+- The purity rule. A function of `jobpolicy.py` reaches no clock, no store, no
+  process, no signal and no file. It is handed records, readings, settings and
+  `now`, and gives back a value, so a rule that could be raced is a rule no
+  table tests.
+- The import rule. `jobpolicy.py` imports nothing of pp's, the store imports
+  nothing of the worker, and neither imports the verbs above them. The
+  direction is a line, so no cycle can hide a rule that reads a mechanism.
+- The core reads no config file and takes no reading of its own: `read_settings`
+  hands a worker the settings of one pass of its loop, and `admit_for` the
+  readings of one launch pass. It writes no sentence either: it tells a sink
+  what it did, and `jobq` words every one of them.
+- The budgets, in code lines that are neither blank, comment nor docstring:
+  250 for the store, 490 for the worker, 730 for the two together. A feature
+  that cannot be built without going over one of them waits until something
+  leaves the core, and moving a rule out into `jobpolicy.py` is the first thing
+  to try.
+- Every function of the store and of the worker is named in one of the two
+  lists in that file, so a construct is placed when it lands, and a name that
+  has gone comes off the list in the same change.
 
 ### Where a queue's jobs live, and how one says it is alive
 
