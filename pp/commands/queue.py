@@ -38,13 +38,18 @@ Agents: run `pp queue wait ID` in the background (or `pp queue watch ID` under a
 how the job ended, without polling and without anything typed into your terminal; `add` prints this hint to
 an agent.
 
-IDs are numbers, ranges (12-15) or a tag (add --tag NAME: at most 64 of letters, digits and . _ - :). A job
-added without --tag has no tag, and its id names it. -q narrows a selection to one queue. A job named by its
-id must suit the verb, or it is an error; a
-range, or a tag several jobs share, leaves the jobs it does not suit as they are, and kill and drop show such a
-selection and ask first (-y: do not ask, -n: only show). Lower --prio runs first (default 10), ties by id. Each
-queue is strict head-of-line unless its own backfill is on, so a big job is never starved by small
-ones. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what
+Selecting jobs: every verb that takes jobs takes the same five forms. 12 is one job by id (ids are
+machine-wide), 12-15 a range of ids, NAME every job with that tag, --prefix P every job whose tag starts with
+P (repeatable), and -q NAME --all every job of one queue (a usage error without -q). A tag is add --tag NAME,
+at most 64 of letters, digits and . _ - : ; a job added without one has no tag and its id names it. -q
+narrows any selection to one queue, and a tag or a prefix that names jobs in two queues is an error that
+lists the ids. There is no glob. A job named by its own id must suit the verb, or it is an error; any other
+form leaves the jobs it does not suit as they are and says which, so a driver that runs twice is no error the
+second time, while a selection that matches no job at all is an error. kill, drop and clean show a selection
+of more than one job and ask first (-y: do not ask, -n: only show).
+
+Lower --prio runs first (default 10), ties by id. Each queue is strict head-of-line unless its own backfill
+is on, so a big job is never starved by small ones. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what
 it meant in your shell.
 
 A job's environment, later entries winning: the worker's (that of the `pp queue add` that started it, without an

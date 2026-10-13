@@ -3561,26 +3561,77 @@ class TestThePolicyTables(unittest.TestCase):
                     self.assertRaises(ValueError, jobpolicy.tag, value)
 
     # -- select: the forms a selection takes -----------------------------------------------------------------
+    # Records of two queues, of all five states, one of them with no name of its own: what every form of the
+    # grammar is read against below.
+    RECORDS = [{"id": 3, "tag": "c3_recall.s0", "queue": "a", "state": "queued"},
+               {"id": 5, "tag": "c3_recall.s1", "queue": "a", "state": "held"},
+               {"id": 8, "tag": "c3_shift.s0", "queue": "a", "state": "running"},
+               {"id": 12, "tag": "s3_eval", "queue": "b", "state": "done"},
+               {"id": 13, "tag": "s3_eval", "queue": "b", "state": "failed"},
+               {"id": 20, "tag": None, "queue": "b", "state": "queued"}]
+    SPANS = [{"id": 3, "tag": "same", "queue": "a", "state": "queued"},
+             {"id": 5, "tag": "same", "queue": "b", "state": "running"}]
+
     def test_which_jobs_a_selection_names(self):
-        """An id, a range and a tag matched whole, over the records they are read against: in the order the
-        specs were given, each id once, and the ids of one spec in id order. A form that names no record
-        gives back nothing, for the verb to refuse."""
-        records = [{"id": 3, "tag": "sweep", "queue": "a"}, {"id": 5, "tag": "sweep", "queue": "b"},
-                   {"id": 12, "tag": "once", "queue": "a"}]
-        rows = [("5", ["5"], [5]), ("one id", ["12"], [12]), ("an id nothing holds", ["99"], []),
-                ("a range over several", ["3-5"], [3, 5]),
-                ("a range over one", ["12-12"], [12]),
-                ("a range over none", ["6-11"], []),
-                ("a tag over several", ["sweep"], [3, 5]),
-                ("a tag over one", ["once"], [12]),
-                ("a tag nothing carries", ["nope"], []),
-                ("two specs, in the order given", ["12", "3-5"], [12, 3, 5]),
-                ("each id once, however many specs name it", ["sweep", "3", "3-5"], [3, 5]),
-                ("one spec, as a string", "sweep", [3, 5])]
-        for what, selection, want in rows:
+        """The five forms of the grammar and no others, over the records they are read against: an id, a range,
+        a tag matched whole, a prefix of a name, and every job of the queue -q names.
+
+        Every form against every class of answer it can give (one job, several, none), over records of two
+        queues and of all five states, since no form reads a state or a queue: the narrowing is the caller's,
+        which hands in the records of the queue -q named. The answer is in the order the specs were given,
+        each id once, and the ids of one spec in id order; a form that names no record gives back nothing, for
+        the verb to refuse."""
+        P, A = jobpolicy.PREFIX, jobpolicy.ALL
+        every = [3, 5, 8, 12, 13, 20]
+        rows = [
+            (jobpolicy.ID, "one", self.RECORDS, "8", [8]),
+            (jobpolicy.ID, "one", self.RECORDS, "20", [20]),            # a job with no name, by its id
+            (jobpolicy.ID, "none", self.RECORDS, "99", []),
+            (jobpolicy.RANGE, "one", self.RECORDS, "12-12", [12]),
+            (jobpolicy.RANGE, "several", self.RECORDS, "3-8", [3, 5, 8]),
+            (jobpolicy.RANGE, "several", self.RECORDS, "13-20", [13, 20]),   # two queues, and an unnamed job
+            (jobpolicy.RANGE, "none", self.RECORDS, "14-19", []),
+            (jobpolicy.TAG, "one", self.RECORDS, "c3_shift.s0", [8]),
+            (jobpolicy.TAG, "several", self.RECORDS, "s3_eval", [12, 13]),
+            (jobpolicy.TAG, "several", self.SPANS, "same", [3, 5]),          # two queues: the caller refuses
+            (jobpolicy.TAG, "none", self.RECORDS, "nothing_carries_this", []),
+            (P, "one", self.RECORDS, (P, "c3_shift"), [8]),
+            (P, "several", self.RECORDS, (P, "c3_"), [3, 5, 8]),
+            (P, "several", self.SPANS, (P, "sa"), [3, 5]),
+            (P, "none", self.RECORDS, (P, "zz"), []),
+            (P, "several", self.RECORDS, (P, ""), every[:-1]),               # never a job with no name
+            (A, "several", self.RECORDS, (A, None), every),
+            (A, "one", self.RECORDS[:1], (A, None), [3]),
+            (A, "none", [], (A, None), []),
+        ]
+        for form, size, records, selection, want in rows:
+            with self.subTest(form=form, size=size, selection=selection):
+                self.assertEqual(jobpolicy.kind(selection), form)
+                self.assertEqual(jobpolicy.select(records, selection), want)    # one spec, as it is
+                self.assertEqual(jobpolicy.select(records, [selection]), want)  # and in a list of one
+        # every form against every class of answer, with the one that cannot happen asserted impossible: an id
+        # names one job machine-wide, so no id ever names two
+        classes = {(form, size) for form, size, *_rest in rows}
+        self.assertEqual(classes | {(jobpolicy.ID, "several")},
+                         {(f, s) for f in (jobpolicy.ID, jobpolicy.RANGE, jobpolicy.TAG, P, A)
+                          for s in ("one", "several", "none")})
+        for j in self.RECORDS:
+            self.assertEqual(jobpolicy.select(self.RECORDS, str(j["id"])), [j["id"]])
+            # no form reads a state: a job of any of the five is named by its name as readily as by its id
+            self.assertIn(j["id"], jobpolicy.select(self.RECORDS, (A, None)))
+            if j["tag"]:
+                self.assertEqual(jobpolicy.select(self.RECORDS, j["tag"]),
+                                 sorted(x["id"] for x in self.RECORDS if x["tag"] == j["tag"]))
+        several = [("two specs, in the order given", ["12", "3-8"], [12, 3, 5, 8]),
+                   ("each id once, however many specs name it", ["s3_eval", "12", "12-13"], [12, 13]),
+                   ("the forms that are flags, beside the words", [(P, "c3_"), "12"], [3, 5, 8, 12]),
+                   ("--all after a word names what is left of the queue", ["12", (A, None)],
+                    [12, 3, 5, 8, 13, 20])]
+        for what, selection, want in several:
             with self.subTest(what):
-                self.assertEqual(jobpolicy.select(records, selection), want)
-        for spec, form in (("7", "id"), ("12-15", "range"), ("sweep", "tag"), ("12-", "tag"), ("", "tag")):
+                self.assertEqual(jobpolicy.select(self.RECORDS, selection), want)
+        for spec, form in (("7", jobpolicy.ID), ("12-15", jobpolicy.RANGE), ("sweep", jobpolicy.TAG),
+                           ("12-", jobpolicy.TAG), ("", jobpolicy.TAG), ((P, "s"), P), ((A, None), A)):
             self.assertEqual(jobpolicy.kind(spec), form)
 
     # -- admit: what one launch pass starts, and what the head waits for -------------------------------------

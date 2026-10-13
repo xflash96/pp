@@ -462,29 +462,46 @@ def tag(v: str) -> str:
     return v
 
 
-def kind(spec: str) -> str:
-    """Which form of the selection grammar this is: an id, a range (12-15), or a tag matched whole."""
+ID, RANGE, TAG = "id", "range", "tag"
+PREFIX = "prefix"       # --prefix P: every job whose name starts with P, repeatable
+ALL = "all"             # --all: every job of the queue -q names, and a usage error without one
+
+
+def kind(spec) -> str:
+    """Which form of the selection grammar this spec is: an id, a range (12-15), a tag matched whole, a
+    prefix of a tag, or every job of one queue.
+
+    The first three are a word the verb was given. The two that are flags are (form, value) pairs, since no
+    word tells them apart from a tag."""
+    if isinstance(spec, tuple):
+        return spec[0]
     if re.fullmatch(r"\d+-\d+", spec):
-        return "range"
-    return "id" if spec.isdigit() else "tag"
+        return RANGE
+    return ID if spec.isdigit() else TAG
 
 
 def select(records: list[dict], selection) -> list[int]:
     """The ids these specs name, over the records they are read against: in the order the specs were given,
-    each id once, and the ids of one spec in id order.
+    each id once, and the ids of one spec in id order. The five forms of the grammar and no others.
 
-    One spec, or several. A form that names no record gives back nothing, and the caller refuses: nothing
+    One spec, or several. A job with no name is named by its id or by a range alone, so neither a tag nor a
+    prefix ever matches one. A form that names no record gives back nothing, and the caller refuses: nothing
     here reads the store or writes a sentence."""
     out: list[int] = []
-    for spec in ([selection] if isinstance(selection, str) else selection):
+    for spec in ([selection] if isinstance(selection, (str, tuple)) else selection):
         form = kind(spec)
-        if form == "range":
-            lo, hi = (int(x) for x in spec.split("-"))
+        value = spec[1] if isinstance(spec, tuple) else spec
+        if form == RANGE:
+            lo, hi = (int(x) for x in value.split("-"))
             hits = [j["id"] for j in records if lo <= j["id"] <= hi]
-        elif form == "id":
-            hits = [j["id"] for j in records if j["id"] == int(spec)]
+        elif form == ID:
+            hits = [j["id"] for j in records if j["id"] == int(value)]
+        elif form == TAG:
+            hits = [j["id"] for j in records if j.get("tag") == value]
+        elif form == PREFIX:
+            hits = [j["id"] for j in records if j.get("tag") and j["tag"].startswith(value)]
         else:
-            hits = [j["id"] for j in records if j.get("tag") == spec]
+            hits = [j["id"] for j in records]
         out += [jid for jid in sorted(hits) if jid not in out]
     return out
 

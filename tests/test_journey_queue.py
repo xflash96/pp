@@ -1139,7 +1139,6 @@ class TestTheLanesAndTheFamilies(Lab):
     """Steps 9 and 10: a lane is a single-slot queue that --all names on its own, and a family is steered by
     the start of its name."""
 
-    @unittest.expectedFailure
     def test_a_single_slot_queue_is_a_lane_and_all_names_only_it(self):
         """--all with -q names every job of that queue whatever its tag, and no job of another queue. Without
         -q it is a usage error. A hold before a kill keeps the lane from starting anything between the kill and
@@ -1161,7 +1160,6 @@ class TestTheLanesAndTheFamilies(Lab):
         self.pp("queue", "hold", "--all", code=2)
         self.pp("queue", "drop", "recall_A10", "-n", code=2)     # a tag over two queues names the ids
 
-    @unittest.expectedFailure
     def test_a_family_is_steered_by_prefix(self):
         """--prefix matches from the first character of a tag and is repeatable, and the union of two that
         overlap is taken once. A release over a family that is already queued exits 0 and leaves those jobs as

@@ -665,38 +665,77 @@ def _stamp_reported(jid: int, verb: str):
 
 # ---- helpers for verbs ----------------------------------------------------------------------------
 
-def _resolve(specs: list[str], scope: list[str] | None = None) -> list[dict]:
-    """Jobs named by ids, ranges (12-15) or exact tags, in the order given, without duplicates. Ids are global.
-    Each carries _bulk: it came from a range or a tag naming several jobs, so a verb skips it when it is in a state
-    the verb does not apply to, where a job named on its own is an error."""
+def _specs(a) -> list:
+    """The selection this verb was given, as the five forms `jobpolicy.select` reads: the words it was given
+    (an id, a range, a tag), then each --prefix, then --all, which names every job of the queue -q names and
+    is a usage error without one.
+
+    Empty where the verb was given no selection at all, which `wait`, `watch` and `clean` each have their own
+    meaning for and every other verb refuses."""
+    out: list = list(getattr(a, "ids", None) or [])
+    one = getattr(a, "id", None)
+    out += [one] if one else []
+    out += [(policy.PREFIX, pre) for pre in getattr(a, "prefix", None) or []]
+    if getattr(a, "all", False):
+        if not a.scope:
+            ui.die(f"{_PROG}: --all names every job of one queue, so it takes -q NAME", 2)
+        out.append((policy.ALL, None))
+    return out
+
+
+def _said(spec) -> str:
+    """One spec as the sentence that refuses it names it: the word the verb was given, or the flag it came
+    from."""
+    form = policy.kind(spec)
+    if form == policy.PREFIX:
+        return f"--prefix {spec[1]}"
+    return "--all" if form == policy.ALL else f"'{spec}'"
+
+
+def _named(a, verb: str) -> list[dict]:
+    """The jobs this verb was given, with a refusal where it was given no selection: every verb that takes
+    jobs takes the same five forms, and none of them acts on every job of the machine by default."""
+    specs = _specs(a)
+    if not specs:
+        ui.die(f"{_PROG} {verb}: name the jobs: an id, a range (12-15), a tag, --prefix P, or --all with -q", 2)
+    return _resolve(specs, a.scope)
+
+
+def _resolve(specs: list, scope: list[str] | None = None) -> list[dict]:
+    """The jobs these specs name, in the order given, without duplicates. Ids are machine-wide, so the default
+    scope is every queue and -q narrows it.
+
+    Each carries _bulk: it was named by a form other than its own id, so a verb leaves it as it is where it is
+    in a state the verb does not suit, while a job named by its id there is an error."""
     records = jobcore.jobs(queue=scope)
     by_id = {j["id"]: j for j in records}
     out, seen = [], set()
     for spec in specs:
-        hits = [by_id[i] for i in policy.select(records, spec)]      # the five forms, over these records
-        if policy.kind(spec) == "tag":
+        form = policy.kind(spec)
+        hits = [by_id[i] for i in policy.select(records, [spec])]    # the five forms, over these records
+        if form in (policy.TAG, policy.PREFIX):
             qs = sorted({j["queue"] for j in hits})
             if len(qs) > 1:
-                ui.die(f"{_PROG}: tag '{spec}' names jobs in queues {', '.join(qs)}: "
+                ui.die(f"{_PROG}: {_said(spec)} names jobs in queues {', '.join(qs)}: "
                        + ", ".join(f"{j['id']} ({j['queue']})" for j in hits) + "; use ids, or -q", 2)
         if not hits:
-            ui.die(f"{_PROG}: no job matches '{spec}'", 2)
+            ui.die(f"{_PROG}: no job matches {_said(spec)}", 2)
         for j in hits:
             if j["id"] not in seen:
                 seen.add(j["id"])
-                out.append({**j, "_bulk": policy.kind(spec) == "range" or len(hits) > 1})
+                out.append({**j, "_bulk": form != policy.ID})
     return out
 
 
-def _one(spec: str, verb: str, scope: list[str] | None = None) -> dict:
-    """The job show, note and log act on. A tag naming several jobs (a retry keeps the tag): the newest, said so;
-    note refuses, since a note on the wrong job misleads."""
-    hits = _resolve([spec], scope)
+def _one(a, verb: str) -> dict:
+    """The job show, note and log act on. A selection naming several jobs (a retry keeps the name): the newest,
+    said so; note refuses, since a note on the wrong job misleads."""
+    hits = _named(a, verb)
     if len(hits) > 1:
         ids = ", ".join(str(j["id"]) for j in hits)
         if verb == "note":
-            ui.die(f"{_PROG} note: '{spec}' names jobs {ids}; note one by its id", 2)
-        ui.warn(f"{_PROG} {verb}: '{spec}' names jobs {ids}; showing the newest, {hits[-1]['id']}")
+            ui.die(f"{_PROG} note: {_said(_specs(a)[0])} names jobs {ids}; note one by its id", 2)
+        ui.warn(f"{_PROG} {verb}: {_said(_specs(a)[0])} names jobs {ids}; showing the newest, {hits[-1]['id']}")
     return hits[-1]
 
 
@@ -707,9 +746,9 @@ def _left(skipped: list[dict]) -> None:
 
 
 def _gate(a, jobs: list[dict], verb: str, ok: tuple) -> int | None:
-    """kill and drop: a job named by its id is acted on at once; a range or a tag naming several jobs is shown first
-    and asked about (-y: do not ask). -n only shows. None to go ahead, else the exit code."""
-    if not a.dry_run and not any(j["_bulk"] for j in jobs):
+    """kill and drop: a selection naming one job is acted on at once; one naming more is shown first and asked
+    about (-y: do not ask). -n only shows. None to go ahead, else the exit code."""
+    if not a.dry_run and len(jobs) < 2:
         return None
     hits = [j for j in jobs if j["state"] in ok]
     print(f"{verb} {len(hits)} job(s): "
@@ -1120,7 +1159,7 @@ def _pool_str(p: dict, now: float) -> str:
 
 
 def cmd_show(a) -> int:
-    j = _one(a.id, "show", a.scope)
+    j = _one(a, "show")
     watched = [{k: w[k] for k in ("pid", "verb", "session")} for w in jobcore.watchers(j)]
     if a.json:
         ui.print_json({**public(j), "watchers": watched})
@@ -1189,17 +1228,17 @@ def cmd_show(a) -> int:
 
 
 def cmd_note(a) -> int:
-    j = _one(a.id, "note", a.scope)
     text = " ".join(a.text).strip()
     if not text:
         ui.die(f"{_PROG} note: no text", 2)
+    j = _one(a, "note")
     add_note(j["id"], text, by=a.by)
     print(f"noted on {j['id']}")
     return 0
 
 
 def cmd_log(a) -> int:
-    j = _one(a.id, "log", a.scope)
+    j = _one(a, "log")
     path = j.get("log")
     if a.follow and j["state"] == "held":
         print(f"[{_PROG} log] note: {j['id']} is held, so this waits forever. "
@@ -1253,7 +1292,7 @@ def cmd_kill(a) -> int:
     as running may be back in its queue for a retry by the time the stop is written. It has no process then,
     so the transaction ends it there."""
     rc = 0
-    jobs = _resolve(a.ids, a.scope)
+    jobs = _named(a, "kill")
     go = _gate(a, jobs, "kill", ("running",))
     if go is not None:
         return go
@@ -1353,7 +1392,7 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
 
 def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
     rc, skipped, started = 0, [], set()
-    jobs = _resolve(a.ids, a.scope)
+    jobs = _named(a, verb)
     if verb == "drop":
         go = _gate(a, jobs, "drop", src)
         if go is not None:
@@ -1385,7 +1424,7 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
 
 def _reprio(a) -> int:
     rc, skipped = 0, []
-    for j in _resolve(a.ids, a.scope):
+    for j in _named(a, "reprio"):
         cur = jobcore.amend(j["id"], {"prio": a.prio}, must_be=("queued", "held"))
         if cur is None:
             got = jobcore.find(j["id"])
@@ -1408,7 +1447,7 @@ CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "shell_env", "owner"
 
 def cmd_retry(a) -> int:
     started, rc, skipped = set(), 0, []
-    for j in _resolve(a.ids, a.scope):
+    for j in _named(a, "retry"):
         if j["state"] not in jobstore.ENDED and j["_bulk"]:
             skipped.append(j)
             continue
@@ -1433,7 +1472,9 @@ def cmd_retry(a) -> int:
 
 def cmd_clean(a, scope: list[str] | None) -> int:
     cutoff = time.time() - a.older if a.older is not None else None
-    victims = [j for j in jobcore.jobs(jobstore.ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
+    specs = _specs(a)
+    named = _resolve(specs, scope) if specs else jobcore.jobs(jobstore.ENDED, scope)
+    victims = [j for j in named if j["state"] in jobstore.ENDED and (cutoff is None or (j.get("ended") or 0) < cutoff)]
     if not victims:
         print("nothing to clean")
         return 0
@@ -1480,6 +1521,9 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
     """wait: block until jobs end, then print their outcomes. watch (stream): a line per event as it happens.
     Both hold a watcher lease while they run (`show` lists it) and stamp each outcome they print on the job."""
     verb = "watch" if stream else "wait"
+    specs = _specs(a)
+    if specs and (a.idle or a.mine):
+        ui.die(f"{_PROG} {verb}: --idle and --mine are the selection, so neither takes one", 2)
     t0 = time.time()
 
     def say(*lines):
@@ -1530,8 +1574,8 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                     tell(j, j["id"])
         footer()
         return 1 if any(j["state"] == "failed" for j in ended) else 0
-    if a.ids:
-        targets, need_all = [j["id"] for j in _resolve(a.ids, scope)], True
+    if specs:
+        targets, need_all = [j["id"] for j in _resolve(specs, scope)], True
     elif a.mine:
         me = session.caller()
         if not me:
@@ -1671,6 +1715,15 @@ def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | No
 
 # ---- the CLI ----------------------------------------------------------------------------------------
 
+def _selectors(p) -> None:
+    """The two of the five selection forms that are flags, on a verb that takes jobs: --prefix P, repeatable,
+    and --all, which takes -q. The other three are words the verb is given, so every verb that takes jobs
+    takes the same five (section 3's grammar, `jobpolicy.select`)."""
+    p.add_argument("--prefix", action="append", metavar="P",
+                   help="every job whose tag starts with P (repeatable)")
+    p.add_argument("--all", action="store_true", help="every job of the queue -q names")
+
+
 def _parser(prog: str, doc: str, add_args=None):
     ap = ui.parser(prog, doc)
     sub = ap.add_subparsers(dest="verb", metavar="VERB")
@@ -1701,39 +1754,49 @@ def _parser(prog: str, doc: str, add_args=None):
         g.add_argument("--here", action="store_true", help="only this directory's project")
         g.add_argument("--project")
     p = sp("show", help="every field of a job, and its log tail")
-    p.add_argument("id")
+    p.add_argument("id", nargs="?", metavar="ID")
+    _selectors(p)
     p.add_argument("--json", action="store_true")
+    # note takes one job and then text of its own, so the job is a word and the two forms that are flags
+    # are no use to it: a note on a family is refused, and `note one by its id` is what it says
     p = sp("note", help="attach a note to a job (any state)")
-    p.add_argument("id")
+    p.add_argument("id", metavar="ID")
     p.add_argument("text", nargs="+")
     p.add_argument("--by", metavar="NAME", help="the author shown (default: the calling agent session, else user)")
     p = sp("log", help="tail a job's log")
-    p.add_argument("id")
+    p.add_argument("id", nargs="?", metavar="ID")
+    _selectors(p)
     p.add_argument("-f", "--follow", action="store_true")
     p.add_argument("-n", "--lines", type=int, default=40)
     p = sp("kill", help="stop running jobs: the whole process group is signalled; a job the signal stopped "
                         "fires no hook")
-    p.add_argument("ids", nargs="+")
+    p.add_argument("ids", nargs="*", metavar="ID")
+    _selectors(p)
     _flag_override(p, BY_SCOPE["job"]["grace"],
                    "the gap before the SIGKILL for the jobs this kill names (default: each job's own)")
     p.add_argument("-n", "--dry-run", action="store_true", help="only show which jobs it would stop")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask about a range or a shared tag")
     for name, hlp in (("drop", "remove queued/held jobs"), ("hold", "park queued jobs"), ("release", "un-park held jobs")):
         p = sp(name, help=hlp)
-        p.add_argument("ids", nargs="+")
+        p.add_argument("ids", nargs="*", metavar="ID")
+        _selectors(p)
         if name == "drop":
             p.add_argument("-n", "--dry-run", action="store_true", help="only show which jobs it would remove")
             p.add_argument("-y", "--yes", action="store_true", help="do not ask about a range or a shared tag")
         if name == "release":
             p.add_argument("--no-start", action="store_true", help="do not start a worker")
     p = sp("reprio", help="change a queued job's priority")
-    p.add_argument("ids", nargs="+", metavar="ID")
+    p.add_argument("ids", nargs="*", metavar="ID")
     p.add_argument("prio", type=int)
+    _selectors(p)
     p = sp("retry", help="re-queue ended jobs as new jobs")
-    p.add_argument("ids", nargs="+")
+    p.add_argument("ids", nargs="*", metavar="ID")
+    _selectors(p)
     p.add_argument("--prio", type=int)
     p.add_argument("--no-start", action="store_true")
     p = sp("clean", help="remove ended job records, with the logs that belong to them")
+    p.add_argument("ids", nargs="*", metavar="ID")
+    _selectors(p)
     p.add_argument("--older", metavar="AGE", type=_dur_flag("d"),
                    help="only those ended before AGE ago (30m, 12h, 7d; a bare number is days)")
     p.add_argument("-n", "--dry-run", action="store_true")
@@ -1741,7 +1804,8 @@ def _parser(prog: str, doc: str, add_args=None):
     for name, hlp in (("wait", "block until jobs end, then print the outcomes (exit 0 ok, 1 failed or dropped, 3 timeout)"),
                       ("watch", "a line per event (start, retry, outcome) as it happens; exits like wait")):
         p = sp(name, help=hlp)
-        p.add_argument("ids", nargs="*")
+        p.add_argument("ids", nargs="*", metavar="ID")
+        _selectors(p)
         g = p.add_mutually_exclusive_group()
         g.add_argument("--idle", action="store_true", help="until nothing is queued or running")
         g.add_argument("--mine", action="store_true", help="every job this agent session queued that is live, or ended without a wait/watch of this session reporting it")
