@@ -81,6 +81,18 @@ class TestPages(Served):
         h = base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode()
         self.assertIn(f"'sha256-{h}'", csp)
 
+    def test_a_crafted_sort_comes_back_inert(self):
+        """A folder page writes ?sort= back into its own links, so the value is one of the three names it
+        offers and nothing else reaches the markup. Only this origin may frame a page, so reading one still
+        takes the person's own click."""
+        crafted = '"><img src=x onerror=alert(1)><b>PWNED</b>'
+        st, headers, body = self.get("/t/A/?hidden=1&sort=" + urllib.parse.quote(crafted, safe=""))
+        self.assertEqual(st, 200)
+        self.assertNotIn("PWNED", body)
+        self.assertNotIn("<img src=x", body)
+        self.assertIn('<a href="/t/A/?sort=name&hidden=1" class="on">name</a>', body)   # the name sort, kept
+        self.assertIn("frame-ancestors 'self'", headers["content-security-policy"])
+
     def test_recent_newest_first_across_roots(self):
         st, _, body = self.get("/_pp/recent")
         self.assertEqual(st, 200)

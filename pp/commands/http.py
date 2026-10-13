@@ -100,6 +100,7 @@ IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".a
 VIDEO_EXT = {".mp4", ".webm", ".mov", ".m4v", ".ogv"}
 AUDIO_EXT = {".mp3", ".wav", ".ogg", ".oga", ".flac", ".m4a", ".opus"}
 README_NAMES = ("readme.md", "readme.markdown", "index.md")
+SORTS = ("name", "mtime", "size")       # how a folder page sorts, and so the only values ?sort= can take
 
 # extension -> highlight.js language (core bundle, or a languages/<x>.min.js the page loads on demand)
 LANG = {
@@ -796,6 +797,8 @@ class Handler(BaseHTTPRequestHandler):
     def _dir(self, root, segs, o: Opened, qs):
         hidden = qs.get("hidden") == "1"
         sort = qs.get("sort", "name")
+        if sort not in SORTS:       # the page writes this value back into its own links, so it is one of ours
+            sort = "name"
         entries, capped, dots = [], False, 0
         try:
             with o.entries() as it:             # the folder that opened, listing itself through its own fd
@@ -841,7 +844,7 @@ class Handler(BaseHTTPRequestHandler):
         here = turl(root, segs, True)
         hq = "&hidden=1" if hidden else ""
         sorts = " · ".join(f'<a href="{here}?sort={k}{hq}" class="{"on" if sort == k else ""}">{k}</a>'
-                           for k in ("name", "mtime", "size"))
+                           for k in SORTS)
         toggle = (f'<a href="{here}{"?sort=" + sort if sort != "name" else ""}">hide dotfiles</a>' if hidden
                   else f'<a href="{here}?hidden=1{"&sort=" + sort if sort != "name" else ""}">show dotfiles</a>')
         files = {n.lower(): n for n, d, *_ in entries if not d}
@@ -996,12 +999,13 @@ class Handler(BaseHTTPRequestHandler):
 def _csp() -> str:
     """Rendered markdown is untrusted HTML (any repo's README). Only our one inline script (pinned by hash) and
     cdnjs may run, so an injected <img onerror=...> or javascript: link is inert. Styles stay inline-able for
-    KaTeX and mermaid; images may come from anywhere, as markdown images do."""
+    KaTeX and mermaid; images may come from anywhere, as markdown images do. Only this origin may frame a page,
+    so a page elsewhere cannot open one in a hidden frame and read it."""
     h = base64.b64encode(hashlib.sha256(JS.encode()).digest()).decode()
     return (f"default-src 'self'; script-src 'sha256-{h}' https://cdnjs.cloudflare.com; "
             "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' data: https://cdnjs.cloudflare.com; "
             "img-src 'self' data: blob: https: http:; media-src 'self'; object-src 'self'; frame-src 'self'; "
-            "connect-src 'self'; base-uri 'none'; form-action 'self'")
+            "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'")
 
 
 class _Server(ThreadingHTTPServer):
