@@ -656,7 +656,7 @@ _PURE_IMPORTS = {"__future__", "annotations", "re", "dataclass", "dataclasses"}
 # what the core may not say, since every sentence a user reads is the caller's (section 8, the wording)
 _SENTENCES = ("print", "warn", "die", "print_json", "input", "confirm")
 # ... and what it may not read: a config file, or a reading of its own (I27)
-_READINGS = ("_qcfg", "reading", "_cards", "pools", "parse_duration")
+_READINGS = ("_qcfg", "_pcfg", "reading", "_cards", "pools", "resolve", "duration")
 
 # how a process is started, which outside the core happens at two sites and no others (section 8's boundary
 # rule, with its two exceptions)

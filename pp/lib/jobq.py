@@ -2,11 +2,11 @@
 
 The store is pp/lib/jobstore.py (one file per job, and the transaction that changes one) and the rules are
 pp/lib/jobpolicy.py (the facts in, one decision out). Here: the verbs, the views, the readings a limit is
-checked against, the lines a setting is read from, and the help.
+checked against, the one declaration of every setting and the files each is read from, and the help.
 
 One worker per queue reaps ended jobs, carries out the stops asked of them, re-queues retries, starts what
 fits, and fires the job's on_fail / on_done hook on its FINAL outcome. Admission is strict head-of-line by
-priority (a big job is never starved by small ones) unless the worker runs with backfill; a job waiting out its
+priority (a big job is never starved by small ones) unless the queue's own backfill is on; a job waiting out its
 retry delay is skipped, not waited for.
 
 A queue's worker is the one actor that signals that queue's jobs, and only a worker ever holds the queue's
@@ -34,6 +34,7 @@ session queued, and stripped from the worker, the jobs and the hooks.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -42,6 +43,7 @@ import shutil
 import signal
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from pp.lib import config, jobcore, jobpolicy as policy, jobstore, lock, paths, proc, session, ui
@@ -83,21 +85,20 @@ def _starting(q: str) -> str:
     return f"the {q} worker is starting and has not recorded itself yet"
 
 
-def _read_settings(q: str, backfill: bool | None, poll: float | None):
-    """What one pass of q's worker loop runs under: {poll, idle_exit, backfill}, read once per pass, so a
-    queue's limits change under its running jobs with no restart.
+def _read_settings(q: str):
+    """What one pass of q's worker loop runs under: every per-queue row, read once per pass, so a queue's
+    limits change under its running jobs with no restart. None of them has a flag, for that reason.
 
-    `work --backfill` fixes backfill, and otherwise the queue's config says. A config that cannot be read
-    comes back as `error` beside the defaults, and says nothing about backfill unless the flag did, so a
-    worker keeps running the way it was until that file is fixed."""
+    A config that cannot be read comes back as `error` beside the defaults, and says nothing about backfill,
+    so a worker keeps running the way it was until that file is fixed."""
+    rows = [r for r in BY_SCOPE["queue"].values() if r.name != "resources"]
+
     def read():
-        fixed = {} if backfill is None else {"backfill": bool(backfill)}
         try:
             cfg = _qcfg(q)
         except config.ConfigError as e:
-            return {"poll": float(poll or 2), "idle_exit": 600.0, "error": str(e), **fixed}
-        return {"poll": float(poll or cfg.get("poll", 2)), "idle_exit": float(cfg.get("idle_exit", 600)),
-                "backfill": bool(cfg.get("backfill", False)), **fixed}
+            return {"poll": policy.POLL, "idle_exit": policy.IDLE_EXIT, "error": str(e)}
+        return {r.name: policy.resolve(r, config=cfg.get(r.name, policy.NOTSET)) for r in rows}
     return read
 
 
@@ -174,18 +175,18 @@ def _voice(q: str, log=None):
     return voice
 
 
-def worker_for(q: str, backfill: bool = False, log=None) -> jobcore.Worker:
+def worker_for(q: str, log=None) -> jobcore.Worker:
     """Queue q's worker, wired: the admission of a pass, the tail a retry is matched against, and the sink it
     says what it did to. The one place a Worker is built."""
-    return jobcore.Worker(q, backfill, _voice(q, log), lambda job, n: "\n".join(log_tail(job, n)), _admit_for(q))
+    return jobcore.Worker(q, False, _voice(q, log), lambda job, n: "\n".join(log_tail(job, n)), _admit_for(q))
 
 
-def cmd_work(q: str, backfill: bool | None = None, poll: float | None = None) -> int:
+def cmd_work(q: str) -> int:
     """`work`: queue q's worker in this process. The loop is the core's; the settings, the admission and the
     words are read and said here."""
     def log(msg):
         print(f"[{q} {datetime.now():%m-%d %H:%M:%S}] {msg}", flush=True)
-    return jobcore.work(q, _read_settings(q, backfill, poll), _admit_for(q), _voice(q, log),
+    return jobcore.work(q, _read_settings(q), _admit_for(q), _voice(q, log),
                         lambda job, n: "\n".join(log_tail(job, n)))
 
 
@@ -204,45 +205,152 @@ def _worker_up(q: str, wake: bool = False, quiet: bool = False) -> jobcore.Holde
     return w
 
 
-# ---- durations, small parsing ------------------------------------------------------------------------
+# ---- the settings, one row each -----------------------------------------------------------------------
+#
+# Every setting a user can give is one row below, and every reading of that setting goes through its row. A
+# row says its type and spelling, its default, its scope, its flag and its keys, and what it refuses
+# (pp/lib/jobpolicy.py, Setting). The scope decides which sources a row has and nothing else does: a per-job
+# row has a flag on `add` and a key in both config tables, a per-queue row the queue's key alone, the
+# machine's rows the machine's table alone, and a per-project row its project's key and a flag for one job.
+#
+# One declaration feeds the flag's entry in the parser (`_flag`) and the checking and reading of every
+# config table (`_read`), and one function reads a value for both (`jobpolicy.value`). The order the sources
+# are read in is `jobpolicy.resolve`, the same order for every row. So a setting has one declaration, one
+# default and one precedence, and a flag and a key cannot disagree about what a setting is.
 
-parse_duration = config.parse_duration
+PROBE_WAIT = 60.0   # how long a probe may take before pp ends it and its reading says so
+PROBE_EVERY = 30.0
+SETTLE = 30.0       # a reading (nvidia-smi, a probe) may not show a job launched less than this before it
+
+_S = policy.Setting
+SETTINGS = (
+    # Per project: the nearest .pp.toml up from the job's directory. `name` is the one row with no flag,
+    # because it names the project and not a job of it; `runner` and `stop` are the project's own commands.
+    _S("name", "project", "text", top=True, flagged=False, refuses="not a string"),
+
+    # Per job: `add`'s flags, `[queue]` in .pp.toml, `[queue.NAME]` in config.toml. The resolved value goes
+    # on the record, so a later config edit cannot change a job already queued or running.
+    _S("prio", "job", "whole", default=policy.PRIO, printed=True, metavar="N",
+       says="lower runs first (default 10)", refuses="not an integer"),
+    _S("gpu_gb", "job", "amount", field="needs", metavar="N",
+       says="GPU memory to reserve on one card (the job's peak use, plus a margin)",
+       refuses="0, a negative, nan, inf; a kind no pool provides"),
+    _S("cpu", "job", "amount", field="needs", metavar="N", says="CPUs to reserve",
+       refuses="0, a negative, nan, inf; a kind no pool provides"),
+    _S("mem_gb", "job", "amount", field="needs", metavar="N", says="RAM to reserve, in GB",
+       refuses="0, a negative, nan, inf; a kind no pool provides"),
+    _S("need", "job", "counts", default={}, field="needs", merge=True, repeat=True, metavar="NAME=N",
+       says="a counter from [resources] (every queue's) or [queue.Q.resources] (one queue's own)",
+       refuses="0, a negative, nan, inf; a name no pool provides, named at add time"),
+    _S("env", "job", "strings", default={}, merge=True, repeat=True, metavar="K=V",
+       says="set in the job's environment; wins over the project's [queue] env",
+       refuses="a name holding = or NUL; a value holding a newline"),
+    _S("timeout", "job", "duration", none_ok=True, metavar="DUR",
+       says="stop it after DUR (90s, 30m, 2h, 1d); none: no timeout",
+       refuses='""; a non-finite value; over 1e9 seconds'),
+    _S("retries", "job", "whole", default=0, printed=True, lo=0, hi=policy.RETRIES_CAP, metavar="N",
+       says="automatic retries of a failure (default 0)",
+       refuses="a negative, a non-integer, over 1000"),
+    _S("retry_delay", "job", "duration", default=policy.RETRY_DELAY, printed=True,
+       hi=policy.RETRY_DELAY_CAP, metavar="DUR",
+       says="delay before the first retry, doubling after (default 30s, at most 1h)",
+       refuses='""; a non-finite value; over the 1h cap'),
+    _S("retry_if", "job", "regex", metavar="REGEX",
+       says="retry only failures whose reason or log tail matches",
+       refuses="a regex that does not compile"),
+    _S("on_fail", "job", "command", metavar="CMD",
+       says="shell command run on the final failure; none: no hook", refuses="a non-string"),
+    _S("on_done", "job", "command", metavar="CMD",
+       says="shell command run on success; none: no hook", refuses="a non-string"),
+
+    # Per queue: `[queue.NAME]` in config.toml, and no flag. Its worker re-reads the table every loop, so a
+    # limit changes under running jobs; a flag would freeze what config can otherwise change.
+    _S("poll", "queue", "period", default=policy.POLL, printed=True, refuses="0 or less"),
+    _S("idle_exit", "queue", "duration", default=policy.IDLE_EXIT, printed=True,
+       refuses="a non-finite value"),
+    _S("backfill", "queue", "boolean", default=False, printed=True, refuses="a non-boolean"),
+    _S("resources", "queue", "pools", default={"slots": 3}, printed=True, merge=True,
+       refuses="an unknown key in a pool table"),
+
+    # The machine: `[resources]` in config.toml, and no flag. One machine has one set of limits, and every
+    # queue counts against them. The four below are the keys of one pool's table.
+    _S("resources", "machine", "pools", default={"cpu": "auto", "mem_gb": "auto", "gpu_gb": "auto"},
+       printed=True, merge=True,
+       refuses='an unknown key in the table; "auto" for a name that is not cpu, mem_gb or gpu_gb; '
+               "probe on gpu_gb; a table with neither max nor probe, except gpu_gb"),
+    _S("max", "machine", "number", default="auto", auto_ok=True, refuses="not a number"),
+    _S("probe", "machine", "shell", refuses="an empty string; probe on gpu_gb"),
+    _S("every", "machine", "duration", default=PROBE_EVERY, printed=True, refuses="a non-finite value"),
+    _S("settle", "machine", "duration", default=SETTLE, printed=True, refuses="a non-finite value"),
+)
+
+# A key of a project's `[queue]` that the command owning it reads for itself, so that table takes it beside
+# the rows above.
+OWN_KEYS = ("runner",)
+
+BY_SCOPE = {s: {r.name: r for r in SETTINGS if r.scope == s}
+            for s in ("job", "queue", "machine", "project")}
+JOB_ROWS = tuple(BY_SCOPE["job"].values())
+POOL_KEYS = tuple(n for n in BY_SCOPE["machine"] if n != "resources")
+QUEUE_KEYS = tuple(BY_SCOPE["job"]) + tuple(BY_SCOPE["queue"])
+PROJECT_KEYS = tuple(BY_SCOPE["job"]) + tuple(n for n, r in BY_SCOPE["project"].items() if not r.top) \
+    + OWN_KEYS
 
 
-def _dur_arg(v, what: str, default_unit: str = "s") -> float:
-    """The one reading of a duration a command line gave, in seconds: a usage error where it is not one, and
-    where it is empty.
+def _read(t: dict, where: str, rows: dict) -> dict:
+    """What one config table says, each key read through its own row: the typed value of every key it holds.
 
-    A config key written as "" is a key that is not set, since the default behind it stands. A command line
-    has no such key: `--timeout "$T"` with T unset is the mistake it looks like, and not a wait with no
-    deadline or a `clean --older ""` with no bound. "no bound" has a spelling of its own where a flag offers
-    one (`add --timeout none`), and leaving the flag out is the other."""
-    try:
-        secs = parse_duration(v, default_unit)
-    except ValueError as e:
-        ui.die(f"{_PROG}: {what}: {e}", 2)
-    if secs is None:
-        ui.die(f"{_PROG}: {what}: say how long, like 90s, 30m, 2h or 1d", 2)
-    return secs
+    A value a row refuses is a ConfigError naming the table and the key, never a silent default and never a
+    traceback. A key no row of the declaration names is left to the one reader that knows it."""
+    out = {}
+    for k, v in t.items():
+        if k not in rows:
+            continue
+        try:
+            out[k] = policy.value(rows[k], v)
+        except ValueError as e:
+            raise config.ConfigError(f"{where} {k}: {e}") from None
+    return out
+
+
+def _typed(row: policy.Setting):
+    """The type argparse reads this row's flag with: the row's own reading, and a usage error in the parser's
+    own words where the row refuses it. So a flag and a key refuse the same values for the same reasons."""
+    def read(raw):
+        try:
+            return policy.value(row, raw)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+    return read
+
+
+def _dur_flag(unit: str = "s"):
+    """The type of a duration flag that is a setting of nothing: a view's own bound (`wait --timeout`,
+    `clean --older`). One reading of a duration, the same one every row takes."""
+    def read(raw):
+        try:
+            return policy.duration(raw, unit)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+    return read
+
+
+def _flag(p, row: policy.Setting) -> None:
+    """The parser entry this row's flag is, built from the row itself. A repeatable flag is read once the
+    whole list is in, since argparse hands it one word at a time."""
+    kw = {"help": row.says, "metavar": row.metavar} if row.metavar else {"help": row.says}
+    if row.repeat:
+        p.add_argument(row.flag, action="append", default=None, **kw)
+    else:
+        p.add_argument(row.flag, type=_typed(row), default=policy.NOTSET, **kw)
 
 
 # ---- resources ------------------------------------------------------------------------------------
 #
 # The pool model as users see it (shared and per-queue pools, probes, settle) is `pp help queue`'s "Resources"; the
-# defaults below are the ones it states. Here: a job's needs are a dict NAME -> amount; Resources.check asks every pool
-# that provides a NAME, a probe's reading is cached in probes/ for `every`, and jobs launched less than `settle`
-# before a reading are subtracted from it.
-
-SHARED_DEFAULTS = {"cpu": "auto", "mem_gb": "auto", "gpu_gb": "auto"}
-QUEUE_DEFAULTS = {"slots": 3}
-POOL_KEYS = ("max", "probe", "every", "settle")
-PROBE_EVERY = 30.0
-PROBE_WAIT = 60.0   # how long a probe may take before pp ends it and its reading says so
-SETTLE = 30.0       # a reading (nvidia-smi, a probe) may not show a job launched less than this before it
-
-
-QUEUE_KEYS = ("timeout", "retries", "retry_delay", "retry_if", "on_fail", "on_done", "idle_exit", "poll", "backfill",
-              "resources")
+# defaults the rows above give are the ones it states. Here: a job's needs are a dict NAME -> amount; Resources.check
+# asks every pool that provides a NAME, a probe's reading is cached in probes/ for `every`, and jobs launched less
+# than `settle` before a reading are subtracted from it.
 
 
 def _qcfg(q: str, empty_ok: bool = True) -> dict:
@@ -251,28 +359,35 @@ def _qcfg(q: str, empty_ok: bool = True) -> dict:
     t = config.load("queue", empty_ok).get(q, {})
     if not isinstance(t, dict):
         raise config.ConfigError(f"[queue.{q}] must be a table")
-    t = dict(t)
     where = f"[queue.{q}]"
     config.check_keys(t, where, QUEUE_KEYS)
-    for k in ("timeout", "retry_delay", "idle_exit", "poll"):
-        if k in t:
-            try:
-                t[k] = parse_duration(t[k])
-            except ValueError as e:
-                raise config.ConfigError(f"{where} {k}: {e}") from None
-    if "retries" in t and (isinstance(t["retries"], bool) or not isinstance(t["retries"], int) or t["retries"] < 0):
-        raise config.ConfigError(f"{where} retries = {t['retries']!r}: a whole number >= 0")
-    if "backfill" in t and not isinstance(t["backfill"], bool):
-        raise config.ConfigError(f"{where} backfill = {t['backfill']!r}: true or false")
-    for k in ("retry_if", "on_fail", "on_done"):
-        if k in t and not isinstance(t[k], str):
-            raise config.ConfigError(f"{where} {k} = {t[k]!r}: a string")
-    if t.get("retry_if"):
-        try:
-            re.compile(t["retry_if"])
-        except re.error as e:
-            raise config.ConfigError(f"{where} retry_if {t['retry_if']!r}: {e}") from None
-    return t
+    return _read(dict(t), where, {**BY_SCOPE["job"], **BY_SCOPE["queue"]})
+
+
+@dataclass(frozen=True)
+class Project:
+    """The project one job belongs to: where its .pp.toml is, what that file's [queue] gives of the settings
+    that have a key there, and the table itself for the keys whose own command reads them."""
+
+    root: str | None = None
+    where: str = ""
+    table: dict = field(default_factory=dict)
+    gives: dict = field(default_factory=dict)
+
+
+def _pcfg(cwd: str) -> Project:
+    """The nearest .pp.toml up from cwd, read through the rows whose scope gives them a key in its [queue]:
+    the project's own defaults for the jobs it adds. A project with no such file gives nothing."""
+    root, data = config.find_project(cwd)
+    if root is None:
+        return Project()
+    where = f"{root}/.pp.toml"
+    t = data.get("queue", {})
+    if not isinstance(t, dict):
+        raise config.ConfigError(f"{where}: queue must be a table ([queue] runner = ..., env = {{...}})")
+    config.check_keys(t, f"{where} [queue]", PROJECT_KEYS)
+    rows = {**BY_SCOPE["job"], **{n: r for n, r in BY_SCOPE["project"].items() if not r.top}}
+    return Project(root, where, dict(t), _read(dict(t), f"{where} [queue]", rows))
 
 
 def _mem_total_gb() -> float:
@@ -318,6 +433,8 @@ def _cards() -> list[dict] | None:
 
 
 def _pool(name: str, v, scope: str | None) -> dict | None:
+    """One pool as its table declares it, read through the rows of the four keys a pool table takes. A bare
+    number means `max`, and `false` removes a pool a default would otherwise give, in that scope."""
     where = (f"[queue.{scope}.resources] " if scope else "[resources] ") + name
     if v is False:           # cpu = false: no such pool here
         return None
@@ -325,42 +442,29 @@ def _pool(name: str, v, scope: str | None) -> dict | None:
     bad = sorted(set(t) - set(POOL_KEYS))
     if bad:
         raise config.ConfigError(f"{where}: unknown {', '.join(bad)} (a table takes {', '.join(POOL_KEYS)})")
-    mx = t.get("max")
+    read = _read(t, where, BY_SCOPE["machine"])
+    mx = read.get("max")
     if mx == "auto":
-        if name not in SHARED_DEFAULTS:
+        if name not in BY_SCOPE["machine"]["resources"].default:
             raise config.ConfigError(f'{where} = "auto": only cpu, mem_gb and gpu_gb know their own size')
         mx = {"cpu": os.cpu_count() or 1, "mem_gb": round(_mem_total_gb()), "gpu_gb": None}[name]   # gpu: per card
-    elif mx is not None:
-        try:
-            mx = policy.num(mx)
-        except (TypeError, ValueError):
-            raise config.ConfigError(f"{where} = {mx!r}: not a number") from None
-    p = {"name": name, "scope": scope, "where": where, "max": mx, "probe": None, "every": PROBE_EVERY,
-         "settle": SETTLE}
-    if t.get("probe") is not None:
-        if name == "gpu_gb":
-            raise config.ConfigError(f"{where}: gpu_gb is probed with nvidia-smi already")
-        if not isinstance(t["probe"], str) or not t["probe"].strip():
-            raise config.ConfigError(f"{where}: probe is a shell command that prints the amount free")
-        p["probe"] = t["probe"]
-    for k in ("every", "settle"):
-        if k in t:
-            try:
-                p[k] = parse_duration(t[k]) or 0.0
-            except ValueError as e:
-                raise config.ConfigError(f"{where} {k}: {e}") from None
+    p = {"name": name, "scope": scope, "where": where, "max": mx, "probe": read.get("probe"),
+         "every": read.get("every", PROBE_EVERY), "settle": read.get("settle", SETTLE)}
+    if p["probe"] is not None and name == "gpu_gb":
+        raise config.ConfigError(f"{where}: gpu_gb is probed with nvidia-smi already")
     if p["max"] is None and p["probe"] is None and name != "gpu_gb":
         raise config.ConfigError(f"{where}: a number, or a table with max and/or probe")
     return p
 
 
 def pools(q: str, empty_ok: bool = True) -> list[dict]:
-    """The pools queue q's jobs draw from: its own ([queue.q.resources]), then the shared ones ([resources])."""
-    own = _qcfg(q, empty_ok).get("resources", {})
-    if not isinstance(own, dict):
+    """The pools queue q's jobs draw from: its own ([queue.q.resources]), then the shared ones ([resources]).
+    Each table is its row's default merged with what the file says, which is the one order of the sources."""
+    own = _qcfg(q, empty_ok).get("resources", policy.NOTSET)
+    if own is not policy.NOTSET and not isinstance(own, dict):
         raise config.ConfigError(f"[queue.{q}.resources] must be a table")
-    own = {**QUEUE_DEFAULTS, **own}
-    shared = {**SHARED_DEFAULTS, **config.load("resources", empty_ok)}
+    own = policy.resolve(BY_SCOPE["queue"]["resources"], config=own)
+    shared = policy.resolve(BY_SCOPE["machine"]["resources"], config=config.load("resources", empty_ok))
     return [p for p in [_pool(k, v, q) for k, v in own.items()] + [_pool(k, v, None) for k, v in shared.items()] if p]
 
 
@@ -616,24 +720,15 @@ def _needs_str(needs: dict | None) -> str:
 
 
 def project_name(cwd: str) -> str:
+    """The project a job of this directory belongs to, as that row says: `name` at the top of the nearest
+    .pp.toml, else the name of the directory that file is in, else of the repository or the directory
+    itself."""
     root, data = config.find_project(cwd)
     if root:
-        return config.project_name(root, data)
+        named = _read({"name": data["name"]} if "name" in data else {}, root, BY_SCOPE["project"])
+        return named.get("name") or os.path.basename(os.path.normpath(root))
     g = config.git_root(cwd)
     return os.path.basename(os.path.normpath(g or cwd))
-
-
-def _kv(items: list[str] | None, flag: str, conv) -> dict:
-    out = {}
-    for it in items or []:
-        k, sep, v = it.partition("=")
-        if not sep or not k:
-            ui.die(f"{_PROG}: {flag} takes NAME=VALUE, got '{it}'", 2)
-        try:
-            out[k] = conv(v)
-        except ValueError:
-            ui.die(f"{_PROG}: {flag} {k}: '{v}' is not a number", 2)
-    return out
 
 
 def _from_lines(src: str) -> list[list[str]]:
@@ -762,6 +857,20 @@ def _attempt_str(j: dict) -> str:
 
 # ---- verbs ----------------------------------------------------------------------------------------
 
+def _given(a, row: policy.Setting):
+    """What this row's flag said on the command line, or NOTSET where it was not given. A flag that may be
+    repeated is read here, since argparse hands it one word at a time and a row is read whole."""
+    raw = getattr(a, row.name, policy.NOTSET)
+    if not row.repeat:
+        return raw
+    if raw is None or raw is policy.NOTSET:
+        return policy.NOTSET
+    try:
+        return policy.value(row, raw)
+    except ValueError as e:
+        ui.die(f"{_PROG}: {row.flag}: {e}", 2)
+
+
 def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     cmds = _from_lines(a.from_) if a.from_ else [cmd]
     if not cmds or not all(cmds):
@@ -769,51 +878,31 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     cwd = paths.expand(a.cwd) if a.cwd else os.getcwd()
     if not os.path.isdir(cwd):
         ui.die(f"{_PROG} add: no directory {cwd}", 2)
-    env = _kv(a.env, "--env", str)
-    needs: dict = {"slots": 1}
-    for k, v in (("gpu_gb", a.gpu_gb), ("cpu", a.cpu), ("mem_gb", a.mem_gb)):
-        if v:
-            needs[k] = policy.num(v)
-    needs.update(_kv(a.need, "--need", policy.num))
-    for k, v in needs.items():
-        if not 0 < v < float("inf"):        # also nan: it compares false with everything, so it would never wait
-            ui.die(f"{_PROG} add: {k}={v:g}: a need is a positive number", 2)
-    why = Resources(q, needs, live=False).check(needs)
-    if why:
-        ui.die(f"{_PROG} add: {why}", 2)
-    qc = _qcfg(q)
-    if a.timeout is None:
-        timeout = qc.get("timeout")
-    else:       # none (or 0): no timeout, whatever the queue's default
-        timeout = None if a.timeout.strip().lower() == "none" else _dur_arg(a.timeout, "--timeout")
-    timeout = timeout or None
-    retries = a.retries if a.retries is not None else qc.get("retries", 0)
-    if retries < 0:
-        ui.die(f"{_PROG} add: --retries must be >= 0", 2)
-    retry_delay = _dur_arg(a.retry_delay, "--retry-delay") if a.retry_delay is not None else qc.get("retry_delay", policy.RETRY_DELAY)
-    retry_if = a.retry_if if a.retry_if is not None else qc.get("retry_if")
-    if retry_if:
-        try:
-            re.compile(retry_if)
-        except re.error as e:
-            ui.die(f"{_PROG} add: --retry-if {retry_if!r}: {e}", 2)
     if a.tag and re.fullmatch(r"\d+(-\d+)?", a.tag):
         ui.die(f"{_PROG} add: --tag {a.tag} reads as a job id or a range, so it could not select its jobs; "
                "use a word", 2)
+    # every per-job row, resolved here and nowhere else: the flag, then this project's [queue], then the
+    # queue's table, then the row's own default. What they come to goes on the record, so a config edit
+    # after this never changes the job
+    project, qc = _pcfg(cwd), _qcfg(q)
+    gave = {r.name: policy.resolve(r, _given(a, r), project.gives.get(r.name, policy.NOTSET),
+                                   qc.get(r.name, policy.NOTSET)) for r in JOB_ROWS}
+    needs = {"slots": 1, **{k: gave[k] for k in ("gpu_gb", "cpu", "mem_gb") if gave[k] is not None},
+             **gave["need"]}
+    why = Resources(q, needs, live=False).check(needs)
+    if why:
+        ui.die(f"{_PROG} add: {why}", 2)
     owner = session.caller()
-    on_fail = policy.hook_spec(a.on_fail if a.on_fail is not None else qc.get("on_fail"))
-    on_done = policy.hook_spec(a.on_done if a.on_done is not None else qc.get("on_done"))
     shell_env = {k: os.environ[k] for k in CAPTURED_ENV if k in os.environ}
     state = "held" if a.hold else "queued"
-    project = project_name(cwd)
+    named = project_name(cwd)
     records = []
     for c in cmds:
-        job = {"queue": q, "tag": a.tag or default_tag(c), "project": project, "cwd": cwd, "cmd": c, "runner": [],
-               "env": dict(env), "shell_env": shell_env, "needs": needs, "prio": a.prio, "owner": owner,
-               "timeout": timeout, "retries": retries, "retry_delay": retry_delay, "retry_if": retry_if or None,
-               "attempt": 1, "on_fail": on_fail, "on_done": on_done}
+        job = {"queue": q, "tag": a.tag or default_tag(c), "project": named, "cwd": cwd, "cmd": c, "runner": [],
+               "shell_env": shell_env, "needs": needs, "owner": owner, "attempt": 1,
+               **{r.on_record: gave[r.name] for r in JOB_ROWS if r.on_record != "needs"}}
         if prepare_job:
-            prepare_job(job, a)
+            prepare_job(job, a, project)
         records.append(job)
     # The records and the ids they were given, whole: a batch lands in one transaction of the store, and the
     # signals that transaction holds back are delivered the moment it ends. They wait for these lines too, so
@@ -824,11 +913,11 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
         for jid, job in zip(ids, records):
             c = job["cmd"]
             print(jid)
-            extra = " ".join(x for x in (f"timeout {ui.human_duration(timeout)}" if timeout else "",
-                                          f"retries {retries}" if retries else "",
-                                          f"on-fail {on_fail}" if on_fail else "") if x)
+            extra = " ".join(x for x in (f"timeout {ui.human_duration(gave['timeout'])}" if gave["timeout"] else "",
+                                          f"retries {gave['retries']}" if gave["retries"] else "",
+                                          f"on-fail {gave['on_fail']}" if gave["on_fail"] else "") if x)
             via = f"  (via {_text(os.path.basename(job['runner'][0]))})" if job["runner"] else ""
-            print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(project)}] p{a.prio} {_needs_str(needs)} {extra}  "
+            print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(named)}] p{gave['prio']} {_needs_str(needs)} {extra}  "
                   f"{_text(shlex.join(c), 100)}{via}", file=sys.stderr)
     if not a.hold and not a.no_start:
         _worker_up(q, wake=True)
@@ -916,7 +1005,8 @@ def cmd_status(a, scope: list[str] | None) -> int:
     gpu = "  ".join(f"GPU{c['index']} {c['util']}% {c['used_gb']:.1f}/{c['total_gb']:.0f}G" for c in cards) if cards else (
         "GPU n/a" + (f" ({CARDS_WHY})" if CARDS_WHY else ""))
     print(f"{gpu}   {datetime.now():%Y-%m-%d %H:%M:%S}")
-    pool_strs = [_pool_str(p, now) for p in shared if p["used"] or p["probe"] or p["name"] not in SHARED_DEFAULTS]
+    default_pools = BY_SCOPE["machine"]["resources"].default
+    pool_strs = [_pool_str(p, now) for p in shared if p["used"] or p["probe"] or p["name"] not in default_pools]
     if pool_strs:
         print("shared: " + " · ".join(pool_strs))
     for e in bad:
@@ -1287,8 +1377,10 @@ def _reprio(a) -> int:
     return rc
 
 
-CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "env", "shell_env", "needs", "prio", "owner", "timeout",
-         "retries", "retry_delay", "retry_if", "on_fail", "on_done")
+# What a retry copies onto the new job: what names the work, and every per-job setting the record holds, from
+# the one declaration. So a row that lands on a record is carried over without a second list saying so.
+CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "shell_env", "owner") \
+    + tuple(dict.fromkeys(r.on_record for r in JOB_ROWS))
 
 
 def cmd_retry(a) -> int:
@@ -1317,7 +1409,7 @@ def cmd_retry(a) -> int:
 
 
 def cmd_clean(a, scope: list[str] | None) -> int:
-    cutoff = time.time() - _dur_arg(a.older, "--older", "d") if a.older is not None else None
+    cutoff = time.time() - a.older if a.older is not None else None
     victims = [j for j in jobcore.jobs(jobstore.ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
     if not victims:
         print("nothing to clean")
@@ -1568,20 +1660,9 @@ def _parser(prog: str, doc: str, add_args=None):
     p = sp("add", help="queue a command (after --)")
     p.add_argument("--tag", help="a name to select it by, alone or with the other jobs that share it "
                                  "(default: the command, cut to 40 characters)")
-    p.add_argument("--prio", type=int, default=10, help="lower runs first (default 10)")
-    p.add_argument("--gpu-gb", type=float, help="GPU memory to reserve on one card (the job's peak use, plus a margin)")
-    p.add_argument("--cpu", type=float, help="CPUs to reserve")
-    p.add_argument("--mem-gb", type=float, help="RAM to reserve, in GB")
-    p.add_argument("--need", action="append", metavar="NAME=N", help="a counter from [resources] (every queue's) or [queue.Q.resources] (one queue's own)")
-    p.add_argument("--env", action="append", metavar="K=V",
-                   help="set in the job's environment; wins over the project's [queue] env")
+    for row in JOB_ROWS:            # one flag per per-job row, from the one declaration
+        _flag(p, row)
     p.add_argument("--cwd", help="run there (default: here); also picks the project")
-    p.add_argument("--timeout", metavar="DUR", help="kill it after DUR (90s, 30m, 2h, 1d); none: no timeout")
-    p.add_argument("--retries", type=int, help="automatic retries of a failure (default 0)")
-    p.add_argument("--retry-delay", metavar="DUR", help="delay before the first retry, doubling after (default 30s)")
-    p.add_argument("--retry-if", metavar="REGEX", help="retry only failures whose reason or log tail matches")
-    p.add_argument("--on-fail", metavar="CMD", help="shell command run on the final failure; none: no hook")
-    p.add_argument("--on-done", metavar="CMD", help="shell command run on success; none: no hook")
     p.add_argument("--hold", action="store_true", help="park it as held until released")
     p.add_argument("--no-start", action="store_true", help="do not start a worker")
     p.add_argument("--from", dest="from_", metavar="FILE", help="one command per line; - for stdin")
@@ -1628,7 +1709,8 @@ def _parser(prog: str, doc: str, add_args=None):
     p.add_argument("--prio", type=int)
     p.add_argument("--no-start", action="store_true")
     p = sp("clean", help="remove ended job records, with the logs that belong to them")
-    p.add_argument("--older", metavar="AGE", help="only those ended before AGE ago (30m, 12h, 7d)")
+    p.add_argument("--older", metavar="AGE", type=_dur_flag("d"),
+                   help="only those ended before AGE ago (30m, 12h, 7d; a bare number is days)")
     p.add_argument("-n", "--dry-run", action="store_true")
     p.add_argument("-y", "--yes", action="store_true")
     for name, hlp in (("wait", "block until jobs end, then print the outcomes (exit 0 ok, 1 failed or dropped, 3 timeout)"),
@@ -1638,14 +1720,13 @@ def _parser(prog: str, doc: str, add_args=None):
         g = p.add_mutually_exclusive_group()
         g.add_argument("--idle", action="store_true", help="until nothing is queued or running")
         g.add_argument("--mine", action="store_true", help="every job this agent session queued that is live, or ended without a wait/watch of this session reporting it")
-        p.add_argument("--timeout", metavar="DUR", type=lambda v: _dur_arg(v, "--timeout"),
+        p.add_argument("--timeout", metavar="DUR", type=_dur_flag(),
                        help="give up after DUR (90s, 30m, 2h, 1d; a bare number is seconds) and exit 3")
-        p.add_argument("--poll", type=float, default=2.0, help="seconds between looks (default 2)")
+        p.add_argument("--poll", metavar="DUR", type=_dur_flag(), default=2.0,
+                       help="between looks (default 2s)")
         p.add_argument("--tail", type=int, default=15, help="log lines shown with a failure (default 15)")
         p.add_argument("--no-start", action="store_true", help="do not start a worker for queued jobs")
     p = sp("work", help="run a queue's worker in the foreground")
-    p.add_argument("--backfill", action="store_true", default=None, help="start later jobs that fit while the head waits")
-    p.add_argument("--poll", type=float)
     p = sp("worker", help="start | stop | status of the background workers")
     p.add_argument("action", choices=("start", "stop", "status"))
     p.add_argument("--json", action="store_true", help="status as JSON")
@@ -1654,8 +1735,8 @@ def _parser(prog: str, doc: str, add_args=None):
 
 def run_cli(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job=None, add_args=None) -> int:
     """The queue CLI for `pp <prog>`. default_queue receives `add` and `work` without -q; status, wait --idle, clean
-    and worker status cover every queue. prepare_job(job, args) amends each job at add time; add_args(parser) adds
-    options to `add`.
+    and worker status cover every queue. prepare_job(job, args, project) amends each job at add time, with the
+    project its [queue] table was read from; add_args(parser) adds options to `add`.
 
     The store's refusal of a queue another layout wrote is worded here, the one place it is said: every verb
     opens a queue, so the refusal can come from any of them, and the store writes no sentence."""
@@ -1702,6 +1783,6 @@ def _verb(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job,
              "release": lambda: _transition(a, ("held",), "queued", "release", "released"),
              "clean": lambda: cmd_clean(a, scope),
              "wait": lambda: cmd_wait(a, scope), "watch": lambda: cmd_wait(a, scope, stream=True),
-             "work": lambda: cmd_work(q or default_queue, a.backfill, a.poll),
+             "work": lambda: cmd_work(q or default_queue),
              "worker": lambda: cmd_worker(a, q, default_queue, scope)}
     return verbs[a.verb]() if a.verb in verbs else 2

@@ -18,7 +18,6 @@ Both are read-only to pp; edit them by hand. A malformed file is a loud error na
 from __future__ import annotations
 
 import os
-import re
 import tomllib
 
 from pp.lib import paths, proc
@@ -67,18 +66,6 @@ def check_keys(table: dict, where: str, known) -> None:
     bad = sorted(set(table) - set(known))
     if bad:
         raise ConfigError(f"{where}: unknown {', '.join(bad)} (known: {', '.join(known)})")
-
-
-def parse_duration(v, default_unit: str = "s") -> float | None:
-    """90 / 90s / 30m / 2h / 1d (a bare number is default_unit) -> seconds; None for None/''; ValueError otherwise."""
-    if v is None or v == "":
-        return None
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        return float(v) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[default_unit]
-    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", str(v))
-    if not m:
-        raise ValueError(f"'{v}' is not a duration like 90s, 30m, 2h, 1d")
-    return float(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2] or default_unit]
 
 
 def find_project(start: str | None = None) -> tuple[str | None, dict]:

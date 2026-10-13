@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+`pp queue`: every setting has one declaration, one default and one order of
+its sources.
+
+- Each setting of a job is a key of a project's `.pp.toml [queue]` as well
+  as of `[queue.NAME]`: `timeout`, `retries`, `retry_delay`, `retry_if`,
+  `on_fail`, `on_done`, `prio`, `gpu_gb`, `cpu`, `mem_gb`, `need` and
+  `env`. The first source that gives a setting wins, in this order:
+  `add`'s flag, the project's `[queue]`, the queue's `[queue.NAME]`, the
+  built-in default. `env` and `need` merge key by key.
+- Durations are read one way everywhere: `90s`, `30m`, `2h`, `1d`, a bare
+  number of seconds, `.5` and `1.5h`, and `none` where a setting offers it.
+  An empty value, a value that is not finite and one over 1e9 seconds are
+  refused, in a config key as on a command line.
+- Numbers are bounded: `retries` at most 1000, `retry_delay` at most the
+  one-hour cap, a queue's `poll` longer than 0. A need that is 0, negative
+  or nan is refused.
+- `pp queue work` takes no `--backfill` and no `--poll`: both are keys of
+  `[queue.NAME]`, which the queue's worker re-reads every loop, so they
+  change under running jobs with no restart.
+
 ## v0.1.1
 
 Fixes. A few command lines and config values that did harm are refused.

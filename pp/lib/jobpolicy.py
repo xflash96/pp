@@ -24,9 +24,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-TIMEOUT_GRACE = 10.0        # seconds between a timeout's SIGTERM and its SIGKILL
+# The built-in defaults the declaration's rows point at (pp/lib/jobq.py, SETTINGS). A rule below falls back
+# to one of them for a record written before that row was a setting of the job.
+TIMEOUT_GRACE = 10.0    # between a timeout's stop of a job and the SIGKILL that follows it
+PRIO = 10
 RETRY_DELAY = 30.0
 RETRY_DELAY_CAP = 3600.0
+RETRIES_CAP = 1000
 
 
 NOTHING = "nothing"         # leave it as it is
@@ -454,19 +458,294 @@ def select(records: list[dict], selection) -> list[int]:
     return out
 
 
-# ---- the settings a rule is handed ------------------------------------------------------------------
+# ---- what a setting is, how a value of it is read, and the one order of its sources -------------------
+#
+# Every setting a user can give is one row of one declaration (pp/lib/jobq.py, SETTINGS), and a row says its
+# type and spelling, its default, its scope, its flag, its keys and what it refuses. Three rules of a row are
+# here, because each is pure and each is the same for every row: which sources a row has, the value one
+# source gives, and the order those sources are read in. Two readers of one setting is a defect, so a flag's
+# word and a key's value are read by the one function below.
+
+
+class _NotSet:
+    """What a source that does not give a setting at all is.
+
+    `None` cannot say it: `--timeout none` and `on_done = "none"` are values of their rows, and a value has
+    to win over the sources behind it the way any value does."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NOTSET"
+
+
+NOTSET = _NotSet()
+
+UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+DURATION_CAP = 1e9      # seconds: past about thirty years a duration is a mistake and not a wait
+HOW_LONG = "say how long, like 90s, 30m, 2h or 1d"
+_DUR = re.compile(r"\s*(\d+(?:\.\d+)?|\.\d+)\s*([smhd]?)\s*")
+
+# Which sources a row has follows from what the setting belongs to, and nothing else decides it: a per-job
+# row has a flag and both keys, a per-queue row the queue's key, the machine's rows the machine's table, and
+# a per-project row its project's key and a flag for one job. A row that cannot have all of its scope's
+# sources is not a setting but an argument of `add`.
+SOURCES = {"job": ("flag", "project", "queue"), "project": ("flag", "project"),
+           "queue": ("queue",), "machine": ("machine",)}
+
+
+@dataclass(frozen=True)
+class Setting:
+    """One row of the declaration, and everything that is true of that setting.
+
+    name      the config key, which is the flag's name without the dashes and with `-` written `_`
+    scope     job | queue | machine | project: what it belongs to, which decides its sources
+    kind      its type and spelling, which `value` reads one source's word through
+    default   the one built-in default, which is what every source being absent comes to
+    printed   its default is printed in the help, so a release that changes it is a break
+    field     the record field a per-job row lands in, where that is not the row's own name
+    unit      what a bare number means, for a duration
+    lo, hi     the bounds the row gives
+    none_ok   `none` is a value of this row, and so is 0: no bound
+    auto_ok   "auto" is a value of this row: the size the machine knows of itself
+    merge     a table, merged key by key, instead of a scalar taken whole from one source
+    repeat    its flag may be given more than once
+    flagged   its scope has a flag and this row has it
+    top       its key is at the top of .pp.toml and not in that file's [queue]
+    metavar   what its flag's help calls the value
+    says      the line its flag's help prints
+    refuses   what it refuses, which the reader that met it words
+    """
+
+    name: str
+    scope: str
+    kind: str
+    default: object = None
+    printed: bool = False
+    field: str = ""
+    unit: str = "s"
+    lo: float | None = None
+    hi: float | None = None
+    none_ok: bool = False
+    auto_ok: bool = False
+    merge: bool = False
+    repeat: bool = False
+    flagged: bool = True
+    top: bool = False
+    metavar: str = ""
+    says: str = ""
+    refuses: str = ""
+
+    @property
+    def flag(self) -> str:
+        """The flag this row is given on a command line, or "" where it has none."""
+        has = self.flagged and "flag" in SOURCES[self.scope]
+        return "--" + self.name.replace("_", "-") if has else ""
+
+    @property
+    def tables(self) -> tuple:
+        """The config tables this row is a key of, by scope: `project` is the project's `.pp.toml [queue]`,
+        `queue` is `[queue.NAME]` and `machine` is `[resources]`."""
+        return tuple(k for k in ("project", "queue", "machine") if k in SOURCES[self.scope])
+
+    @property
+    def on_record(self) -> str:
+        """The record field a per-job row's resolved value lands in."""
+        return self.field or self.name
+
+
+def resolve(setting: Setting, flag=NOTSET, project=NOTSET, config=NOTSET):
+    """One row's value: the first source that gives it, in the one order every row is read in.
+
+        the flag  >  the project's .pp.toml [queue]  >  ~/.config/pp/config.toml [queue.NAME]  >  the default
+
+    A source that does not give the setting is NOTSET, so a value of `none` is a value and not an absence. A
+    scalar is taken whole from the first source that gives it; a table (env, need) merges key by key, with
+    the same order per key, so a project may add one variable to the queue's without naming the rest."""
+    if setting.merge:
+        out = dict(setting.default or {})
+        for src in (config, project, flag):
+            if src is not NOTSET:
+                out.update(src)
+        return out
+    for v in (flag, project, config):
+        if v is not NOTSET:
+            return v
+    return setting.default
+
+
+def value(setting: Setting, raw):
+    """What one source says about this row, as the row's own type: the one reading of a setting, for a flag's
+    word and for a key's value alike.
+
+    ValueError where the row refuses it, worded so that whoever read it names the flag or the key it came
+    from. A kind with no reading of its own comes back as it is, for the one reader that knows it (a pool)."""
+    kind = setting.kind
+    if kind in ("duration", "period"):
+        secs = duration(raw, setting.unit, setting.none_ok)
+        if secs is not None and setting.hi is not None and secs > setting.hi:
+            raise ValueError(f"'{raw}' is longer than {setting.hi:g} seconds, which is this one's cap")
+        if kind == "period" and not secs:
+            raise ValueError(f"'{raw}' is not longer than 0")
+        return secs
+    if kind == "whole":
+        return whole(raw, setting.lo, setting.hi)
+    if kind == "amount":
+        return amount(raw)
+    if kind == "number":
+        if setting.auto_ok and raw == "auto":
+            return raw
+        try:
+            return num(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{raw!r}: not a number") from None
+    if kind == "boolean":
+        return boolean(raw)
+    if kind == "regex":
+        return regex(raw)
+    if kind == "command":
+        return hook_spec(raw)
+    if kind == "shell":
+        return shell(raw)
+    if kind == "text":
+        return text(raw)
+    if kind == "strings":
+        return {k: one_line(k, v) for k, v in pairs(raw).items()}
+    if kind == "counts":
+        return {k: amount(v) for k, v in pairs(raw).items()}
+    return raw
+
+
+def duration(v, unit: str = "s", none_ok: bool = False) -> float | None:
+    """The one reading of a duration, in seconds: 90s, 30m, 2h, 1d, .5 and 1.5h, and a bare number in `unit`.
+    `none` is no bound where the row allows one, and so is 0.
+
+    An empty value, a spelling this does not know, a value that is not finite and a value past DURATION_CAP
+    seconds are each refused. A config key is written `""` by a shell that expanded a variable it had not
+    set as much as a flag is, and reading that as "no bound" is a wait with no deadline; where a row means to
+    offer one it offers the word."""
+    if v is None or v == "" or isinstance(v, bool):
+        raise ValueError(HOW_LONG + (", or none" if none_ok else ""))
+    if isinstance(v, str) and v.strip().lower() == "none":
+        if none_ok:
+            return None
+        raise ValueError(f"'{v}' is no duration, and this one takes no 'none': {HOW_LONG}")
+    if isinstance(v, (int, float)):
+        secs = float(v) * UNITS[unit]
+    else:
+        m = _DUR.fullmatch(str(v))
+        if not m:
+            raise ValueError(f"'{v}' is not a duration like 90s, 30m, 2h or 1d")
+        secs = float(m[1]) * UNITS[m[2] or unit]
+    if not 0 <= secs <= DURATION_CAP:       # nan and inf compare false with everything, so both land here
+        raise ValueError(f"'{v}' is not a duration from 0 to {DURATION_CAP:g} seconds")
+    return None if none_ok and secs == 0 else secs
+
 
 def num(v) -> int | float:
+    """A number, as a whole one where it is one: 3 rather than 3.0, since a count reads better that way."""
     f = float(v)
     return int(f) if f.is_integer() else f
 
 
+def whole(v, lo: float | None = None, hi: float | None = None) -> int:
+    """A whole number inside the bounds the row gives. A fraction is refused rather than rounded."""
+    if isinstance(v, bool) or isinstance(v, float):
+        raise ValueError(f"{v!r}: a whole number, not a fraction")
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{v!r}: a whole number") from None
+    if (lo is not None and n < lo) or (hi is not None and n > hi):
+        bound = (f"from {lo:g} to {hi:g}" if lo is not None and hi is not None
+                 else f"of at least {lo:g}" if lo is not None else f"of at most {hi:g}")
+        raise ValueError(f"{n}: a whole number {bound}")
+    return n
+
+
+def amount(v) -> int | float:
+    """How much of a pool a job asks for: a positive number. 0, a negative, nan and inf are refused, nan
+    because it compares false with everything and so would wait for a pool that can never hold it."""
+    if isinstance(v, bool):
+        raise ValueError(f"{v!r}: a positive number")
+    try:
+        f = num(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{v}' is not a number") from None
+    if not 0 < f < float("inf"):
+        raise ValueError(f"{f:g}: a positive number")
+    return f
+
+
+def boolean(v) -> bool:
+    if not isinstance(v, bool):
+        raise ValueError(f"{v!r}: true or false")
+    return v
+
+
+def text(v) -> str:
+    if not isinstance(v, str):
+        raise ValueError(f"{v!r}: a string")
+    return v
+
+
+def shell(v) -> str:
+    """A shell command a setting carries: a string with something in it."""
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"{v!r}: a shell command")
+    return v
+
+
+def regex(v) -> str | None:
+    """A pattern that compiles, or None where it is empty: a row with no pattern matches every failure, so an
+    empty one written on purpose turns a default off."""
+    if not isinstance(v, str):
+        raise ValueError(f"{v!r}: a string")
+    if not v:
+        return None
+    try:
+        re.compile(v)
+    except re.error as e:
+        raise ValueError(f"{v!r}: {e}") from None
+    return v
+
+
 def hook_spec(v) -> str | None:
-    v = (v or "").strip() if isinstance(v, str) else v
-    return None if not v or v == "none" else str(v)
+    """A shell command, or None where it is `none` or empty: a hook the job does not carry."""
+    if v is not None and not isinstance(v, str):
+        raise ValueError(f"{v!r}: a shell command, or none")
+    v = (v or "").strip()
+    return None if not v or v == "none" else v
 
 
 def hook_argv(spec: str | None) -> list[str] | None:
     """argv a hook runs as: a shell command."""
     spec = hook_spec(spec)
     return None if spec is None else ["/bin/sh", "-c", spec]
+
+
+def pairs(v) -> dict:
+    """A table row's value from either source: the table a config key holds, or the NAME=VALUE words a
+    repeated flag gave."""
+    if isinstance(v, dict):
+        return {str(k): val for k, val in v.items()}
+    if not isinstance(v, (list, tuple)):
+        raise ValueError(f'{v!r}: a table, like {{ NAME = "value" }}')
+    out = {}
+    for it in (v if isinstance(v, (list, tuple)) else [v]):
+        k, sep, val = str(it).partition("=")
+        if not sep or not k:
+            raise ValueError(f"'{it}': NAME=VALUE")
+        out[k] = val
+    return out
+
+
+def one_line(name: str, v) -> str:
+    """One variable of a job's environment: a name without `=` or NUL, and a value on one line, because the
+    environment is handed to a runner as one line per variable."""
+    if "=" in name or "\0" in name:
+        raise ValueError(f"'{name}': a name holds neither = nor NUL")
+    s = str(v)
+    if "\n" in s:
+        raise ValueError(f"'{name}': a value holds no newline")
+    return s

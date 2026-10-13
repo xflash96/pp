@@ -1,3 +1,4 @@
+import dataclasses
 import inspect
 import io
 import json
@@ -565,14 +566,21 @@ class TestStore(QueueCase):
         self.assertEqual(sorted(int(line) for line in out.getvalue().split()), stored)
 
     def test_durations(self):
-        self.assertEqual(jobq.parse_duration("90"), 90)
-        self.assertEqual(jobq.parse_duration("30m"), 1800)
-        self.assertEqual(jobq.parse_duration("2h"), 7200)
-        self.assertEqual(jobq.parse_duration("1.5d"), 129600)
-        self.assertEqual(jobq.parse_duration(7, "d"), 7 * 86400)
-        self.assertIsNone(jobq.parse_duration(None))
-        with self.assertRaises(ValueError):
-            jobq.parse_duration("2 weeks")
+        """One reading of a duration, for every row and every flag that takes one: the spellings it knows,
+        the unit a bare number is in, and what it refuses. A value no row can hold is refused where it is
+        read, so nothing turns into a wait with no deadline further in."""
+        for v, secs in (("90", 90.0), (90, 90.0), ("90s", 90.0), ("30m", 1800.0), ("2h", 7200.0),
+                        ("1d", 86400.0), ("1.5h", 5400.0), (".5", 0.5), (" 2h ", 7200.0), ("0", 0.0)):
+            with self.subTest(duration=v):
+                self.assertEqual(jobpolicy.duration(v), secs)
+        self.assertEqual(jobpolicy.duration(7, "d"), 7 * 86400.0)       # a bare number in the row's unit
+        self.assertEqual(jobpolicy.duration("1.5d"), 129600.0)
+        self.assertIsNone(jobpolicy.duration("none", none_ok=True))     # no bound, where the row offers one
+        self.assertIsNone(jobpolicy.duration("NONE", none_ok=True))
+        self.assertIsNone(jobpolicy.duration(0, none_ok=True))
+        for v in ("", None, "none", "2 weeks", "-5", "lots", True, float("nan"), float("inf"), 1e10, "1e10"):
+            with self.subTest(refused=v), self.assertRaises(ValueError):
+                jobpolicy.duration(v)
 
     def test_an_empty_duration_on_a_command_line_is_a_usage_error(self):
         """A config key written as "" is a key that is not set, and the default behind it stands. A command
@@ -3012,6 +3020,7 @@ class TestTheWorkersWait(QueueCase):
         its own wait, so the worker ticks with it. A timeout is a stop the worker wrote itself and nobody
         waits for, so it waits its poll out rather than taking the one store lock ten times a second until
         the job is gone."""
+        self.config("slots = 3", "poll = 5")        # the queue's own poll: the worker re-reads it every loop
         j = self.add("--timeout", "60", cmd="sleep 30")
         jobq.worker_for("default").tick()                   # running, under no claim of its own
         self.started_earlier(j, 120)                    # and its time is up, so the next tick writes the stop
@@ -3025,7 +3034,7 @@ class TestTheWorkersWait(QueueCase):
                 proc.raise_to_self(signal.SIGTERM)      # the worker stops after the second wait it asks for
             return real(self_, 0)
         with mock.patch.object(jobcore.Wait, "wait", wait), redirect_stdout(io.StringIO()):
-            self.assertEqual(jobq.cmd_work("default", poll=5.0), 0)
+            self.assertEqual(jobq.cmd_work("default"), 0)
         self.assertEqual(asked, [5.0, 5.0])             # the queue's poll, never STOP_PERIOD
         self.assertEqual((jobstore.find(j)["stop"] or {}).get("by"), "timeout")
         self.assertLess(jobpolicy.STOP_PERIOD, 5.0)
@@ -3378,6 +3387,53 @@ class TestThePolicyTables(unittest.TestCase):
                             self.assertEqual(got.get("was"), "timeout" if was == "timeout" and kill else None)
         self.assertEqual(rows, 24)
 
+    # -- resolve: the four sources of one row, present or absent, exhaustive --------------------------------
+    def test_the_one_order_a_settings_sources_are_read_in(self):
+        """Section 2's one precedence, for every row of the declaration and over all sixteen ways its four
+        sources can be present or absent: the flag, then the project's .pp.toml [queue], then the queue's
+        [queue.NAME], then the row's own default.
+
+        A source that does not give the setting is NOTSET, which is what lets `none` be a value: a row whose
+        flag said `none` takes None and does not fall through to a key behind it. A scalar is taken whole
+        from the first source that gives it; a table merges key by key, in the same order per key."""
+        rows = 0
+        for row in jobq.SETTINGS:
+            for has_flag in (True, False):
+                for has_project in (True, False):
+                    for has_queue in (True, False):
+                        for has_default in (True, False):
+                            rows += 1
+                            r = row if has_default else dataclasses.replace(row, default=None)
+                            if row.merge:
+                                src = {"flag": {"a": "f", "both": "f"}, "project": {"b": "p", "both": "p"},
+                                       "queue": {"c": "q", "both": "q"}}
+                                want = {}
+                                for key, on in (("queue", has_queue), ("project", has_project),
+                                                ("flag", has_flag)):
+                                    want.update(src[key] if on else {})
+                                want = {**(r.default or {}), **want}
+                            else:
+                                src = {"flag": "f", "project": "p", "queue": "q"}
+                                want = ("f" if has_flag else "p" if has_project else "q" if has_queue
+                                        else r.default)
+                            got = jobpolicy.resolve(
+                                r, src["flag"] if has_flag else jobpolicy.NOTSET,
+                                src["project"] if has_project else jobpolicy.NOTSET,
+                                src["queue"] if has_queue else jobpolicy.NOTSET)
+                            with self.subTest(setting=row.name, scope=row.scope, flag=has_flag,
+                                              project=has_project, queue=has_queue, default=has_default):
+                                self.assertEqual(got, want)
+        self.assertEqual(rows, 16 * len(jobq.SETTINGS))
+
+    def test_a_value_of_none_wins_over_the_sources_behind_it(self):
+        """`--timeout none` and `on_done = "none"` are values of their rows and not an absence of one, so a
+        queue's default timeout can be lifted for one job and a project's hook turned off for one queue."""
+        timeout, on_done = jobq.BY_SCOPE["job"]["timeout"], jobq.BY_SCOPE["job"]["on_done"]
+        self.assertIsNone(jobpolicy.resolve(timeout, jobpolicy.value(timeout, "none"), config=7200.0))
+        self.assertIsNone(jobpolicy.resolve(timeout, jobpolicy.value(timeout, "0"), config=7200.0))
+        self.assertIsNone(jobpolicy.resolve(on_done, jobpolicy.value(on_done, "none"), config="true"))
+        self.assertEqual(jobpolicy.resolve(timeout, jobpolicy.NOTSET, config=7200.0), 7200.0)
+
     # -- matches: --retry-if over the text it is handed, exhaustive ------------------------------------------
     def test_what_retry_if_matches_over_every_pattern(self):
         """`--retry-if` is read against the failure's own reason and the tail of the job's log, as one text.
@@ -3668,6 +3724,331 @@ class TestThePolicyTables(unittest.TestCase):
         was = json.dumps(job, sort_keys=True)
         self.assertEqual(jobpolicy.job_env(job, 0), jobpolicy.job_env(job, 0))
         self.assertEqual(json.dumps(job, sort_keys=True), was)
+
+
+class TestTheSettingsTable(unittest.TestCase):
+    """The settings table generated from the one declaration in the code (pp/lib/jobq.py, SETTINGS), beside
+    the table the interface holds, row for row.
+
+    A row the code has and the table does not, a row the table has and the code does not, and a difference in
+    a row's flag, its keys, its default or whether that default is printed, are each a failure here. So one
+    declaration, one default and one precedence is a test and not a reading. The rows whose behaviour a later
+    stage brings are named below and asserted absent, so neither list can go quiet.
+    """
+
+    # the table's own rows: (setting, scope, flag, its key or keys, default, its default is printed)
+    TABLE = (
+        ("name", "project", "", "name (top level)", None, False),
+        ("prio", "job", "--prio", "[queue] prio, [queue.NAME] prio", 10, True),
+        ("gpu_gb", "job", "--gpu-gb", "[queue] gpu_gb, [queue.NAME] gpu_gb", None, False),
+        ("cpu", "job", "--cpu", "[queue] cpu, [queue.NAME] cpu", None, False),
+        ("mem_gb", "job", "--mem-gb", "[queue] mem_gb, [queue.NAME] mem_gb", None, False),
+        ("need", "job", "--need", "[queue] need, [queue.NAME] need", {}, False),
+        ("env", "job", "--env", "[queue] env, [queue.NAME] env", {}, False),
+        ("timeout", "job", "--timeout", "[queue] timeout, [queue.NAME] timeout", None, False),
+        ("retries", "job", "--retries", "[queue] retries, [queue.NAME] retries", 0, True),
+        ("retry_delay", "job", "--retry-delay", "[queue] retry_delay, [queue.NAME] retry_delay", 30.0, True),
+        ("retry_if", "job", "--retry-if", "[queue] retry_if, [queue.NAME] retry_if", None, False),
+        ("on_fail", "job", "--on-fail", "[queue] on_fail, [queue.NAME] on_fail", None, False),
+        ("on_done", "job", "--on-done", "[queue] on_done, [queue.NAME] on_done", None, False),
+        ("poll", "queue", "", "[queue.NAME] poll", 2.0, True),
+        ("idle_exit", "queue", "", "[queue.NAME] idle_exit", 600.0, True),
+        ("backfill", "queue", "", "[queue.NAME] backfill", False, True),
+        ("resources", "queue", "", "[queue.NAME.resources]", {"slots": 3}, True),
+        ("resources", "machine", "", "[resources] NAME",
+         {"cpu": "auto", "mem_gb": "auto", "gpu_gb": "auto"}, True),
+        ("max", "machine", "", "[resources] max", "auto", False),
+        ("probe", "machine", "", "[resources] probe", None, False),
+        ("every", "machine", "", "[resources] every", 30.0, True),
+        ("settle", "machine", "", "[resources] settle", 30.0, True),
+    )
+
+    # the rows of the same table whose flag and behaviour a later stage brings: (setting, scope, stage)
+    LATER = (("runner", "project", 4), ("stop", "project", 4), ("log", "job", 4))
+
+    @staticmethod
+    def keys_of(row) -> str:
+        """A row's key or keys as the table words them, from the tables its scope gives it and nothing else."""
+        if row.kind == "pools":
+            return "[queue.NAME.resources]" if row.scope == "queue" else "[resources] NAME"
+        if row.top:
+            return f"{row.name} (top level)"
+        return ", ".join({"project": f"[queue] {row.name}", "queue": f"[queue.NAME] {row.name}",
+                          "machine": f"[resources] {row.name}"}[t] for t in row.tables)
+
+    def generated(self) -> tuple:
+        """The table the declaration itself gives, in the order it declares its rows."""
+        return tuple((r.name, r.scope, r.flag, self.keys_of(r), r.default, r.printed) for r in jobq.SETTINGS)
+
+    def test_the_generated_table_is_the_one_the_interface_holds(self):
+        """Printed beside it, and equal to it row for row: every setting a user can give, its scope, its
+        flag where its scope has one, its keys, its default, and whether that default is printed."""
+        got, want = self.generated(), self.TABLE
+        print("\nsetting      scope    flag           keys                               default        printed")
+        for name, scope, flag, keys, default, printed in got:
+            print(f"{name:<12} {scope:<8} {flag:<14} {keys:<34} {str(default):<14} {printed}")
+        self.assertEqual({(r[0], r[1]) for r in got} - {(r[0], r[1]) for r in want}, set(),
+                         "the code has these rows and the table does not")
+        self.assertEqual({(r[0], r[1]) for r in want} - {(r[0], r[1]) for r in got}, set(),
+                         "the table has these rows and the code does not")
+        self.assertEqual(sorted(got, key=lambda r: (r[0], r[1])),
+                         sorted(want, key=lambda r: (r[0], r[1])))
+
+    def test_the_rows_a_later_stage_brings_are_named_and_not_declared(self):
+        """A row whose behaviour is not built yet is not declared, so nothing resolves a setting pp does not
+        carry out. Each is named here with the stage that brings it, and the stage before that one fails
+        here if it declares the row early or late."""
+        declared = {(r.name, r.scope) for r in jobq.SETTINGS}
+        for name, scope, stage in self.LATER:
+            with self.subTest(setting=name, stage=stage):
+                self.assertNotIn((name, scope), declared)
+                self.assertEqual(stage, 4)
+        self.assertEqual([r for r in self.LATER if r[2] == 5], [], "no row of the table waits for stage 5")
+
+    def test_a_rows_sources_follow_from_its_scope(self):
+        """Which sources a row has follows from what the setting belongs to, and nothing else decides it: a
+        per-job row has a flag and both keys, a per-queue row the queue's key alone, the machine's rows the
+        machine's table alone, and a per-project row its project's key and a flag for one job.
+
+        A row that cannot have all of its scope's sources is not a setting but an argument of `add`, which is
+        why `--tag`, `--hold`, `--after` and `--cwd` are no rows of this table."""
+        want = {"job": ("project", "queue"), "queue": ("queue",), "machine": ("machine",),
+                "project": ("project",)}
+        for r in jobq.SETTINGS:
+            with self.subTest(setting=r.name, scope=r.scope):
+                self.assertEqual(r.tables, want[r.scope])
+                self.assertEqual(bool(r.flag), r.scope in ("job", "project") and r.flagged)
+        # the one row of the table that has no flag, because it names the project and not a job of it
+        self.assertEqual([r.name for r in jobq.SETTINGS if not r.flag and r.scope in ("job", "project")],
+                         ["name"])
+        for name in ("tag", "hold", "after", "cwd", "no_runner"):
+            self.assertNotIn(name, {r.name for r in jobq.SETTINGS})
+
+    def test_every_row_says_its_type_and_what_it_refuses(self):
+        """A row arrives with its type and its refusals written down, so a setting cannot be added without
+        saying what a user may write and what is refused."""
+        kinds = {"text", "whole", "amount", "counts", "strings", "duration", "period", "regex", "command",
+                 "shell", "number", "boolean", "pools"}
+        for r in jobq.SETTINGS:
+            with self.subTest(setting=r.name, scope=r.scope):
+                self.assertIn(r.kind, kinds)
+                self.assertTrue(r.refuses or r.kind == "pools", "this row says nothing about what it refuses")
+                if r.flag:
+                    self.assertTrue(r.says, "this row's flag has no help line")
+
+    def test_adds_flags_are_the_rows_and_nothing_else_is_a_setting(self):
+        """Every per-job row has its flag on `add`, built from the row itself, and every other flag of `add`
+        is an argument of one run and no setting of anything. So a flag cannot be added beside the
+        declaration, which is what makes a flag and a key unable to disagree."""
+        add = jobq._parser("queue", "doc")._subparsers._group_actions[0].choices["add"]
+        flags = {o for action in add._actions for o in action.option_strings if o.startswith("--")}
+        self.assertEqual({r.flag for r in jobq.JOB_ROWS} - flags, set(), "these rows have no flag on add")
+        self.assertEqual(flags - {r.flag for r in jobq.JOB_ROWS},
+                         {"--help", "--queue", "--tag", "--cwd", "--hold", "--no-start", "--from"})
+
+
+class TestTheSettingsSources(QueueCase):
+    """Every per-job row read from each of the sources its scope gives it, end to end, with the resolved
+    value on the job's record.
+
+    A setting with a second reader would take one source and miss another, so these are the tests that there
+    is one reading of each row: the same row is given in the queue's table, in the project's own [queue] and
+    on `add`'s flag, and the one that wins is the one the order names."""
+
+    # (setting, as a config table writes it, as add's flag writes it, what the record then holds)
+    SOURCES = (
+        ("prio", "prio = 3", ("--prio", "4"), ("prio", 3, 4)),
+        ("timeout", 'timeout = "2h"', ("--timeout", "30m"), ("timeout", 7200.0, 1800.0)),
+        ("retries", "retries = 2", ("--retries", "5"), ("retries", 2, 5)),
+        ("retry_delay", 'retry_delay = "1m"', ("--retry-delay", "90s"), ("retry_delay", 60.0, 90.0)),
+        ("retry_if", 'retry_if = "OOM"', ("--retry-if", "reset"), ("retry_if", "OOM", "reset")),
+        ("on_fail", 'on_fail = "true"', ("--on-fail", "false"), ("on_fail", "true", "false")),
+        ("on_done", 'on_done = "true"', ("--on-done", "false"), ("on_done", "true", "false")),
+        ("cpu", "cpu = 2", ("--cpu", "3"), ("needs.cpu", 2, 3)),
+        ("mem_gb", "mem_gb = 4", ("--mem-gb", "5"), ("needs.mem_gb", 4, 5)),
+        ("need", "need = { tok = 1 }", ("--need", "tok=2"), ("needs.tok", 1, 2)),
+        ("env", 'env = { K = "cfg" }', ("--env", "K=flag"), ("env.K", "cfg", "flag")),
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.resources("tok = 4")
+
+    def project(self, text: str, where: str | None = None) -> str:
+        """A project directory with that [queue] table in its .pp.toml, and its path."""
+        root = where or self.sb.dir("proj")
+        with open(os.path.join(root, ".pp.toml"), "w") as f:
+            f.write(f'name = "proj"\n[queue]\n{text}\n')
+        return root
+
+    def held(self, jid, field: str):
+        """What the record holds for a row, by the field the row lands in (`needs.cpu` is one of its needs)."""
+        j = jobstore.find(jid)
+        for part in field.split("."):
+            j = j.get(part) if isinstance(j, dict) else None
+        return j
+
+    def test_a_row_is_read_from_the_queues_table(self):
+        """Every per-job key of [queue.NAME] is that queue's default for the jobs added to it."""
+        for name, table, _flag, (field, want, _won) in self.SOURCES:
+            with self.subTest(setting=name):
+                self.config("slots = 3", table)
+                self.assertEqual(self.held(self.add(), field), want)
+
+    def test_a_row_is_read_from_the_projects_own_queue_table(self):
+        """Every per-job key of a project's `.pp.toml [queue]` is that project's default for the jobs added
+        from its directory, which is what makes one project's work describable in one file."""
+        for name, table, _flag, (field, want, _won) in self.SOURCES:
+            with self.subTest(setting=name):
+                root = self.project(table)
+                self.assertEqual(self.held(self.add(cwd=root), field), want)
+
+    def test_the_flag_wins_over_both_keys_and_the_project_over_the_queue(self):
+        """The one order, over every row that has more than one source: the flag, then the project's
+        .pp.toml [queue], then the queue's table, then the default."""
+        for name, table, flag, (field, want, won) in self.SOURCES:
+            with self.subTest(setting=name):
+                self.config("slots = 3", table)
+                root = self.project(table)
+                self.assertEqual(self.held(self.add(cwd=root, *flag), field), won)
+        # the project's key wins over the queue's, with nothing on the command line
+        self.config("slots = 3", "retries = 2")
+        self.assertEqual(self.held(self.add(cwd=self.project("retries = 7")), "retries"), 7)
+
+    def test_a_table_merges_key_by_key_and_a_scalar_is_taken_whole(self):
+        """env and need merge key by key, with the same order per key, so a project adds one variable to the
+        queue's without naming the rest. Every other row is taken whole from one source."""
+        self.config("slots = 3", 'env = { A = "q", B = "q" }\nneed = { tok = 1 }')
+        root = self.project('env = { B = "p", C = "p" }')
+        j = jobstore.find(self.add("--env", "C=f", "--env", "D=f", cwd=root))
+        self.assertEqual(j["env"], {"A": "q", "B": "p", "C": "f", "D": "f"})
+        self.assertEqual(j["needs"], {"slots": 1, "tok": 1})
+
+    def test_a_default_stands_where_no_source_gives_the_row(self):
+        """Nothing has to be configured to start: every row has one built-in default, and that is what an
+        `add` with no flag, no project and no queue table comes to."""
+        j = jobstore.find(self.add())
+        for r in jobq.JOB_ROWS:
+            with self.subTest(setting=r.name):
+                if r.on_record == "needs":
+                    self.assertNotIn(r.name, j["needs"])
+                else:
+                    self.assertEqual(j[r.on_record], r.default)
+        self.assertEqual(j["needs"], {"slots": 1})       # every job takes one slot, and that has no row
+
+    def test_a_retry_carries_every_row_the_record_holds(self):
+        """A retry is a new job of the same work, so it carries what the old one was given rather than
+        resolving the settings of the day it is re-queued."""
+        self.config("slots = 3", 'retry_delay = "90s"')
+        j = self.add("--timeout", "2h", "--retries", "1")
+        w = jobq.worker_for("default")
+        self.run_until(w, lambda: self.state(j) in jobstore.ENDED)
+        self.config("slots = 3", 'retry_delay = "1s"')      # changed under it, and the retry keeps the old one
+        rc, out, err = self.call("retry", str(j), "--no-start")
+        self.assertEqual(rc, 0, err)
+        new = jobstore.find(int(re.search(r"\b(\d+)\b", out.split("\n")[0]).group(1)))
+        self.assertEqual((new["retry_delay"], new["timeout"], new["retries"]), (90.0, 7200.0, 1))
+
+
+class TestWhatASettingRefuses(QueueCase):
+    """What each row refuses, refused where it is read: on the flag as a usage error, and in a config table
+    as an error naming the file's key. One row, so a flag and a key refuse the same values."""
+
+    # (how a config table writes it, how add's flag writes it, a word of the refusal). A form a source
+    # cannot express is None: a flag's NAME=VALUE splits on its first =, so only a table can hold a name
+    # that itself holds one.
+    REFUSED = (
+        ("retries = 1001", ("--retries", "1001"), "1000"),
+        ("retries = -1", ("--retries", "-1"), "whole number"),
+        ("retries = 1.5", ("--retries", "1.5"), "whole number"),
+        ('retry_delay = "2h"', ("--retry-delay", "2h"), "3600"),
+        ('timeout = ""', ("--timeout", ""), "say how long"),
+        ('timeout = "soon"', ("--timeout", "soon"), "not a duration"),
+        ("timeout = nan", ("--timeout", "nan"), "duration"),
+        ("timeout = 1e10", ("--timeout", "1e10"), "duration"),
+        ('retry_if = "(unclosed"', ("--retry-if", "(unclosed"), "unterminated"),
+        ("cpu = 0", ("--cpu", "0"), "positive number"),
+        ("cpu = -2", ("--cpu", "-2"), "positive number"),
+        ("cpu = nan", ("--cpu", "nan"), "positive number"),
+        ("need = { tok = 0 }", ("--need", "tok=0"), "positive number"),
+        ("need = 3", None, "a table"),
+        ('env = { "A=B" = "v" }', None, "NUL"),
+        ('env = { A = "one\\ntwo" }', ("--env", "A=one\ntwo"), "newline"),
+        ("prio = 1.5", ("--prio", "1.5"), "whole number"),
+    )
+
+    def test_a_flag_a_row_refuses_is_a_usage_error_and_queues_nothing(self):
+        """Refused at the earliest moment: before the job is stored, so nothing is queued under a value pp
+        would have to guess at later."""
+        for _table, flag, word in self.REFUSED:
+            if flag is None:
+                continue
+            with self.subTest(flag=flag):
+                rc, _out, err = self.call("add", "--no-start", "--cwd", self.work, *flag, "--", "true")
+                self.assertEqual(rc, 2, err)
+                self.assertIn(word, err)
+                self.assertNotIn("Traceback", err)
+        self.assertEqual(jobstore.jobs(), [])
+
+    def test_a_key_a_row_refuses_names_the_table_and_the_key(self):
+        """A config file pp cannot read is a loud error naming it, never a silent default: `pp queue` says
+        so, and while it stands the queue's worker launches nothing."""
+        for table, _flag, word in self.REFUSED:
+            with self.subTest(key=table):
+                self.config("slots = 3", table)
+                with self.assertRaises(config.ConfigError) as cm:
+                    jobq._qcfg("default")
+                self.assertIn("[queue.default]", str(cm.exception))
+                self.assertIn(table.split(" ")[0], str(cm.exception))
+                self.assertIn(word, str(cm.exception))
+
+    def test_a_key_of_a_project_that_a_row_refuses_names_that_file(self):
+        """The same reading, in the project's own table, so one file's mistake is named where it was made.
+        A project's keys are read where the job is added, so nothing of that project is queued."""
+        root = self.sb.dir("bad")
+        with open(os.path.join(root, ".pp.toml"), "w") as f:
+            f.write("[queue]\nretries = 1001\n")
+        with self.assertRaises(config.ConfigError) as cm:
+            self.call("add", "--no-start", "--cwd", root, "--", "true")
+        self.assertIn(".pp.toml", str(cm.exception))
+        self.assertIn("retries", str(cm.exception))
+        self.assertEqual(jobstore.jobs(), [])
+
+    def test_an_unknown_key_is_a_typo_in_either_table(self):
+        """A key pp does not read is a typo until proven otherwise, in the queue's table and in a project's,
+        and the error names the keys that table does take."""
+        self.config("slots = 3", "retires = 2")
+        with self.assertRaises(config.ConfigError) as cm:
+            jobq._qcfg("default")
+        self.assertIn("unknown retires", str(cm.exception))
+        root = self.sb.dir("typo")
+        with open(os.path.join(root, ".pp.toml"), "w") as f:
+            f.write("[queue]\nretires = 2\n")
+        with self.assertRaises(config.ConfigError) as cm:
+            self.call("add", "--no-start", "--cwd", root, "--", "true")
+        self.assertIn("unknown retires", str(cm.exception))
+
+    def test_a_queues_poll_is_longer_than_nothing(self):
+        """The one per-queue bound: a poll of 0 would hold the store lock as fast as the loop can ask for
+        it, so it is refused where it is read."""
+        for bad in ("poll = 0", "poll = -1"):
+            with self.subTest(poll=bad):
+                self.config("slots = 3", bad)
+                with self.assertRaises(config.ConfigError):
+                    jobq._qcfg("default")
+        self.config("slots = 3", 'poll = "0.5"')
+        self.assertEqual(jobq._qcfg("default")["poll"], 0.5)
+
+    def test_an_environment_name_holds_no_equals_and_a_value_one_line(self):
+        """The job's environment is handed to a runner as one line per variable. A flag's NAME=VALUE splits
+        on its first `=`, so `--env A=B=v` is the variable A with the value B=v, and only a table can write
+        a name that holds one."""
+        j = jobstore.find(self.add("--env", "A=B=v"))
+        self.assertEqual(j["env"], {"A": "B=v"})
+        self.config("slots = 3", 'env = { "A=B" = "v" }')
+        with self.assertRaises(config.ConfigError) as cm:
+            jobq._qcfg("default")
+        self.assertIn("A=B", str(cm.exception))
 
 
 class TestWhatTheTextNames(QueueCase):

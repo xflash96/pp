@@ -41,7 +41,7 @@ IDs are numbers, ranges (12-15) or a tag (add --tag NAME; without one, the tag i
 characters). -q narrows a selection to one queue. A job named by its id must suit the verb, or it is an error; a
 range, or a tag several jobs share, leaves the jobs it does not suit as they are, and kill and drop show such a
 selection and ask first (-y: do not ask, -n: only show). Lower --prio runs first (default 10), ties by id. Each
-queue is strict head-of-line unless its worker runs with backfill, so a big job is never starved by small
+queue is strict head-of-line unless its own backfill is on, so a big job is never starved by small
 ones. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what
 it meant in your shell.
 
@@ -74,12 +74,26 @@ Hooks, on the FINAL outcome of a job
     PP_QUEUE_EVENT (failed|done) PP_QUEUE_RC PP_QUEUE_REASON PP_QUEUE_LOG PP_QUEUE_CWD PP_QUEUE_TAG; their output
     goes to <queue>/hooks/<id>-<event>.log.
 
+Settings: one default, one key, one flag, one order. Every setting has a built-in default, so nothing has to
+be configured to start. Where one has more than one source, the first of these that gives it wins, and a key is
+its flag's name without the dashes and with - written _ (retry_if, retry_delay, on_fail, on_done, gpu_gb,
+mem_gb):
+
+    add's flag  >  the project's .pp.toml [queue]  >  ~/.config/pp/config.toml [queue.NAME]  >  the default
+
+A setting a JOB carries has a flag and a key in both tables, and what it comes to goes on the job's record, so
+a later config edit never changes a job already queued. A setting a QUEUE carries has a key and no flag,
+because its worker re-reads it every loop. env and need merge key by key; every other setting is taken whole
+from one source. --tag, --hold and --cwd name one run, so they have no key: a shared default for any of them
+would be wrong for every job that took it.
+
 Per project, from the nearest .pp.toml up from the job's directory:
 
     [queue]
     runner = "docker/run.sh"         # put before every command added from this project (relative to the
                                      # project root); --no-runner skips it
     env = { HF_HUB_OFFLINE = "1" }   # added to each job's environment; add's --env wins
+    timeout = "6h"                   # and any other per-job key, as this project's default
 
 The job runs in the directory you queued it from (or --cwd), as `RUNNER CMD...`. The runner gets env and
 CUDA_VISIBLE_DEVICES (the card --gpu-gb reserved) in its own environment. A container runner must pass them in
@@ -114,12 +128,13 @@ still records how running jobs end and enforces their timeouts. So does an empty
 rewritten in place is for a moment; remove it to use the defaults:
 
     [queue.default]
-    timeout = "6h"       # defaults for jobs added to this queue (add's flags win)
+    timeout = "6h"       # defaults for jobs added to this queue (add's flags and the project's [queue] win)
     retries = 1
     retry_delay = "1m"
     retry_if = "Connection reset|503"
     on_fail = "notify-send 'pp job failed'"     # a shell command; default: none
     on_done = "none"
+    prio = 5             # ... and every other per-job key: env, need, gpu_gb, cpu, mem_gb
     idle_exit = 600      # the worker exits after this long with nothing queued or running
     poll = 2             # worker loop period, seconds
     backfill = false     # let later jobs that fit start while the head waits
@@ -189,9 +204,6 @@ import shutil
 
 from pp.lib import config, jobq, ui
 
-PROJECT_KEYS = ("runner", "env")
-
-
 def _add_args(p):
     p.add_argument("--no-runner", action="store_true", help="ignore the project's [queue] runner")
 
@@ -222,22 +234,12 @@ def _runner(spec, root: str, path: str | None) -> list[str]:
     return [exe] + argv[1:]
 
 
-def _prepare(job: dict, a) -> None:
-    """The project's [queue] runner and env; a job's own --env wins over the project's."""
-    root, data = config.find_project(job["cwd"])
-    if not root:
-        return
-    where = f"{root}/.pp.toml"
-    pcfg = data.get("queue", {})
-    if not isinstance(pcfg, dict):
-        raise config.ConfigError(f"{where}: queue must be a table ([queue] runner = ..., env = {{...}})")
-    config.check_keys(pcfg, f"{where} [queue]", PROJECT_KEYS)
-    env = pcfg.get("env", {})
-    if not isinstance(env, dict):
-        raise config.ConfigError(f"{where}: [queue] env must be a table, e.g. env = {{ HF_HUB_OFFLINE = \"1\" }}")
-    if not getattr(a, "no_runner", False):
-        job["runner"] = _runner(pcfg.get("runner"), root, (job.get("shell_env") or {}).get("PATH"))
-    job["env"] = {**{str(k): str(v) for k, v in env.items()}, **job["env"]}
+def _prepare(job: dict, a, project) -> None:
+    """The project's own runner, put before the command this job runs. Every other key of that [queue] table
+    is a row of the settings declaration, resolved onto the record before this runs (pp/lib/jobq.py)."""
+    if project.root and not getattr(a, "no_runner", False):
+        job["runner"] = _runner(project.table.get("runner"), project.root,
+                                (job.get("shell_env") or {}).get("PATH"))
 
 
 def main(argv: list[str]) -> int:

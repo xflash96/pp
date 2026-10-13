@@ -350,7 +350,8 @@ class TestConfigMistakes(QueueJourney):
         self.assertIn("poll: 'fast' is not a duration", self.status(code=1))
         self.setcfg("[queue.default]\nretries = \"two\"\n")
         r = self.pp("queue", "add", "--", "true", code=1)
-        self.assertIn("retries = 'two': a whole number", r.stderr)
+        self.assertIn("retries", r.stderr)              # the key it is about, and what it takes
+        self.assertIn("a whole number", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         self.setcfg("[resources\nx = 1\n")
         self.assertIn("bad config", self.pp("queue", code=1).stdout)
@@ -613,7 +614,7 @@ class TestProjectRunner(QueueJourney):
         self.refused(noexec, "not executable", "chmod +x")
         self.refused(self.project("nopath", '[queue]\nrunner = "no-such-wrapper --gpus all"\n'), "not on PATH")
         self.refused(self.project("badtype", "[queue]\nrunner = 3\n"), "runner must be", code=1)     # config errors
-        self.refused(self.project("badenv", '[queue]\nenv = "HF=1"\n'), "env must be a table", code=1)
+        self.refused(self.project("badenv", '[queue]\nenv = "HF=1"\n'), "env", "a table", code=1)
         self.refused(self.project("notable", 'queue = "docker/run.sh"\n'), "queue must be a table", code=1)
         self.refused(self.project("typo", '[queue]\nrunnr = "docker/run.sh"\n'), "unknown runnr", code=1)
         self.refused(self.project("badtoml", "[queue\n"), ".pp.toml", code=1)
