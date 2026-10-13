@@ -9,12 +9,14 @@ relink, and nothing registered ever runs a half-edited tree.
     pp promote -n [PATH]           preflight: the plan and EVERY blocker at once; changes nothing
     pp promote --dirty             git mode: snapshot the working tree as-is (tracked + untracked, minus ignored)
     pp promote --again             promote even when HEAD already is the current release
-    pp promote status [--json]     every promoted target: current release, how far the source is ahead, links
+    pp promote status [--json]     every promoted target: current release, how far the source is ahead, links;
+                                   `failed` is a current release whose activation failed, or that nothing gated
     pp promote ls NAME             releases, newest first (* = current)
     pp promote rollback NAME [--to STAMP] [-n] [-y]   flip back to the previous release, rerun `after`; a
                                    release whose own `after`/`verify` failed is skipped (ls marks it); --to
                                    picks any
-    pp promote diff NAME           what the source has that the current release does not
+    pp promote diff NAME [--json]  what the source has that the current release does not; a source that is
+                                   gone is `source_gone` and exit 1
     pp promote link NAME [-n]      reassert the links
     pp promote gc NAME [--keep N] [-n]   prune old releases and leftover staging dirs, after asking
     pp promote init [PATH] [-n]    write a starter .pp.toml
@@ -950,10 +952,12 @@ def _status_row(name: str, src: str) -> dict:
     t = _resolve(name, survey=True)
     cur = t.current()
     info = t.info(cur)
+    # `failed` is the one question about the current release: is it one a gate passed and an activation did
+    # not undo. A release nothing gated was never proved either, so it answers the same way
     row = {"name": name, "source": src, "mode": t.mode, "current": cur, "rev": info.get("rev"),
            "created": info.get("created_iso"), "release_dirty": info.get("dirty", False),
-           "checked": info.get("checked"), "head": None, "ahead": None, "dirty": None, "links_ok": True,
-           "link_problems": []}
+           "checked": info.get("checked"), "failed": bool(info.get("failed")) or info.get("checked") is False,
+           "head": None, "ahead": None, "dirty": None, "links_ok": True, "link_problems": []}
     if t.mode == "git" and os.path.isdir(src):
         head = _git(src, "rev-parse", "--verify", "-q", "HEAD").stdout.strip()
         row["head"] = head or None
@@ -1101,7 +1105,12 @@ def cmd_diff(argv: list[str]) -> int:
     if not cur:
         ui.die(f"{t.name}: nothing promoted", 1)
     rev = t.info(cur).get("rev", "")
-    if t.mode == "git":
+    gone = not os.path.isdir(t.source)
+    if gone:
+        # the release is there and its source is not, so there is nothing to compare it with. `status` names
+        # such a target too; here it is the whole answer, so the field says it and the status is 1
+        got = {"commits": [], "files": []} if t.mode == "git" else {"files": []}
+    elif t.mode == "git":
         got = {}
         for key, args in (("commits", ("log", "--oneline", f"{rev}..HEAD", "--", ".")),
                           ("files", ("diff", "--stat", rev, "--", "."))):
@@ -1114,9 +1123,12 @@ def cmd_diff(argv: list[str]) -> int:
         got = {"files": proc.run(["diff", "-rq", *excl, t.dir(cur), t.source], group="own", stdin="none",
                                  env="inherit").stdout.rstrip().splitlines()}
     if a.json:
-        ui.print_json({"name": t.name, "current": cur, "rev": rev, **got})
-        return 0
+        ui.print_json({"name": t.name, "current": cur, "rev": rev, "source_gone": gone, **got})
+        return 1 if gone else 0
     print(f"{t.name}: current {cur}" + (f", rev {rev[:12]}" if rev else ""))
+    if gone:
+        print(f"its source {t.source} is gone, so there is nothing to compare the release with")
+        return 1
     if not any(got.values()):
         print("nothing: the source is level with the release")
     for key, lines in got.items():

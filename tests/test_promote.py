@@ -425,6 +425,47 @@ class TestPromote(Base):
         self.assertEqual(self.pp("link", "demo")[0], 0)
         self.assertTrue(json.loads(self.pp("status", "--json")[1])[0]["links_ok"])
 
+    def test_status_says_what_proved_the_current_release(self):
+        """A row's `failed` is the one question a reader has about the current release: is it one a gate
+        passed and an activation did not undo. A release nothing gated was never proved either, so it
+        answers the same way, and a release pp rolled back onto says so after the rollback."""
+        self.make_repo('check = "true"\nverify = "test ! -e BAD"\n')
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        good = self.current()
+        self.assertFalse(json.loads(self.pp("status", "--json")[1])[0]["failed"])
+
+        self.write("BAD", "x")                          # the next release activates badly and is rolled back
+        self.commit()
+        self.assertEqual(self.pp(self.repo)[0], 1)
+        self.assertEqual(self.current(), good)
+        self.assertFalse(json.loads(self.pp("status", "--json")[1])[0]["failed"])
+        bad = [s for s in self.stamps() if s != good][0]
+        self.assertEqual(self.pp("rollback", "demo", "--to", bad, "-y")[0], 0)
+        self.assertTrue(json.loads(self.pp("status", "--json")[1])[0]["failed"])
+
+        with open(os.path.join(self.repo, ".pp.toml")) as f:
+            table = f.read()
+        os.remove(os.path.join(self.repo, "BAD"))
+        self.write(".pp.toml", table.replace('check = "true"\n', ""))
+        self.commit()
+        self.assertEqual(self.pp(self.repo)[0], 0)      # a release nothing gated: the same answer
+        self.assertTrue(json.loads(self.pp("status", "--json")[1])[0]["failed"])
+
+    def test_diff_says_when_the_source_is_gone(self):
+        """A target keeps its releases when its project is moved away. `diff` cannot say what the source has
+        then, so the field says the source is gone and the status is 1 rather than git's error."""
+        self.make_repo()
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        moved = self.repo + "-moved"
+        os.rename(self.repo, moved)
+        rc, out, _ = self.pp("diff", "demo", "--json")
+        self.assertEqual(rc, 1)
+        self.assertTrue(json.loads(out)["source_gone"])
+        os.rename(moved, self.repo)
+        rc, out, _ = self.pp("diff", "demo", "--json")
+        self.assertEqual(rc, 0)
+        self.assertFalse(json.loads(out)["source_gone"])
+
     def test_ls_and_diff(self):
         self.make_repo()
         self.pp(self.repo)
