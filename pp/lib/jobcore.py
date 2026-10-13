@@ -291,7 +291,11 @@ class Worker:
         did, which is all the decision about this job has to go on. The time recorded with it is read before
         it goes out, because that time is what an exit code is late against (I10): a code the attempt wrote
         while this stop was on its way out is that stop's outcome, and a time read afterwards would leave the
-        window the stop command takes to start reading as the job's own end."""
+        window the stop command takes to start reading as the job's own end.
+
+        Which of the two went out is recorded with it, as `cmd`: the command where the project's one started,
+        and nothing where pp's own signal went. So a reader of the record says what went out for that stop
+        rather than reading the job's configured command, which a command that could not start never ran."""
         sig, mark = (signal.SIGTERM, "sent") if a.do == policy.TERM else (signal.SIGKILL, "kill9")
         now = time.time()       # before anything goes out for this stop, and recorded once it has
         # the project's command in place of the SIGTERM, where the job carries one. pp's own grace and SIGKILL
@@ -307,9 +311,10 @@ class Worker:
             cur = s.job(job["id"], must_be=("running",))
             if cur is None or not cur.get("stop"):
                 return
-            cur["stop"]["denied" if outcome == "denied" else mark] = now
-            if cmd and h is None:
-                cur["stop"]["rc"] = 127     # the code a shell gives a command it could not run
+            # the command where it is what went out, and the code a shell gives one it could not run where it
+            # is not: a stop carrying `cmd` is a stop that command was carried out by
+            cur["stop"].update({"denied" if outcome == "denied" else mark: now,
+                                **({"cmd": cmd} if h is not None else {"rc": 127} if cmd else {})})
             s.save(cur)
         self.say("stop", job, {"outcome": outcome, "sig": sig, "cmd": cmd if h is not None else None,
                                "grace": (job.get("stop") or {}).get("grace"), "group": cur.get("pgid")})

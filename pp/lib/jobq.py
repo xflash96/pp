@@ -1347,7 +1347,10 @@ def cmd_show(a) -> int:
         when = f"{datetime.fromtimestamp(st['t']):%H:%M:%S}"
         rows.append(["stop", (f"{_text(st.get('by'))}, on the {_text(st['was'])}'s stop from {when}"
                               if st.get("was") else f"{_text(st.get('by'))} asked at {when}")
-                     + (", SIGTERM sent" if st.get("sent") else ", nothing signalled")
+                     # what went out for it, off the record: the project's command where that is what went
+                     # out, and pp's own signal where it is
+                     + ((f", its stop command went out ({_text(st['cmd'])})" if st.get("cmd")
+                         else ", SIGTERM sent") if st.get("sent") else ", nothing signalled")
                      + (", SIGKILL sent" if st.get("kill9") else "")
                      + (f", its command exited {st['rc']}" if st.get("rc") is not None else "")
                      # a denied stop is not in flight: say so, or it reads as one still being carried out
@@ -1517,6 +1520,7 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
             # it already, whoever sent it. Neither answer names a log that does not exist
             q, waited = j["queue"], ui.human_duration(time.time() - started_at)
             went = ("the SIGKILL went out" if stop.get("kill9") else
+                    "the project's stop command went out" if stop.get("cmd") else
                     "the SIGTERM went out" if stop.get("sent") else "no signal of pp's has gone out")
             said = (f"{_PROG}: job {jid} is still running {waited} after it was asked to stop; {went}. "
                     f"`pp {_PROG} show {jid}` says what went out for it.")
@@ -1543,7 +1547,9 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
     else:
         # the grace on the record, which is the shorter of every ask (`jobpolicy.merge_stop`) and the one the SIGKILL
         # went out after, not the one this kill asked for
-        went = ("the project's stop command" if policy.stop_command(cur) else "SIGTERM")
+        # and what went out for it, off the record and not off the command the job carries: a command that
+        # could not start ran nothing, and pp's own signal went out for that stop instead
+        went = ("the project's stop command" if stop.get("cmd") else "SIGTERM")
         how = (f"SIGKILL after {float(stop.get('grace') or 0):g}s" if stop.get("kill9")
                else f"stopped on {went}")
         # a stop command that failed is said with its code: pp will not report a stop it did not achieve

@@ -5102,7 +5102,38 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         self.assertEqual(went, [signal.SIGTERM])        # what the record says went out is what did
         self.assertIsNotNone(stop["sent"])
         self.assertEqual(stop["rc"], 127)
+        self.assertNotIn("cmd", stop, "the record names a command as what went out, and none went out")
         self.assertFalse(os.path.exists(ran), "a command that could not start ran")
+
+    def test_the_stop_carries_the_command_that_went_out_for_it(self):
+        """What went out for a stop is on the stop itself, as `cmd`: the project's command where that is what
+        went out, and nothing of the kind where pp's own signal went. The job's configured command cannot
+        answer this, since a command that could not start ran nothing and pp's signal went out for that stop
+        instead, and the code 127 is the same either way: the field is what tells the two apart."""
+        ran = self.sb.path("what-the-stop-command-did")
+        cmd = f"echo x >> {ran}"
+        j, w = self.a_job_whose_run_is_live()
+        # and a second job of the same queue, whose work is in its own process group: both runs are live
+        # before anything is asked of either, so this test's way out signals each of them itself
+        k, _w2 = self.a_job_whose_run_is_live(cmd=self.gated("go2"))
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = cmd
+            s.save(cur)
+        self.a_kill_asks(j, grace=10.0)
+        went = self.recording()
+        w.carry_out()
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual(went, [])                      # the command went out in place of the SIGTERM
+        self.assertEqual(stop["cmd"], cmd)
+        self.assertIsNotNone(stop["sent"])
+        journey.until(lambda: self.lines(ran) == ["x"], timeout=30, what="the stop command this stop ran")
+        self.a_kill_asks(k, grace=10.0)
+        w.carry_out()
+        group = jobstore.find(k)["stop"]
+        self.assertEqual(went, [signal.SIGTERM])        # pp's own signal went out for that one
+        self.assertIsNotNone(group["sent"])
+        self.assertNotIn("cmd", group)
 
     def test_a_code_written_while_the_stop_goes_out_is_that_stops_outcome(self):
         """A stop decides the reason, and what an exit code is late against is the time that stop went out.
