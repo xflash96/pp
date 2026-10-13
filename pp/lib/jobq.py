@@ -669,8 +669,6 @@ def _pool(name: str, v, scope: str | None) -> dict | None:
     bad = sorted(set(t) - set(POOL_KEYS))
     if bad:
         raise config.ConfigError(f"{where}: unknown {', '.join(bad)} (a table takes {', '.join(POOL_KEYS)})")
-    p = {"name": name, "scope": scope, "where": where, "max": None, "probe": None, "every": PROBE_EVERY,
-         "settle": SETTLE}
     mx = t.get("max")
     if mx == "auto":
         if name not in SHARED_DEFAULTS:
@@ -681,7 +679,8 @@ def _pool(name: str, v, scope: str | None) -> dict | None:
             mx = _num(mx)
         except (TypeError, ValueError):
             raise config.ConfigError(f"{where} = {mx!r}: not a number") from None
-    p["max"] = mx
+    p = {"name": name, "scope": scope, "where": where, "max": mx, "probe": None, "every": PROBE_EVERY,
+         "settle": SETTLE}
     if t.get("probe") is not None:
         if name == "gpu_gb":
             raise config.ConfigError(f"{where}: gpu_gb is probed with nvidia-smi already")
