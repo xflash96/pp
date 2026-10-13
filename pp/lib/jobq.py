@@ -747,10 +747,9 @@ def reading(p: dict, run: bool = True) -> dict | None:
         except OSError as e:
             r = {"t": t, "value": None, "error": str(e)[:160]}
         else:
-            m = re.search(r"-?\d+(?:\.\d+)?", out.stdout)
             if out.timed_out:
                 r = {"t": t, "value": None, "error": f"it did not answer in {PROBE_WAIT:g}s"}
-            elif out.returncode == 0 and m:
+            elif out.returncode == 0 and (m := re.search(r"-?\d+(?:\.\d+)?", out.stdout)):
                 r = {"t": t, "value": _num(m[0]), "error": None}
             else:
                 said = (out.stderr.strip() or out.stdout.strip()).splitlines()
