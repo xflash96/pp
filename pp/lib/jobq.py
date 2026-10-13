@@ -537,11 +537,21 @@ def add_note(jid: int, text: str, by: str | None = None) -> dict | None:
 parse_duration = config.parse_duration
 
 
-def _dur_arg(v, what: str, default_unit: str = "s") -> float | None:
+def _dur_arg(v, what: str, default_unit: str = "s") -> float:
+    """The one reading of a duration a command line gave, in seconds: a usage error where it is not one, and
+    where it is empty.
+
+    A config key written as "" is a key that is not set, since the default behind it stands. A command line
+    has no such key: `--timeout "$T"` with T unset is the mistake it looks like, and not a wait with no
+    deadline or a `clean --older ""` with no bound. "no bound" has a spelling of its own where a flag offers
+    one (`add --timeout none`), and leaving the flag out is the other."""
     try:
-        return parse_duration(v, default_unit)
+        secs = parse_duration(v, default_unit)
     except ValueError as e:
         ui.die(f"{_PROG}: {what}: {e}", 2)
+    if secs is None:
+        ui.die(f"{_PROG}: {what}: say how long, like 90s, 30m, 2h or 1d", 2)
+    return secs
 
 
 def _num(v) -> int | float:
@@ -2699,7 +2709,7 @@ def cmd_retry(a) -> int:
 
 
 def cmd_clean(a, scope: list[str] | None) -> int:
-    cutoff = time.time() - _dur_arg(a.older, "--older", "d") if a.older else None
+    cutoff = time.time() - _dur_arg(a.older, "--older", "d") if a.older is not None else None
     victims = [j for j in _jobs(ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
     if not victims:
         print("nothing to clean")

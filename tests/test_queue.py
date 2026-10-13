@@ -548,6 +548,36 @@ class TestStore(QueueCase):
         with self.assertRaises(ValueError):
             jobq.parse_duration("2 weeks")
 
+    def test_an_empty_duration_on_a_command_line_is_a_usage_error(self):
+        """A config key written as "" is a key that is not set, and the default behind it stands. A command
+        line has no such key, so one duration reader refuses an empty value for every duration flag: a shell
+        wrote `--timeout "$T"` with T unset, and taking that for "no bound" is a wait with no deadline, a
+        job with no timeout, and a `clean` that takes every record there is.
+
+        "no bound" has a spelling where a flag offers one (`add --timeout none`), and leaving the flag out is
+        the other, so nothing a user writes on purpose is refused here."""
+        ap = jobq._parser("queue", "doc")
+        for argv in (["wait", "1", "--timeout", ""], ["watch", "1", "--timeout", ""]):
+            with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit, msg=argv) as exit_:
+                ap.parse_args(argv)
+            self.assertEqual(exit_.exception.code, 2, argv)
+            self.assertIn("--timeout", err.getvalue())      # the flag it is about, and how to write one
+            self.assertIn("say how long", err.getvalue())
+        ended = self.add(cmd="true")
+        self.run_until(jobq.Worker("default"), lambda: self.state(ended) in jobq.ENDED)
+        for argv in (["add", "--no-start", "--cwd", self.work, "--timeout", "", "--", "true"],
+                     ["add", "--no-start", "--cwd", self.work, "--retry-delay", "", "--", "true"],
+                     ["clean", "--older", "", "-n"]):
+            rc, out, err = self.call(*argv)
+            self.assertEqual(rc, 2, (argv, out, err))
+            self.assertIn("say how long", err)
+            self.assertNotIn("Traceback", err)
+        self.assertEqual(self.state(ended), "done")         # nothing was queued, and no record was taken
+        # the spellings that do mean "no bound", and the flag left out
+        self.assertIsNone(jobq.find(self.add("--timeout", "none"))["timeout"])
+        self.assertIsNone(jobq.find(self.add("--timeout", "0"))["timeout"])
+        self.assertEqual(self.call("clean", "-n")[0], 0)
+
     def test_config_defaults_apply(self):
         self.config("slots = 3", 'timeout = "2h"\nretries = 2\nretry_delay = "1m"\nretry_if = "OOM"\non_done = "true"')
         j = jobq.find(self.add())
