@@ -1240,7 +1240,6 @@ class TestTheRetriesAndTheRecovery(Lab):
     """Steps 11 to 13: the retries are pp's, a worker that goes away is replaced, and a machine that went down
     leaves work the next worker reaps."""
 
-    @unittest.expectedFailure
     def test_a_retry_keeps_the_id_and_reads_only_its_own_attempt(self):
         """An automatic retry keeps the job's id. A retry filter matches the failed attempt's own lines, from
         the offset where that attempt began, so a pattern an earlier attempt matched matches no more. A job
@@ -1254,8 +1253,10 @@ class TestTheRetriesAndTheRecovery(Lab):
         self.assertEqual((j["id"], j["state"]), (int(jid), "failed"))
         self.assertEqual(j["attempt"], 2)                        # the second attempt said nothing to match
         self.assertIsNotNone(self.field(j, "not_retried"))
-        self.assertGreater(self.field(j, "log_at"), 0)
-        self.assertEqual(self.field(self.field(j, "history")[0], "log_at"), 0)
+        # each attempt's own offset, where that attempt's output begins: past the banner pp wrote for it,
+        # and the later attempt's past the earlier one's, which is what keeps a filter to one attempt
+        self.assertGreater(self.field(self.field(j, "history")[0], "log_at"), 0)
+        self.assertGreater(self.field(j, "log_at"), self.field(self.field(j, "history")[0], "log_at"))
 
         slow = self.add("-q", "r1", "--retries", "1", "--retry-delay", "60", "--", "sh", "-c", "exit 1")
         self.until(lambda: self.show(slow)["attempt"] == 2 and self.state(slow) == "queued",

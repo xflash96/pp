@@ -4806,6 +4806,26 @@ class TestAWorkerKilledWhileItLaunches(InjectedCase):
         self.run_until(w, lambda: self.state(j) == "done")
         self.assertEqual(jobstore.find(j)["rc"], 0)
 
+    def test_an_adopted_attempt_knows_where_its_own_output_begins(self):
+        """The launch hands the wrapper the offset its own output starts at, and the wrapper writes it in the
+        claim beside its pid. So a worker that ends between the start and the record leaves both to be
+        adopted, and the retry filter of an adopted attempt reads that attempt's own lines rather than
+        starting at the file and matching the line pp wrote before it."""
+        j = self.add(cmd=f"echo a-line-of-the-jobs-own; {self.gated()}")
+        self.a_worker_killed_at("the start")
+        held = self.the_run_is_live(j)
+        self.assertIsNone(jobstore.find(j).get("log_at"))        # recorded with the pid, and neither is
+        w = jobq.worker_for("default")
+        w.carry_out()
+        rec = jobstore.find(j)
+        self.assertEqual(rec["log_at"], held["log_at"])
+        self.assertGreater(rec["log_at"], 0)                     # past the banner the launch wrote
+        journey.until(lambda: jobq.log_tail(rec, 40), timeout=10, what="the job's own first line")
+        self.assertEqual(jobq.log_tail(rec, 40), ["a-line-of-the-jobs-own"])
+        self.open_the_gate()
+        self.the_run_is_over(j)
+        self.run_until(w, lambda: self.state(j) == "done")
+
 
 class TestAWorkerKilledWhileItStops(InjectedCase):
     """The four steps of a stop, with the worker ending between two of them each time: what the record says

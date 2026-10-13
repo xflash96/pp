@@ -40,11 +40,12 @@ from datetime import datetime
 from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, session
 
 # What a job runs as. Its stdin is the job's run claim, which this `sh` holds for exactly as long as the attempt
-# lives; it writes its own pid in there first, so the claim names it even if the worker that started it died
-# before recording it. The command itself reads /dev/null, so neither it nor anything it leaves behind holds the
-# claim: the attempt is over when this `sh` is over. The exit code goes to another name and is renamed into
-# place, so whoever reads it finds a whole code or none.
-WRAP = ('printf \'{"pid": %d}\' "$$" >&0; "$@" 0</dev/null; r=$?; '
+# lives; it writes its own pid and the offset its own output starts at in there first, so the claim names both
+# even if the worker that started it died before recording them. The offset is its first argument, which the
+# launch read off the log after writing its banner. The command itself reads /dev/null, so neither it nor
+# anything it leaves behind holds the claim: the attempt is over when this `sh` is over. The exit code goes to
+# another name and is renamed into place, so whoever reads it finds a whole code or none.
+WRAP = ('at=$1; shift; printf \'{"pid": %d, "log_at": %d}\' "$$" "$at" >&0; "$@" 0</dev/null; r=$?; '
         'echo "$r" > "$PP_QUEUE_RCFILE.part" && mv "$PP_QUEUE_RCFILE.part" "$PP_QUEUE_RCFILE"')
 WAKE = signal.SIGUSR1       # what a verb sends a worker to end its wait between ticks, so a stop is served now
 START_EVERY = 5.0           # how often one process starts a worker again for a queue whose last round brought none up
@@ -338,9 +339,10 @@ class Worker:
                     s.save(cur)
 
     def _adopt(self, j: dict, held: dict):
-        """Complete the record of a running job from its claim. The wrapper writes its own pid in there, so a
-        job whose worker died between the start and the record is named again, and can be timed out, killed and
-        reported like any other. The claim is held, so that pid is that wrapper's."""
+        """Complete the record of a running job from its claim. The wrapper writes its own pid and the offset
+        its own output starts at in there, so a job whose worker died between the start and the record is named
+        again, and can be timed out, killed, matched by --retry-if and reported like any other. The claim is
+        held, so that pid is that wrapper's and that offset is that attempt's."""
         if j.get("pid") or not held.get("pid"):
             return
         p = proc.read(int(held["pid"]))
@@ -350,7 +352,7 @@ class Worker:
             cur = s.job(j["id"], must_be=("running",))
             if cur is None or cur.get("pid"):
                 return
-            cur.update(pid=p.pid, pgid=p.pgid, pstart=p.start, boot=proc.boot_id())
+            cur.update(pid=p.pid, pgid=p.pgid, pstart=p.start, boot=proc.boot_id(), log_at=held.get("log_at"))
             s.save(cur)
         self.say("adopted", cur, {"pid": p.pid})
 
@@ -496,7 +498,7 @@ class Worker:
                 f.write(policy.banner(j, shlex.join(argv), f"{datetime.now():%Y-%m-%d %H:%M:%S}"))
                 f.flush()
                 at = f.tell()   # where this attempt's own output begins, which is what --retry-if reads from
-                p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
+                p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", str(at), *argv], group="own", stdin=claim.fd,
                                env="scrubbed", add_env=policy.job_env(j), cwd=j["cwd"], stdout=f,
                                stderr=proc.STDOUT)
         except Exception as e:
