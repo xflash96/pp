@@ -153,8 +153,9 @@ Settings: one default, one key, one flag, one order
     config edit never changes a job already queued. A setting a QUEUE or the MACHINE carries has a key and no flag,
     because its worker re-reads it every loop. env and need merge key by key; every other setting is taken whole from
     one source. gpu_gb, cpu and mem_gb are per-job keys of [queue.NAME], what a job declares, and pool keys of
-    [resources] or [queue.NAME.resources], what is provided. Every per-job flag but --tag, --hold, --after, --cwd and
-    --no-runner is also a key in both tables; those five name one run.
+    [resources] or [queue.NAME.resources], what is provided. Every per-job flag but --tag, --hold, --after, --cwd,
+    --no-start, --from and --no-runner is also a key in both tables; those seven name one run or one add, and
+    --runner and --stop have the project's key alone.
         Per project, in the nearest .pp.toml up from the job's directory, where a relative path is relative to that
     file's own directory: `name = "lab"` at the top level names the project in every status row, and [queue] takes any
     per-job key as this project's default, `log = "logs/{tag}.log"` among them, and two of its own: `runner =
