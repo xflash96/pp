@@ -209,6 +209,158 @@ def merge_stop(existing: dict | None, ask: dict) -> dict:
     return out
 
 
+# ---- what one launch pass admits ---------------------------------------------------------------------
+#
+# A pass is handed the records it reads inside its transaction, the readings taken before it, and the
+# settings it runs under. It gives back one value: the jobs to start, in the order they start, with the card
+# each one takes, and the one (job, why) the head of the queue waited for. So every rule of admission is a
+# table (tests/test_queue.py), and the core's own code is the claim, the record and the start.
+#
+# `seen` is one pass's readings as a value, taken outside the store lock by whoever runs the probes
+# (pp/lib/jobq.py, Resources): {q, pools, by_name, cards, cards_t, probes, cards_why, where}.
+
+
+@dataclass(frozen=True)
+class Pass:
+    """What one launch pass decided.
+
+    starts      ((job, card), ...) in the order they start; card is None for a job that needs no GPU.
+    blocked     (job, why) for the first job that did not fit, which is what the head of the queue waits
+                for, and (None, "") for a pass that admitted everything it was given.
+    """
+
+    starts: tuple = ()
+    blocked: tuple = (None, "")
+
+
+def need(j: dict, k: str):
+    """How much of pool k this job asks for; 0 where it asks for none."""
+    return (j.get("needs") or {}).get(k, 0)
+
+
+def pool_jobs(p: dict, running: list[dict]) -> list[dict]:
+    """The running jobs a pool counts: every queue's, for a shared pool, and one queue's for its own."""
+    return running if p["scope"] is None else [r for r in running if r["queue"] == p["scope"]]
+
+
+def gpu_budget(p: dict, card: dict) -> float:
+    """What a pool reserves on one card: the max it was read with, or the card's own total less 2 GB."""
+    return p["max"] if p["max"] is not None else round(max(card["total_gb"] - 2, 0), 1)
+
+
+def ready(queued: list[dict], now: float) -> list[dict]:
+    """The queued jobs a pass may start. A job waiting out a retry's delay is skipped, not waited for, so it
+    never becomes the head of its queue."""
+    return [j for j in queued if (j.get("not_before") or 0) <= now]
+
+
+def check(needs: dict, seen: dict) -> str | None:
+    """Why these needs can never fit (nothing provides one, or it exceeds a budget); None when they might."""
+    for k, v in needs.items():
+        ps = seen["by_name"].get(k)
+        if not ps:
+            return (f"nothing provides '{k}': set [resources] {k} (shared by every queue) or "
+                    f"[queue.{seen['q']}.resources] {k} (this queue's own) in {seen['where']}")
+        if k == "gpu_gb":
+            if not seen["cards"]:
+                return "needs gpu_gb but nvidia-smi sees no GPU" + (f" ({seen['cards_why']})" if seen["cards_why"] else "")
+            top = max(min(gpu_budget(p, c) for p in ps) for c in seen["cards"])
+            if v > top:
+                return f"needs gpu_gb={v:g} but no card's budget is that large ({top:g})"
+            continue
+        for p in ps:
+            if p["max"] is not None and v > p["max"]:
+                return f"needs {k}={v:g} but {p['where']} = {p['max']:g}"
+    return None
+
+
+def fits(job: dict, running: list[dict], seen: dict) -> tuple[bool, str, int | None]:
+    """Whether one job fits now: (fits, why not, the card it takes). running = every queue's running jobs,
+    which inside a pass holds the jobs that pass has taken already. `why` keeps its fluctuating detail after
+    ';' so the worker notes a change of reason only."""
+    needs = job.get("needs") or {}
+    for k, v in needs.items():
+        if k == "gpu_gb":
+            continue
+        ps = seen["by_name"].get(k)
+        if not ps:
+            return False, f"{k}: nothing provides it ([resources] or [queue.{seen['q']}.resources] {k})", None
+        for p in ps:
+            if p["max"] is not None:
+                used = sum(need(r, k) for r in pool_jobs(p, running))
+                if used + v > p["max"]:
+                    return False, f"{k}: {p['where']}; {used:g}+{v:g} > {p['max']:g}", None
+            if p["probe"]:
+                r = seen["probes"].get((p["scope"], p["name"]))
+                if r and r.get("running"):
+                    return False, f"{k}: its probe is being read ({p['where']})", None
+                if not r or r.get("value") is None:
+                    return False, f"{k}: probe failed ({p['where']}); {(r or {}).get('error') or 'no reading'}", None
+                pending = sum(need(x, k) for x in running if (x.get("started") or 0) + p["settle"] > r["t"])
+                free = r["value"] - pending
+                if v > free:
+                    return False, (f"{k}: not free ({p['where']}); probe says {r['value']:g}"
+                                   + (f", {pending:g} of it launched since" if pending else "") + f", need {v:g}"), None
+    want = needs.get("gpu_gb", 0)
+    if not want:
+        return True, "", None
+    ps = seen["by_name"].get("gpu_gb")
+    if not ps:
+        return False, "gpu_gb: nothing provides it", None
+    if not seen["cards"]:
+        return False, "gpu: nvidia-smi unreadable" + (f" ({seen['cards_why']})" if seen["cards_why"] else ""), None
+    settle = max(p["settle"] for p in ps)
+    whys = []
+    for c in sorted(seen["cards"], key=lambda c: -c["free_gb"]):
+        i = c["index"]
+        on = [r for r in running if r.get("gpu") == i]
+        why = None
+        for p in ps:
+            reserved, budget = sum(need(r, "gpu_gb") for r in pool_jobs(p, on)), gpu_budget(p, c)
+            if reserved + want > budget:
+                why = f"card {i} reserved {reserved:g}+{want:g} > {budget:g} ({p['where']})"
+                break
+        if why is None:
+            # what the reading cannot see yet: jobs launched on this card less than `settle` before it
+            pending = sum(need(r, "gpu_gb") for r in on if (r.get("started") or 0) + settle > seen["cards_t"])
+            if c["free_gb"] - pending < want:
+                why = f"card {i} free {c['free_gb'] - pending:.1f}" + (
+                    f" ({pending:g} launched in the last {settle:g}s, not allocated yet)" if pending else "")
+        if why is None:
+            return True, "", i
+        whys.append(why)
+    return False, f"gpu_gb {want:g} does not fit on any card; {', '.join(sorted(whys))}", None
+
+
+def admit(state: dict, seen: dict, settings: dict) -> Pass:
+    """One launch pass: which of the queued jobs start, on which card, and what the head waited for.
+
+    state is the records the pass read inside its own transaction: {queued, running}, the queued ones of this
+    queue in run order (prio, then id) and every queue's running ones, since a shared pool counts them all.
+    settings is {backfill, now}.
+
+    Strict head-of-line by priority: the first job that does not fit ends the pass, so a big job is never
+    starved by small ones. With backfill the pass goes on past it, and the job that did not fit is still the
+    one the head waits for. A job waiting out a retry's delay is skipped, not waited for (`ready`), so it
+    never becomes the head. What this pass has taken counts against the next job in it, as the record it is
+    about to become: on the card it took, and launched now, so a reading older than its settle window does
+    not show the next job room that is already taken."""
+    running = list(state["running"])
+    starts, blocked = [], (None, "")
+    for job in ready(state["queued"], settings["now"]):
+        ok, why, card = fits(job, running, seen)
+        if not ok:
+            if blocked[0] is None:
+                blocked = (job, why)
+            if settings["backfill"]:
+                continue
+            break
+        starts.append((job, card))
+        # what this pass has taken counts against the next job in it, as the record it is about to become:
+        # on the card it took, and launched now, which is inside every settle window a reading has
+        running.append({**job, "started": settings["now"], "gpu": card})
+    return Pass(tuple(starts), blocked)
+
 # ---- the settings a rule is handed ------------------------------------------------------------------
 
 def num(v) -> int | float:

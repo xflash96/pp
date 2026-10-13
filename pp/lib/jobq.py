@@ -98,10 +98,10 @@ def _read_settings(q: str, backfill: bool | None, poll: float | None):
 
 
 def _admit_for(q: str):
-    """The admission of one launch pass: the readings are taken here, outside the store lock, and the pass
-    asks the callable they are in about each job it is about to start."""
+    """The admission of one launch pass: the readings are taken here, outside the store lock, and handed to
+    the pass as a value (`policy.admit` is the arithmetic over them)."""
     def admit_for(kinds):
-        return Resources(q, kinds, empty_ok=False).admit
+        return Resources(q, kinds, empty_ok=False).seen
     return admit_for
 
 
@@ -415,13 +415,11 @@ def reading(p: dict, run: bool = True) -> dict | None:
     return r
 
 
-def _need(j: dict, k: str):
-    return (j.get("needs") or {}).get(k, 0)
-
-
 class Resources:
-    """Queue q's pools with their live readings (nvidia-smi, probes), taken once and outside the store lock;
-    admit() then runs under the lock against every queue's running jobs."""
+    """Queue q's pools with their live readings (nvidia-smi, probes), taken once and outside the store lock.
+
+    What a pass is handed is `seen`, those readings as a value: the arithmetic over them is pure, so every
+    rule of admission is a table (pp/lib/jobpolicy.py)."""
 
     def __init__(self, q: str, needed=(), live: bool = True, empty_ok: bool = True):
         self.q = q
@@ -435,86 +433,17 @@ class Resources:
         self.readings = {(p["scope"], p["name"]): reading(p, run=live)
                          for p in self.pools if p["probe"] and p["name"] in needed}
 
-    def _in(self, p: dict, running: list[dict]) -> list[dict]:
-        return running if p["scope"] is None else [r for r in running if r["queue"] == p["scope"]]
-
-    def gpu_budget(self, p: dict, card: dict) -> float:
-        return p["max"] if p["max"] is not None else round(max(card["total_gb"] - 2, 0), 1)
+    @property
+    def seen(self) -> dict:
+        """These readings as the value a pass admits against, with the file a pool is declared in, which a
+        refusal names."""
+        return {"q": self.q, "pools": self.pools, "by_name": self.by_name, "cards": self.cards,
+                "cards_t": self.cards_t, "probes": self.readings, "cards_why": CARDS_WHY,
+                "where": config.global_path()}
 
     def check(self, needs: dict) -> str | None:
-        """Why these needs can never fit (nothing provides one, or it exceeds a budget); None when they might."""
-        for k, v in needs.items():
-            ps = self.by_name.get(k)
-            if not ps:
-                return (f"nothing provides '{k}': set [resources] {k} (shared by every queue) or "
-                        f"[queue.{self.q}.resources] {k} (this queue's own) in {config.global_path()}")
-            if k == "gpu_gb":
-                if not self.cards:
-                    return "needs gpu_gb but nvidia-smi sees no GPU" + (f" ({CARDS_WHY})" if CARDS_WHY else "")
-                top = max(min(self.gpu_budget(p, c) for p in ps) for c in self.cards)
-                if v > top:
-                    return f"needs gpu_gb={v:g} but no card's budget is that large ({top:g})"
-                continue
-            for p in ps:
-                if p["max"] is not None and v > p["max"]:
-                    return f"needs {k}={v:g} but {p['where']} = {p['max']:g}"
-        return None
-
-    def admit(self, job: dict, running: list[dict]) -> tuple[bool, str, int | None]:
-        """(fits, why not, card). running = every queue's running jobs. `why` keeps its fluctuating detail after
-        ';' so the worker notes a change of reason only."""
-        needs = job.get("needs") or {}
-        for k, v in needs.items():
-            if k == "gpu_gb":
-                continue
-            ps = self.by_name.get(k)
-            if not ps:
-                return False, f"{k}: nothing provides it ([resources] or [queue.{self.q}.resources] {k})", None
-            for p in ps:
-                if p["max"] is not None:
-                    used = sum(_need(r, k) for r in self._in(p, running))
-                    if used + v > p["max"]:
-                        return False, f"{k}: {p['where']}; {used:g}+{v:g} > {p['max']:g}", None
-                if p["probe"]:
-                    r = self.readings.get((p["scope"], p["name"]))
-                    if r and r.get("running"):
-                        return False, f"{k}: its probe is being read ({p['where']})", None
-                    if not r or r.get("value") is None:
-                        return False, f"{k}: probe failed ({p['where']}); {(r or {}).get('error') or 'no reading'}", None
-                    pending = sum(_need(x, k) for x in running if (x.get("started") or 0) + p["settle"] > r["t"])
-                    free = r["value"] - pending
-                    if v > free:
-                        return False, (f"{k}: not free ({p['where']}); probe says {r['value']:g}"
-                                       + (f", {pending:g} of it launched since" if pending else "") + f", need {v:g}"), None
-        need = needs.get("gpu_gb", 0)
-        if not need:
-            return True, "", None
-        ps = self.by_name.get("gpu_gb")
-        if not ps:
-            return False, "gpu_gb: nothing provides it", None
-        if not self.cards:
-            return False, "gpu: nvidia-smi unreadable" + (f" ({CARDS_WHY})" if CARDS_WHY else ""), None
-        settle = max(p["settle"] for p in ps)
-        whys = []
-        for c in sorted(self.cards, key=lambda c: -c["free_gb"]):
-            i = c["index"]
-            on = [r for r in running if r.get("gpu") == i]
-            why = None
-            for p in ps:
-                reserved, budget = sum(_need(r, "gpu_gb") for r in self._in(p, on)), self.gpu_budget(p, c)
-                if reserved + need > budget:
-                    why = f"card {i} reserved {reserved:g}+{need:g} > {budget:g} ({p['where']})"
-                    break
-            if why is None:
-                # what the reading cannot see yet: jobs launched on this card less than `settle` before it
-                pending = sum(_need(r, "gpu_gb") for r in on if (r.get("started") or 0) + settle > self.cards_t)
-                if c["free_gb"] - pending < need:
-                    why = f"card {i} free {c['free_gb'] - pending:.1f}" + (
-                        f" ({pending:g} launched in the last {settle:g}s, not allocated yet)" if pending else "")
-            if why is None:
-                return True, "", i
-            whys.append(why)
-        return False, f"gpu_gb {need:g} does not fit on any card; {', '.join(sorted(whys))}", None
+        """Why these needs can never fit; None when they might."""
+        return policy.check(needs, self.seen)
 
     def usage(self, running: list[dict], scope: str | None) -> list[dict]:
         """The pools of one scope (a queue name, or None = shared) with what running jobs hold: for status."""
@@ -523,7 +452,8 @@ class Resources:
             if p["scope"] != scope or p["name"] == "gpu_gb":
                 continue
             r = reading(p, run=False) if p["probe"] else None
-            out.append({"name": p["name"], "max": p["max"], "used": sum(_need(j, p["name"]) for j in self._in(p, running)),
+            out.append({"name": p["name"], "max": p["max"],
+                        "used": sum(policy.need(j, p["name"]) for j in policy.pool_jobs(p, running)),
                         "probe": p["probe"], "reading": r})
         return out
 

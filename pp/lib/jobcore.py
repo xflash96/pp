@@ -170,11 +170,11 @@ class Worker:
         self.serving = 0        # stops of this queue in flight at the last tick: while any is, the wait is short
         self.claim: lock.Claim | None = None    # where it records itself; work() sets it once it has taken it
         # what this worker is handed, because none of it is the core's: the sink it says what it did to, the
-        # tail of a job's log that --retry-if matches against, and the admission of one launch pass. The
-        # defaults say nothing, match nothing and admit nothing, so a worker nobody wired launches nothing
+        # tail of a job's log that --retry-if matches against, and the readings of one launch pass. The
+        # defaults say nothing, match nothing and provide nothing, so a worker nobody wired launches nothing
         self.say = sink or (lambda kind, job, fields: None)
         self.tail = tail or (lambda job, n: "")
-        self.admit_for = admit_for or (lambda kinds: lambda job, running: (False, "no admission", None))
+        self.admit_for = admit_for or (lambda kinds: {"by_name": {}, "q": self.queue})
         self.stopping = lambda: False   # work() points it at its stop flag: a stopping worker launches nothing new
 
     def record(self) -> dict:
@@ -402,34 +402,25 @@ class Worker:
     # -- launching
 
     def launch(self):
-        queued = jobstore.jobs("queued", self.queue)
         now = time.time()
-        ready = [j for j in queued if (j.get("not_before") or 0) <= now]     # a retry's delay never blocks the line
-        if not ready:
+        queued = jobstore.jobs("queued", self.queue)
+        if not policy.ready(queued, now):   # a retry's delay never blocks the line, and nothing else is due
             self._note(None)
             return
-        admit = self.admit_for({k for j in ready for k in (j.get("needs") or {})})
+        seen = self.admit_for({k for j in policy.ready(queued, now) for k in (j.get("needs") or {})})
         if self.stopping():
             return          # told to stop while the readings were taken
         taken: list = []        # (record, card, claim) for each job this pass admitted
-        blocked: tuple = (None, "")     # the first job that did not fit, and why
+        p = policy.Pass()
         try:
             # one transaction for the whole pass: it reads the running jobs it admits against once, and reads
             # each job it is about to start again in that same scope, since another queue's worker may be
             # admitting from a shared pool and a verb may have changed the job since it was listed (prio, a note)
             with jobstore.txn() as s:
-                running = s.jobs("running")
-                for j in ready:
-                    cur = s.job(j["id"], must_be=("queued",))
-                    if cur is None:
-                        continue        # held, dropped or started meanwhile
-                    ok, why, card = admit(cur, running)
-                    if not ok:
-                        if blocked[0] is None:
-                            blocked = (cur, why)
-                        if self.backfill:
-                            continue
-                        break
+                here = [cur for j in queued if (cur := s.job(j["id"], must_be=("queued",))) is not None]
+                p = policy.admit({"queued": here, "running": s.jobs("running")}, seen,
+                                 {"backfill": self.backfill, "now": now})
+                for cur, card in p.starts:
                     # the run claim before the record says running, so a reader never sees a running job with
                     # nothing holding its claim unless its run has ended. Taking one is two calls that never
                     # wait, which is why it belongs in here; nothing under the store lock may wait either.
@@ -438,7 +429,6 @@ class Worker:
                         continue        # a run of this job is live already
                     taken.append((cur, card, claim))    # before the rest of it, which can raise
                     self._claim(s, cur, card)
-                    running.append(cur)     # what this pass has taken counts against the next job in it
             for cur, card, claim in taken:  # outside the transaction: starting a process is not store work
                 self._spawn(cur, card, claim)
         finally:
@@ -448,7 +438,7 @@ class Worker:
             # whose run is over. Releasing twice is not an error.
             for _cur, _card, claim in taken:
                 claim.release()
-        self._note(*blocked)
+        self._note(*p.blocked)
 
     @staticmethod
     def _claim(s: jobstore.Txn, j: dict, gpu: int | None):
@@ -705,9 +695,9 @@ def work(q: str, read_settings, admit_for, sink, tail=None) -> int:
     Four callables, because none of what they answer is the core's: `read_settings()` gives back
     {poll, idle_exit, backfill} once per loop, so a queue's limits change under running jobs with no restart,
     and an `error` on it is a caller whose settings cannot be read, under which this keeps reaping, timing out
-    and recording, and launches nothing; `admit_for(kinds)` gives back the (job, running) -> (ok, why, cards)
-    of one launch pass, called before that pass's transaction; `sink(kind, job, fields)` is told what this did,
-    and words it; `tail(job, n)` is the log tail --retry-if matches against.
+    and recording, and launches nothing; `admit_for(kinds)` gives back the readings of one launch pass, taken
+    before that pass's transaction; `sink(kind, job, fields)` is told what this did, and words it;
+    `tail(job, n)` is the log tail --retry-if matches against.
 
     So the core reads no config file and takes no reading of its own, and it writes no sentence."""
     jobstore.writing_queue(q)    # a queue this pp cannot read is refused here too; the worker's own queue says its format
