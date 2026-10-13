@@ -323,7 +323,8 @@ Agents
 What is left to you, on purpose
     A dependency graph: --after is ids that already exist, with no cycles and no forward references. A log read as a
     result: make the command exit non-zero, or read its log in --on-done. Progress, a percentage and a finish time:
-    `pp queue` shows elapsed time and the last log line, and `show --json` has every attempt's duration. Results,
+    `pp queue` shows elapsed time and the last log line, and `show --json` has every attempt's duration, while no job
+    carries an estimate of its own, so a finish time for a grid is the `seconds` of the runs that have ended. Results,
     which the job writes where its project wants them; `pp queue note` puts a reading beside the job. Skipping work
     already done, which the plan that writes your campaign file knows and pp does not. More than one machine: a
     submitting runner (stop = "scancel $PP_QUEUE_JOB"), or `ssh host ...`.
