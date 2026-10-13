@@ -298,6 +298,24 @@ class TestDiscovery(unittest.TestCase):
         self.assertEqual(s.recent, ["*.txt"])
 
 
+class TestTheRootAndRuleTables(unittest.TestCase):
+    def test_an_unknown_key_names_the_file_and_the_key(self):
+        """A key pp does not read in [[http.roots]] or [[http.discover]] is a typo: a misspelt `marker` left
+        the rule with no marker, so it served every folder under `under`. Such a key stops the server where
+        the file is read, and the error names that file and that key. The known keys of each table are its
+        own, so `marker` in a fixed tab is as wrong as `markers` in a rule."""
+        for key, need, table, bad in (("roots", "path", {"path": "/tmp", "marker": ".git"}, "marker"),
+                                      ("discover", "under", {"under": "/tmp", "markers": ".git"}, "markers")):
+            with self.assertRaises(pphttp.config.ConfigError) as caught:
+                pphttp.tables({key: [table]}, key, need)
+            self.assertIn(bad, str(caught.exception))
+            self.assertIn(pphttp.config.global_path(), str(caught.exception))
+        # every key each table does read goes through
+        self.assertEqual(len(pphttp.tables({"roots": [{"name": "n", "path": "/tmp"}]}, "roots", "path")), 1)
+        self.assertEqual(len(pphttp.tables({"discover": [{"under": "/tmp", "depth": 2, "marker": [".git"]}]},
+                                           "discover", "under")), 1)
+
+
 class TestTheTreeChangesUnderARequest(unittest.TestCase):
     """open_in_tab approves a name and then checks the fd it opened is that path. The gate turns tab/sub into a
     symlink out of the tab the moment the name is approved, which is what a writer in a served tab can do while

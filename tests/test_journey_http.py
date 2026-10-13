@@ -206,6 +206,8 @@ class TestConfigured(HttpJourney):
                           ('[http]\nroots = "~/notes"', "[http] roots must be written [[http.roots]]"),
                           ('[[http.roots]]\nname = "x"', 'needs path = "/some/dir"'),
                           ('[[http.discover]]\nunder = "/tmp"\ndepth = "2"', "depth = '2' is not an integer"),
+                          ('[[http.roots]]\nname = "x"\npath = "/tmp"\nmarker = ".git"', "marker"),
+                          ('[[http.discover]]\nunder = "/tmp"\nmarkers = ".git"', "markers"),
                           ('[http]\nfollow_symlinks = "yes"', "follow_symlinks = 'yes': true or false")):
             with open(self.config(""), "w") as f:
                 f.write(text + "\n")

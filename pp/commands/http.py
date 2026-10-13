@@ -200,14 +200,19 @@ class Settings:
 
 KEYS = ("port", "bind", "recent", "exclude_dirs", "deny", "follow_symlinks", "hosts", "roots", "discover", "cache_ttl",
         "scan_budget", "scan_depth", "scan_entries", "recent_limit", "list_cap", "embed_cap")
+TABLE_KEYS = {"roots": ("name", "path"), "discover": ("under", "depth", "marker")}
 
 
 def tables(cfg: dict, key: str, need: str) -> list[dict]:
-    """[[http.<key>]]: an array of tables, each with `need`; anything else is a ConfigError."""
+    """[[http.<key>]]: an array of tables, each with `need` and no other key than its own; anything else is a
+    ConfigError naming the file and the key. A misspelt `marker` served every folder under `under`, so a key
+    pp does not read stops the server here, where the file is read, rather than widening what it serves."""
     v = cfg.get(key, [])
     if not isinstance(v, list) or not all(isinstance(t, dict) for t in v):
         raise config.ConfigError(f"[http] {key} must be written [[http.{key}]] (an array of tables)")
     for t in v:
+        # the keys first, so a misspelt `path` is named as the key it is and not reported as a missing one
+        config.check_keys(t, f"{config.global_path()} [[http.{key}]]", TABLE_KEYS[key])
         if not isinstance(t.get(need), str) or not t[need]:
             raise config.ConfigError(f"[[http.{key}]] {t}: needs {need} = \"/some/dir\"")
     for t in v if key == "discover" else []:
