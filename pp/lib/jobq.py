@@ -227,6 +227,12 @@ SETTINGS = (
     # Per project: the nearest .pp.toml up from the job's directory. `name` is the one row with no flag,
     # because it names the project and not a job of it; `runner` and `stop` are the project's own commands.
     _S("name", "project", "text", top=True, flagged=False, refuses="not a string"),
+    _S("runner", "project", "argv", metavar="CMD",
+       says="run this job through it: RUNNER CMD... (a path holding / is relative to the project root)",
+       refuses="a path that does not exist, is not executable, or is not on PATH, at add time"),
+    _S("stop", "project", "shell", metavar="CMD",
+       says='how a stop reaches the work the runner started; "group" where that work is in the job\'s own '
+            "process group", refuses="an empty string; a non-string"),
 
     # Per job: `add`'s flags, `[queue]` in .pp.toml, `[queue.NAME]` in config.toml. The resolved value goes
     # on the record, so a later config edit cannot change a job already queued or running.
@@ -287,17 +293,14 @@ SETTINGS = (
     _S("settle", "machine", "duration", default=SETTLE, printed=True, refuses="a non-finite value"),
 )
 
-# A key of a project's `[queue]` that the command owning it reads for itself, so that table takes it beside
-# the rows above.
-OWN_KEYS = ("runner",)
-
 BY_SCOPE = {s: {r.name: r for r in SETTINGS if r.scope == s}
             for s in ("job", "queue", "machine", "project")}
 JOB_ROWS = tuple(BY_SCOPE["job"].values())
 POOL_KEYS = tuple(n for n in BY_SCOPE["machine"] if n != "resources")
 QUEUE_KEYS = tuple(BY_SCOPE["job"]) + tuple(BY_SCOPE["queue"])
-PROJECT_KEYS = tuple(BY_SCOPE["job"]) + tuple(n for n, r in BY_SCOPE["project"].items() if not r.top) \
-    + OWN_KEYS
+PROJECT_KEYS = tuple(BY_SCOPE["job"]) + tuple(n for n, r in BY_SCOPE["project"].items() if not r.top)
+# the rows of the project's own table that have a flag on `add`, resolved by the command that carries them out
+PROJECT_ROWS = tuple(r for r in BY_SCOPE["project"].values() if r.flagged)
 
 
 def _read(t: dict, where: str, rows: dict) -> dict:
@@ -391,6 +394,17 @@ class Project:
     where: str = ""
     table: dict = field(default_factory=dict)
     gives: dict = field(default_factory=dict)
+
+
+def resolved(a, project: Project, name: str) -> tuple:
+    """What one per-project row comes to for this job, and which source gave it: the flag it was given, then
+    the project's own key, then the row's default, which is the order every row is read in. The command that
+    carries the row out asks for it here, so the declaration and the precedence stay in one place (`runner`
+    and `stop`, section 2). The source is for the sentence that refuses a value."""
+    row = BY_SCOPE["project"][name]
+    flag = _given(a, row)
+    value = policy.resolve(row, flag, project.gives.get(name, policy.NOTSET))
+    return value, row.flag if flag is not policy.NOTSET else f"{project.where} [queue]"
 
 
 def _pcfg(cwd: str) -> Project:
@@ -1176,6 +1190,7 @@ def cmd_show(a) -> int:
     rows = [["tag", _text(j.get("tag")) or "-"], ["project", _text(j.get("project"))], ["cwd", _text(j.get("cwd"))],
             ["command", _text(shlex.join(list(j.get("runner") or []) + list(j.get("cmd") or [])))],
             ["needs", _needs_str(j.get("needs")) or "slots 1"], ["prio", j.get("prio")],
+            ["stop", _text(j.get("stop_cmd")) or "-"],
             ["attempt", f"{j.get('attempt', 1)}/{int(j.get('retries') or 0) + 1}"
              + (f"  retry delay {ui.human_duration(j.get('retry_delay'))}" if j.get("retries") else "")
              + (f"  retry if /{j['retry_if']}/" if j.get("retry_if") else "")],
@@ -1444,7 +1459,7 @@ def _reprio(a) -> int:
 
 # What a retry copies onto the new job: what names the work, and every per-job setting the record holds, from
 # the one declaration. So a row that lands on a record is carried over without a second list saying so.
-CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "shell_env", "owner") \
+CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "stop_cmd", "shell_env", "owner") \
     + tuple(dict.fromkeys(r.on_record for r in JOB_ROWS))
 
 
@@ -1740,7 +1755,7 @@ def _parser(prog: str, doc: str, add_args=None):
     p.add_argument("--tag", type=_tag_flag,
                    help="a name to select it by, alone or with the other jobs that share it: at most 64 of "
                         "letters, digits and . _ - : (default: none, and its id names it)")
-    for row in JOB_ROWS:            # one flag per per-job row, from the one declaration
+    for row in JOB_ROWS + PROJECT_ROWS:     # one flag per row that has one, from the one declaration
         _flag(p, row)
     p.add_argument("--cwd", help="run there (default: here); also picks the project")
     p.add_argument("--hold", action="store_true", help="park it as held until released")

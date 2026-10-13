@@ -539,7 +539,8 @@ RUNNER = """#!/bin/sh
 echo "RUNNER cwd=$(pwd) cuda=${CUDA_VISIBLE_DEVICES-unset} hf=${HF_HUB_OFFLINE-unset} seed=${SEED-unset} job=$PP_QUEUE_JOB"
 exec "$@"
 """
-PROJECT = 'name = "toyproj"\n[queue]\nrunner = "docker/run.sh"\nenv = { HF_HUB_OFFLINE = "1", SEED = "project" }\n'
+PROJECT = ('name = "toyproj"\n[queue]\nrunner = "docker/run.sh"\nstop = "group"\n'
+           'env = { HF_HUB_OFFLINE = "1", SEED = "project" }\n')
 
 
 class TestProjectRunner(QueueJourney):
@@ -608,12 +609,17 @@ class TestProjectRunner(QueueJourney):
         self.assertEqual(self.show(j)["env"], {"HF_HUB_OFFLINE": "***", "SEED": "***"})
 
     def test_each_broken_project_says_what_to_fix(self):
-        missing = self.project("missing", '[queue]\nrunner = "docker/run.sh"\n')
+        missing = self.project("missing", '[queue]\nrunner = "docker/run.sh"\nstop = "group"\n')
         self.refused(missing, "does not exist", "--no-runner")
-        noexec = self.project("noexec", '[queue]\nrunner = "docker/run.sh"\n', {"docker/run.sh": (RUNNER, 0o644)})
+        noexec = self.project("noexec", '[queue]\nrunner = "docker/run.sh"\nstop = "group"\n',
+                              {"docker/run.sh": (RUNNER, 0o644)})
         self.refused(noexec, "not executable", "chmod +x")
-        self.refused(self.project("nopath", '[queue]\nrunner = "no-such-wrapper --gpus all"\n'), "not on PATH")
-        self.refused(self.project("badtype", "[queue]\nrunner = 3\n"), "runner must be", code=1)     # config errors
+        self.refused(self.project("nopath", '[queue]\nrunner = "no-such-wrapper --gpus all"\nstop = "group"\n'),
+                     "not on PATH")
+        # a project whose work runs through a runner says how a stop reaches it, or no job of it is queued
+        self.refused(self.project("nostop", '[queue]\nrunner = "docker/run.sh"\n',
+                                  {"docker/run.sh": (RUNNER, 0o755)}), "it needs a stop")
+        self.refused(self.project("badtype", "[queue]\nrunner = 3\n"), "runner", "a command line", code=1)
         self.refused(self.project("badenv", '[queue]\nenv = "HF=1"\n'), "env", "a table", code=1)
         self.refused(self.project("notable", 'queue = "docker/run.sh"\n'), "queue must be a table", code=1)
         self.refused(self.project("typo", '[queue]\nrunnr = "docker/run.sh"\n'), "unknown runnr", code=1)
@@ -623,7 +629,7 @@ class TestProjectRunner(QueueJourney):
         self.wait(j)
 
     def test_a_runner_list_and_a_runner_on_path_work(self):
-        root = self.project("listy", '[queue]\nrunner = ["env", "LISTY=1"]\n')
+        root = self.project("listy", '[queue]\nrunner = ["env", "LISTY=1"]\nstop = "group"\n')
         j = self.add("--", "sh", "-c", "echo listy=$LISTY", cwd=root)
         self.wait(j)
         self.assertIn("listy=1", self.pp("queue", "log", j).stdout)

@@ -3828,6 +3828,8 @@ class TestTheSettingsTable(unittest.TestCase):
     # the table's own rows: (setting, scope, flag, its key or keys, default, its default is printed)
     TABLE = (
         ("name", "project", "", "name (top level)", None, False),
+        ("runner", "project", "--runner", "[queue] runner", None, False),
+        ("stop", "project", "--stop", "[queue] stop", None, False),
         ("prio", "job", "--prio", "[queue] prio, [queue.NAME] prio", 10, True),
         ("gpu_gb", "job", "--gpu-gb", "[queue] gpu_gb, [queue.NAME] gpu_gb", None, False),
         ("cpu", "job", "--cpu", "[queue] cpu, [queue.NAME] cpu", None, False),
@@ -3854,7 +3856,7 @@ class TestTheSettingsTable(unittest.TestCase):
     )
 
     # the rows of the same table whose flag and behaviour a later stage brings: (setting, scope, stage)
-    LATER = (("runner", "project", 4), ("stop", "project", 4), ("log", "job", 4))
+    LATER = (("log", "job", 4),)
 
     @staticmethod
     def keys_of(row) -> str:
@@ -3918,7 +3920,7 @@ class TestTheSettingsTable(unittest.TestCase):
         """A row arrives with its type and its refusals written down, so a setting cannot be added without
         saying what a user may write and what is refused."""
         kinds = {"text", "whole", "amount", "counts", "strings", "duration", "period", "regex", "command",
-                 "shell", "number", "boolean", "pools"}
+                 "shell", "argv", "number", "boolean", "pools"}
         for r in jobq.SETTINGS:
             with self.subTest(setting=r.name, scope=r.scope):
                 self.assertIn(r.kind, kinds)
@@ -3932,8 +3934,9 @@ class TestTheSettingsTable(unittest.TestCase):
         declaration, which is what makes a flag and a key unable to disagree."""
         add = jobq._parser("queue", "doc")._subparsers._group_actions[0].choices["add"]
         flags = {o for action in add._actions for o in action.option_strings if o.startswith("--")}
-        self.assertEqual({r.flag for r in jobq.JOB_ROWS} - flags, set(), "these rows have no flag on add")
-        self.assertEqual(flags - {r.flag for r in jobq.JOB_ROWS},
+        rows = jobq.JOB_ROWS + jobq.PROJECT_ROWS
+        self.assertEqual({r.flag for r in rows} - flags, set(), "these rows have no flag on add")
+        self.assertEqual(flags - {r.flag for r in rows},
                          {"--help", "--queue", "--tag", "--cwd", "--hold", "--no-start", "--from"})
 
 

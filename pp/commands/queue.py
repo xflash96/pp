@@ -49,8 +49,8 @@ second time, while a selection that matches no job at all is an error. kill, dro
 of more than one job and ask first (-y: do not ask, -n: only show).
 
 Lower --prio runs first (default 10), ties by id. Each queue is strict head-of-line unless its own backfill
-is on, so a big job is never starved by small ones. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what
-it meant in your shell.
+is on, so a big job is never starved by small ones. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV
+are captured at add time, so `python` means what it meant in your shell.
 
 A job's environment, later entries winning: the worker's (that of the `pp queue add` that started it, without an
 agent session's identity); PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job;
@@ -101,13 +101,23 @@ Per project, from the nearest .pp.toml up from the job's directory:
 
     [queue]
     runner = "docker/run.sh"         # put before every command added from this project (relative to the
-                                     # project root); --no-runner skips it
+                                     # project root); --no-runner skips it for one job
+    stop = "group"                   # how a stop reaches the work the runner started: "group" where that
+                                     # work stays in the job's own process group, else a shell command
     env = { HF_HUB_OFFLINE = "1" }   # added to each job's environment; add's --env wins
     timeout = "6h"                   # and any other per-job key, as this project's default
 
 The job runs in the directory you queued it from (or --cwd), as `RUNNER CMD...`. The runner gets env and
 CUDA_VISIBLE_DEVICES (the card --gpu-gb reserved) in its own environment. A container runner must pass them in
 (docker run -e CUDA_VISIBLE_DEVICES -e HF_HUB_OFFLINE ...), or the job sees every GPU and none of env.
+
+A project whose work runs through a runner says how a stop reaches that work, and `add` is refused where it
+sets a runner and no stop: a runner that starts the work in a container, on a batch system or on another host
+puts it where no signal of pp's reaches it. `--runner CMD` and `--stop CMD` say the same for one job, so a
+single such job needs no .pp.toml. Both are read when the job is queued and kept on its record, so a config
+edit does not change a running job and the worker that comes back after a restart carries out the same stop.
+A job added with --no-runner has its work in its own process group, so its stop is that group whatever the
+project says, and the record says so.
 
 Resources: what a job declares (--gpu-gb, --cpu, --mem-gb, --need NAME=N; every job takes slots = 1) must be
 provided by a pool and fit in EVERY pool that provides it. Shared pools count all queues' running jobs; a
@@ -212,23 +222,16 @@ import os
 import shlex
 import shutil
 
-from pp.lib import config, jobq, ui
+from pp.lib import jobq, ui
 
 def _add_args(p):
     p.add_argument("--no-runner", action="store_true", help="ignore the project's [queue] runner")
 
 
-def _runner(spec, root: str, path: str | None) -> list[str]:
-    """argv of the project's runner; refuses (exit 2) one that could only fail at launch time, hours later."""
-    if not spec:
-        return []
-    where = f"{root}/.pp.toml"
-    if isinstance(spec, str):
-        argv = shlex.split(spec)
-    elif isinstance(spec, list) and all(isinstance(x, str) for x in spec):
-        argv = list(spec)
-    else:
-        raise config.ConfigError(f"{where}: [queue] runner must be a command line or a list of strings")
+def _runner(spec, root: str, where: str, path: str | None) -> list[str]:
+    """argv of the runner this job runs through; refuses (exit 2) one that could only fail at launch time,
+    hours later. A path holding / is relative to the project root, and a bare name is looked up on PATH."""
+    argv = shlex.split(spec) if isinstance(spec, str) else list(spec or [])
     if not argv:
         return []
     exe = os.path.expanduser(argv[0])
@@ -245,11 +248,25 @@ def _runner(spec, root: str, path: str | None) -> list[str]:
 
 
 def _prepare(job: dict, a, project) -> None:
-    """The project's own runner, put before the command this job runs. Every other key of that [queue] table
-    is a row of the settings declaration, resolved onto the record before this runs (pp/lib/jobq.py)."""
-    if project.root and not getattr(a, "no_runner", False):
-        job["runner"] = _runner(project.table.get("runner"), project.root,
-                                (job.get("shell_env") or {}).get("PATH"))
+    """How this job's work is launched and stopped, onto the record: the runner put before its command, and
+    the stop that reaches what that runner started. Both are rows of the settings declaration, so the flag
+    wins over the project's key and nothing else gives either (pp/lib/jobq.py, SETTINGS).
+
+    A job whose work runs through a runner needs a stop, because no signal of pp's reaches work the runner
+    started elsewhere: such an add is refused here, where the runner is read. A job that skips the runner has
+    its work in its own process group, so its stop is that group whatever its project says."""
+    spec, where = (None, "") if getattr(a, "no_runner", False) else jobq.resolved(a, project, "runner")
+    root = project.root or job["cwd"]
+    job["runner"] = _runner(spec, root, where, (job.get("shell_env") or {}).get("PATH"))
+    stop, _where = jobq.resolved(a, project, "stop")
+    if not job["runner"]:
+        job["stop_cmd"] = "group"       # its work is in its own process group, and pp's signals reach it
+    elif stop:
+        job["stop_cmd"] = stop
+    else:
+        ui.die("queue add: this job runs through a runner, so it needs a stop that reaches what the runner "
+               f"starts: set [queue] stop in {root}/.pp.toml, or pass --stop CMD. Where the runner's work "
+               'stays in the job\'s own process group, that is stop = "group".', 2)
 
 
 def main(argv: list[str]) -> int:

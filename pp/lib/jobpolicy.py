@@ -33,6 +33,8 @@ RETRY_DELAY_CAP = 3600.0
 RETRIES_CAP = 1000
 
 
+GROUP = "group"             # the stop of a job whose work is in its own process group: pp's own signals
+
 NOTHING = "nothing"         # leave it as it is
 TIME_UP = "time-up"         # write a timeout's stop on it; from there it is a stop like any other
 TERM = "term"               # SIGTERM to its group, recorded as the stop's `sent`
@@ -728,6 +730,8 @@ def value(setting: Setting, raw):
         return hook_spec(raw)
     if kind == "shell":
         return shell(raw)
+    if kind == "argv":
+        return words(raw)
     if kind == "text":
         return text(raw)
     if kind == "strings":
@@ -815,6 +819,29 @@ def shell(v) -> str:
     if not isinstance(v, str) or not v.strip():
         raise ValueError(f"{v!r}: a shell command")
     return v
+
+
+def words(v):
+    """A command line a setting carries: a string, which the reader that runs it splits the way a shell quotes
+    words, or a list of strings already split. It comes back as it was given, since splitting is the job of
+    whoever runs it and no rule here reads a word of it."""
+    if isinstance(v, str) and v.strip():
+        return v
+    if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+        return list(v)
+    raise ValueError(f"{v!r}: a command line, or a list of strings")
+
+
+def stop_command(job: dict) -> str | None:
+    """The command that reaches the work this job's runner started, or None where the job's work is in its own
+    process group and pp's own signals reach it.
+
+    It is resolved onto the record when the job is queued (`stop_cmd`), so a config edit does not change a
+    running job's stop and the worker that adopts one after a restart carries out the same stop on the same
+    container. A job that skips the runner carries "group", whatever its project says, since its work is in
+    its own group and a command naming a container nothing created would fail for a job pp stopped."""
+    cmd = job.get("stop_cmd")
+    return None if not cmd or cmd == GROUP else cmd
 
 
 def regex(v) -> str | None:
