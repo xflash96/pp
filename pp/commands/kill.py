@@ -15,6 +15,9 @@ command line of the shell running pkill, so pkill kills its own shell (exit 143 
 which is the SIGTERM it sent itself).
 Patterns only match your own processes unless --any-user.
 
+A TARGET names a pid, a :PORT or a pattern. One that names none of the three, an empty word or a `:` with no
+port after it, is a usage error, so an unset variable in a script selects nothing.
+
 Asking: pid and port targets are explicit and act at once; a pattern shows its matches and asks. Without a
 terminal it refuses unless -y (agents: `-n` to look, then `-y`). A port published by docker is held by root's
 docker-proxy: pp names the container and offers `docker stop` instead of killing the proxy.
@@ -173,6 +176,11 @@ def main(argv: list[str]) -> int:
     problems: list[str] = []
 
     for t in a.targets:
+        if not t.strip() or t.strip() == ":":
+            # `pp kill -y "$PAT"` with the variable unset: a word with no pid, no port and no pattern in it
+            # is read as a pattern that matches every process of the user, so the one reading refuses it here
+            ui.die(f"{t!r} names nothing to signal: write a pid, :PORT or a pattern. A target with no number "
+                   "and no pattern in it would match every process of yours", 2)
         if t.isdigit():
             pid = int(t)
             if pid not in procs:

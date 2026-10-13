@@ -91,6 +91,24 @@ class TestKill(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("caller", r.stderr)
 
+    def test_a_target_that_names_nothing_is_a_usage_error(self):
+        """`pp kill -y "$PAT"` with the variable unset hands pp an empty word, and an empty pattern matches
+        every process of the user: the terminal multiplexer, the editor, the agent asking. So a word with no
+        pid, no port and no pattern in it is refused where a target is read, before any process is chosen,
+        and the refusal names the three things a target can be. `:` is the same word with the port left off
+        (`pp kill ":$PORT"`). Only -n is run here: the refusal is what the test is about, and the form that
+        signals must never be run against a pp that still takes the word."""
+        for t in ("", " ", "\t", ":", ": "):
+            r = subprocess.run([sys.executable, PP, "kill", "-n", t], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("write a pid, :PORT or a pattern", r.stderr)
+            self.assertEqual(r.stdout, "")              # nothing was chosen, so no table was printed
+        # a pattern that names a process nobody carries is still a pattern, and says so
+        r = subprocess.run([sys.executable, PP, "kill", "-n", "-x", "nothing-carries-this-name"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no process matches", r.stderr)
+
     def test_free_port_and_missing_pid(self):
         # held bound and never listened on, for as long as the check runs: nobody else can take the port, and
         # /proc/net shows no listener on it. A port let go of first could be anyone's by now.
