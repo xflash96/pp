@@ -110,14 +110,18 @@ pp queue add -q dl --need net=1 -- ./fetch.sh            the dl queue, taking on
 pp queue add --timeout 2h -- python x.py                 stopped after two hours
 pp queue add --retries 2 --retry-if 'Connection reset' -- ./sync.sh
 pp queue add --on-fail 'notify-send "job $PP_QUEUE_JOB failed"' -- ./nightly.sh
-pp queue add --tag sweep -- python x.py --lr 0.1         tagged, to act on the group later
-pp queue wait sweep                                      every job tagged sweep
+pp queue add --tag sweep.lr1 -- python x.py --lr 0.1     a name for the job, and for its family
+pp queue wait --prefix sweep.                            every job whose name starts with sweep.
 pp queue watch 12                                        a line for each start, retry and outcome
 pp queue drop 20-29                                      a range: it shows the jobs and asks first
 pp queue kill 12                                         waits while the worker stops it, then:
                                                          killed 12 (stopped on SIGTERM)
 pp queue retry 11        pp queue hold 15        pp queue release 15
 ```
+
+Every verb that takes jobs takes the same five forms: an id, a range of ids,
+a `--tag` name matched whole, `--prefix P`, and `--all` with `-q NAME`. A job
+added without `--tag` has no name, and its id selects it.
 
 Limits go in `~/.config/pp/config.toml`. Every queue draws on the shared
 GPU memory, CPUs and RAM; a queue's own pool caps what it may take of them.
@@ -136,22 +140,36 @@ retry_if = "Connection reset|503"
 net = 2
 ```
 
-A project's `.pp.toml` can wrap every job queued from it, for example in a
-container, and add to the jobs' environment:
+A project's `.pp.toml` says how its jobs are launched and stopped, where
+their output goes, and what is in their environment:
 
 ```toml
 [queue]
-runner = "docker/run.sh"         # the job runs as docker/run.sh CMD...
+runner = "docker/run.sh"                   # the job runs as docker/run.sh CMD...
+stop = "docker rm -f $PP_QUEUE_CONTAINER"  # how a stop reaches the work the runner started
+log = "logs/{tag}.log"                     # under the project root; {tag} or {id}
 env = { HF_HUB_OFFLINE = "1" }
 ```
 
-`pp queue add --no-runner` skips the runner for one job. The runner gets the
-job's environment, including `CUDA_VISIBLE_DEVICES`, and a container runner
-has to pass it in. Give a job a token or a secret with `--env` or the
-project's `env`: a variable exported in your shell reaches it only through
-the worker. `--json` gives a job's variables by name, with each value `***`.
-`pp help queue` has the examples, and `pp help queue add` every option of
-`add`.
+A runner puts the work where no signal of pp's reaches it, so a project that
+sets one says the stop as well, or the `add` is refused. pp hands the runner
+`PP_QUEUE_CONTAINER`, a name for whatever it starts elsewhere, and
+`PP_QUEUE_ENVFILE`, a file of `KEY=VALUE` lines for a container to read with
+`--env-file`. `pp queue add --no-runner` skips the runner for one job, and
+`--runner CMD` with `--stop CMD` gives one job both with no `.pp.toml`.
+
+A campaign is a file of one job per line, each line with its own flags, and a
+stage can wait for the one before it:
+
+```
+IDS=$(pp queue add --from stage1.txt)                   # one id per line on stdout
+pp queue add --from stage2.txt --after "$(echo "$IDS" | tr '\n' ',')"
+```
+
+Give a job a token or a secret with `--env` or the project's `env`: a variable
+exported in your shell reaches it only through the worker. `--json` gives a
+job's variables by name, with each value `***`. `pp help queue` is the whole
+page, with the runner to copy, and `pp help queue add` every option of `add`.
 
 ## Working with agents
 
