@@ -19,7 +19,8 @@ relink, and nothing registered ever runs a half-edited tree.
 NAME is a promoted target's name, or a path into its project.
 
 .pp.toml at the project root:
-    name = "pp"            # optional, default the directory name; it names the releases dir, so keep it unique
+    name = "pp"            # optional, default the directory name; it names the releases dir: one path
+                           # component, and unique across the projects you promote
     [promote]
     source = "git"         # git: HEAD via `git archive` (a dirty tracked tree refuses unless --dirty)
                            # tree: copy the working tree (stamp = content hash)
@@ -81,11 +82,26 @@ NOT_RELEASES = ("current", "revisions.log")
 
 # ---- targets --------------------------------------------------------------------------------------
 
+def _releases(name) -> str:
+    """Where this target's releases live. A name becomes a path here and nowhere else, so this is where a name
+    that is not one plain path component is refused: `gc` removes the directories under this one, and a name of
+    `..` would make it the whole data directory. It holds for a registry key as much as for `name` in a
+    .pp.toml, since both name the same directory.
+
+    What cannot be one directory is all that is refused, because most names are names pp derived rather than
+    names a user wrote: with no `name` key the project directory's own name is the target's, a dot in front and
+    all (~/.dotfiles), and a name pp refused here would refuse a project it has always taken."""
+    if not isinstance(name, str) or name in ("", ".", "..") or name != os.path.basename(name) or "\0" in name:
+        raise config.ConfigError(f"name = {name!r}: one path component, since it names the releases directory: "
+                                 f"no '/', not '.' or '..', and not empty")
+    return paths.data_dir("releases", name, create=False)
+
+
 class Target:
     def __init__(self, name: str, source: str, cfg: dict):
         self.name, self.source, self.cfg = name, source, cfg
         self.mode = cfg.get("source", "git")
-        self.releases = paths.data_dir("releases", name, create=False)
+        self.releases = _releases(name)
 
     def current(self) -> str | None:
         try:
@@ -131,15 +147,41 @@ DEFAULT_KEEP = 5         # releases kept; current and the one before it always s
 PROMOTE_KEYS = ("source", "exclude", "build", "check", "links", "dev_links", "after", "verify", "keep")
 
 
-def _checked(cfg, root: str) -> dict:
-    """A project's [promote] table, or a ConfigError naming what is wrong: a misspelt `check` must not release
-    with nothing gating it."""
+def _checked(data: dict, root: str) -> dict:
+    """A project's [promote] table, or a ConfigError naming the file and the key: a misspelt `check` must not
+    release with nothing gating it, a `name` that is not one path component must not become a path, and a value
+    of the wrong type must not reach the code that uses it. Every key is checked here, so preflight lists what
+    is wrong and nothing is created before it is read."""
     where = f"{root}/.pp.toml"
+    name = data.get("name")
+    if name is not None:
+        try:
+            _releases(name)             # the rule is where the name becomes a path; this names the file it is in
+        except config.ConfigError as e:
+            raise config.ConfigError(f"{where} {e}") from None
+    cfg = data.get("promote", {})
     if not isinstance(cfg, dict):
         raise config.ConfigError(f"{where}: promote must be a table ([promote] check = ..., links = {{...}})")
     config.check_keys(cfg, f"{where} [promote]", PROMOTE_KEYS)
     if cfg.get("source", "git") not in ("git", "tree"):
         raise config.ConfigError(f"{where} [promote] source = {cfg['source']!r}: git or tree")
+    for key in ("build", "check", "after", "verify"):
+        if key in cfg and not isinstance(cfg[key], str):
+            raise config.ConfigError(f"{where} [promote] {key} = {cfg[key]!r}: one shell command, as a string")
+    if "keep" in cfg and (isinstance(cfg["keep"], bool) or not isinstance(cfg["keep"], int)):
+        raise config.ConfigError(f"{where} [promote] keep = {cfg['keep']!r}: how many releases to keep, a number")
+    ex = cfg.get("exclude", [])
+    if not isinstance(ex, list) or not all(isinstance(p, str) for p in ex):
+        raise config.ConfigError(f"{where} [promote] exclude = {ex!r}: a list of patterns, each a string")
+    for key in ("links", "dev_links"):
+        links = cfg.get(key, {})
+        if not isinstance(links, dict) or not all(isinstance(p, str) and isinstance(r, str) for p, r in links.items()):
+            raise config.ConfigError(f"{where} [promote] {key} = {links!r}: a table of link path = path in the "
+                                     f"release ({{ \"~/.local/bin/x\" = \"bin/x\" }})")
+        for p in links:
+            if not (os.path.isabs(p) or p.startswith("~")):
+                raise config.ConfigError(f"{where} [promote] {key}: the link path {p!r} is relative, so where the "
+                                         f"link lands would follow the directory pp ran in: an absolute path, or ~")
     return cfg
 
 
@@ -147,19 +189,34 @@ def _project(path: str | None) -> Target:
     root, data = config.find_project(path)
     if not root or "promote" not in data:
         ui.die(f"no [promote] table in a .pp.toml at or above {paths.expand(path or '.')}; `pp promote init` writes one", 2)
-    return Target(config.project_name(root, data), root, _checked(data["promote"], root))
+    return Target(config.project_name(root, data), root, _checked(data, root))
 
 
 def _registry_file(create: bool = False) -> str:
     return os.path.join(paths.state_dir("promote", create=create), "registry.json")
 
 
-def _registry() -> dict:
+def _registry(unusable: list | None = None) -> dict:
+    """Every promoted target: its name, and where its project is. A key no releases path can be built from is
+    no target to act on, and 0.1.0 wrote such a key, so it is dropped here: a verb over the registry then acts
+    on the targets around it, and `pp promote` in that project refuses naming the file and the key, which is
+    where the name is fixed. `unusable` collects the keys dropped, for `status` to say once: it is the one verb
+    that surveys the registry, and a target it never lists is one to say something about."""
     try:
         with open(_registry_file()) as f:
-            return json.load(f)
+            reg = json.load(f)
     except (OSError, ValueError):
         return {}
+    kept = {}
+    for name, row in reg.items():
+        try:
+            _releases(name)
+        except config.ConfigError:
+            if unusable is not None:
+                unusable.append(name)
+            continue
+        kept[name] = row
+    return kept
 
 
 def _registry_lock() -> str:
@@ -199,9 +256,18 @@ def _resolve(arg: str | None) -> Target:
     if arg in reg:
         src = reg[arg]["source"]
         root, data = config.find_project(src) if os.path.isdir(src) else (None, {})
-        cfg = _checked(data.get("promote", {}), root) if root == src else {}
+        cfg, bad = {}, ""
+        if root == src:
+            try:
+                cfg = _checked(data, root)
+            except config.ConfigError as e:
+                # one target's bad value must not end a verb over the registry: `status` surveys every target,
+                # and `pp promote` in that project is where the refusal belongs
+                bad = str(e)
         if not os.path.isdir(src):
             ui.warn(f"{arg}: its source {src} is gone; releases only, no hooks or links")
+        elif bad:
+            ui.warn(f"bad config: {bad}; releases only, no hooks or links")
         elif not cfg:
             ui.warn(f"{src}: no readable [promote] config; releases only, no hooks")
         return Target(arg, src, cfg)
@@ -743,7 +809,19 @@ def cmd_status(argv: list[str]) -> int:
     ap = ui.parser("promote status", "every promoted target: current release, source drift, links")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
-    rows = [_status_row(n, r["source"]) for n, r in sorted(_registry().items())]
+    unusable: list[str] = []
+    rows = [_status_row(n, r["source"]) for n, r in sorted(_registry(unusable).items())]
+    if unusable:
+        # what is wrong with the name, and where the releases of such a name went: a pp that built the path
+        # without checking it wrote them wherever the name led, which for `.` and `..` is a directory pp uses
+        # for every target. So the line names that path and what of it is this target's
+        root = paths.data_dir("releases", create=False)
+        where = ", ".join(sorted({os.path.normpath(os.path.join(root, n)) for n in unusable}))
+        ui.warn(f"{len(unusable)} name(s) in {_registry_file()} are not one path component: "
+                f"{', '.join(unusable)}. pp builds no releases path from such a name, so no verb acts on it: "
+                f"remove its entry from that file. A pp that made releases for it put them in {where}, a "
+                f"directory pp uses for other targets as well: what is this target's there is its release "
+                f"directories, its `current` and its `revisions.log`")
     if a.json:
         ui.print_json(rows)
         return 0

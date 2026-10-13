@@ -59,10 +59,14 @@ class Base(unittest.TestCase):
         return self.commit("init")
 
     def pp(self, *argv):
+        """The command, as pp/cli.py runs it: a ConfigError is what the user reads, and exit 1."""
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", io.StringIO()):
             try:
                 rc = promote.main(list(argv))
+            except promote.config.ConfigError as e:
+                print(f"pp: bad config: {e}", file=sys.stderr)
+                rc = 1
             except SystemExit as e:
                 rc = e.code
         return rc, out.getvalue(), err.getvalue()
@@ -414,6 +418,130 @@ class TestPromote(Base):
             data = tomllib.load(f)
         self.assertEqual((data["name"], "promote" in data), ("keepme", True))
 
+
+
+class TestABadValue(Base):
+    """config.py promises a loud error naming the file, and `_checked` promises that a misspelt key does not
+    release with nothing gating it. A value of the wrong type is the same mistake: it used to pass preflight
+    and reach the code that uses it, where it dropped files from the release or raised a traceback."""
+
+    def bad(self, line: str, says: str):
+        src = os.path.join(self.tmp, "bad")
+        self.write(".pp.toml", f'name = "bad"\n[promote]\nsource = "tree"\n{line}\n', root=src)
+        self.write("f.txt", "x", root=src)
+        for argv in ((src, "-n"), (src,)):
+            rc, out, err = self.pp(*argv)
+            self.assertEqual(rc, 1, f"{line}: {out + err}")
+            self.assertIn(f"{src}/.pp.toml", err)
+            self.assertIn(says, err, line)
+        self.assertFalse(os.path.exists(os.path.join(self.sb.data, "releases", "bad")), line)
+
+    def test_a_string_where_a_list_belongs_is_not_a_list_of_characters(self):
+        """`exclude = "*.log"` used to become the patterns * . l o g, and `*` drops every file: the release was
+        empty and status called it level with the source."""
+        self.bad('exclude = "*.log"', "exclude")
+
+    def test_every_value_is_checked_by_its_key(self):
+        for line, says in (('exclude = [7]', "exclude"),
+                           ('keep = "five"', "keep"),
+                           ('check = ["python3", "-c", "print(1)"]', "check"),
+                           ('build = 7', "build"),
+                           ('links = ["~/.local/bin/x"]', "links"),
+                           ('links = { "~/.local/bin/x" = 7 }', "links"),
+                           ('dev_links = { "bin/x" = "bin/x" }', "relative")):
+            with self.subTest(line=line):
+                self.bad(line, says)
+
+    def test_a_name_that_is_not_one_path_component(self):
+        """`name` names the releases directory, and `gc` removes directories under it: `name = ".."` made that
+        directory the data directory itself, and two promotes removed every release of every project."""
+        for name in ("..", ".", "a/b", "sub/", ""):
+            with self.subTest(name=name):
+                src = os.path.join(self.tmp, "named")
+                self.write(".pp.toml", f'name = "{name}"\n[promote]\nsource = "tree"\n', root=src)
+                self.write("f.txt", "x", root=src)
+                rc, out, err = self.pp(src)
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn("one path component", err)
+        self.assertEqual(sorted(os.listdir(self.sb.data)) if os.path.isdir(self.sb.data) else [], [])
+
+    def test_a_registry_name_that_is_not_one_path_component_is_acted_on_by_nothing(self):
+        """0.1.0 checked no name, so a registry it wrote holds keys like `..`, whose releases directory is the
+        data directory itself: `gc` of that target removed every other target's releases."""
+        for n in ("alpha", "beta"):
+            src = os.path.join(self.tmp, n)
+            self.write(".pp.toml", f'name = "{n}"\n[promote]\nsource = "tree"\n', root=src)
+            self.write("f.txt", n, root=src)
+            self.assertEqual(self.pp(src)[0], 0)
+        dots = os.path.join(self.tmp, "dots")
+        self.write(".pp.toml", 'name = ".."\n[promote]\nsource = "tree"\n', root=dots)
+        self.write("f.txt", "x", root=dots)
+        reg = dict(self.registry(), **{"..": {"source": dots}})
+        with open(os.path.join(self.sb.state, "promote", "registry.json"), "w") as f:
+            json.dump(reg, f)
+
+        self.sb.chdir()                 # `..` as a path is then this directory's parent, which is no project
+        self.assertNotEqual(self.pp("gc", "..", "--keep", "0", "-y")[0], 0)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.sb.data, "releases"))), ["alpha", "beta"])
+        self.assertEqual(sorted(os.listdir(self.sb.data)), ["releases"])
+        rows = json.loads(self.pp("status", "--json")[1])
+        self.assertEqual(sorted(r["name"] for r in rows), ["alpha", "beta"])
+        for n in ("alpha", "beta"):
+            self.assertEqual(len(json.loads(self.pp("ls", n, "--json")[1])), 1)
+        rc, out, err = self.pp(dots)                    # the project itself is where the name is fixed
+        self.assertEqual(rc, 1, out)
+        self.assertIn("one path component", err)
+
+        rc, out, err = self.pp("status")                # the one verb that surveys the registry says it once
+        self.assertEqual(rc, 0, err)
+        self.assertIn("not one path component: ..", err)
+        self.assertIn(os.path.join(self.sb.state, "promote", "registry.json"), err)
+        # the leftovers of this name are where the path led, which for `..` is the directory every target's
+        # releases are under: the line names that directory and what in it is this target's, and never the
+        # directory itself, whose removal would take every release the user has
+        self.assertIn(self.sb.data, err)
+        self.assertNotIn(os.path.join(self.sb.data, "releases"), err)
+        self.assertIn("revisions.log", err)
+
+    def test_a_name_with_a_space_is_a_name(self):
+        """Only a name that would not be one directory is refused: a project called `My Project` is not."""
+        src = os.path.join(self.tmp, "spaced")
+        self.write(".pp.toml", 'name = "My Project"\n[promote]\nsource = "tree"\n', root=src)
+        self.write("f.txt", "x", root=src)
+        rc, out, err = self.pp(src)
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.isdir(os.path.join(self.sb.data, "releases", "My Project")))
+
+    def test_a_name_with_a_dot_in_front_is_a_name(self):
+        """With no `name` key the project directory's own name is the target's, so most names are names pp
+        derived. A dotted project directory (~/.dotfiles, ~/.emacs.d) is an ordinary one."""
+        src = os.path.join(self.tmp, ".dotfiles")
+        self.write(".pp.toml", '[promote]\nsource = "tree"\n', root=src)
+        self.write("f.txt", "x", root=src)
+        rc, out, err = self.pp(src)
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.isdir(os.path.join(self.sb.data, "releases", ".dotfiles")))
+        self.assertIn(".dotfiles", self.registry())
+        self.assertIn(".dotfiles", self.pp("status")[1])
+        self.assertEqual(len(json.loads(self.pp("ls", ".dotfiles", "--json")[1])), 1)
+        self.assertIn(".dotfiles: no release older than", self.pp("rollback", ".dotfiles", "-y")[2])
+        self.assertEqual(self.pp("gc", ".dotfiles", "-y")[0], 0)
+
+    def test_one_bad_value_leaves_the_other_targets_listed(self):
+        """`status` surveys every target, so a value pp refuses in one project's config is a line about that
+        target and the rows of the others still print: the refusal belongs to `pp promote` in that project."""
+        for n in ("alpha", "beta"):
+            src = os.path.join(self.tmp, n)
+            self.write(".pp.toml", f'name = "{n}"\n[promote]\nsource = "tree"\n', root=src)
+            self.write("f.txt", n, root=src)
+            self.assertEqual(self.pp(src)[0], 0)
+        self.write(".pp.toml", 'name = "beta"\n[promote]\nsource = "tree"\nexclude = "*.log"\n',
+                   root=os.path.join(self.tmp, "beta"))
+        rc, out, err = self.pp("status")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("exclude", err)
+        for n in ("alpha", "beta"):
+            self.assertIn(n, out)
 
 
 class TestNothingLeftOpen(Base):
