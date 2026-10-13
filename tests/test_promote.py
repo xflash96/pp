@@ -420,6 +420,113 @@ class TestPromote(Base):
 
 
 
+class TestAWordThatIsNoVerb(Base):
+    def test_a_mistyped_verb_does_not_release_the_project_in_the_cwd(self):
+        """Every other word is a PATH, and a path that is not there resolves to the project of the cwd: a typo
+        for a read-only verb used to snapshot, gate, flip `current` and run `after`."""
+        self.make_repo()
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        first = self.current()
+        self.write("v", "2")
+        self.commit("v2")
+        self.sb.chdir(self.repo)
+        rc, out, err = self.pp("stat")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no such verb or path 'stat'", err)
+        self.assertEqual(self.current(), first)
+        self.assertEqual(self.stamps(), [first])
+
+        rc, _, err = self.pp("demo")                  # the name every other verb takes
+        self.assertEqual(rc, 2)
+        self.assertIn("'demo' is a promoted target", err)
+        self.assertEqual(self.current(), first)
+
+        self.assertEqual(self.pp("-n", self.repo)[0], 0)      # a path, and a flag before it, still work
+        self.assertEqual(self.pp("-n")[0], 0)
+        self.assertEqual(self.pp("-n", "bin")[0], 0)          # a relative path in the project
+
+    def test_the_verb_is_the_verb_wherever_it_sits_among_the_options(self):
+        """The refusal covered the first argument only, so an option before the word sent it on as a PATH:
+        `pp promote -y rollback`, the transposition of a line all three verbs take `-y` on, promoted the
+        project in the cwd instead of rolling it back, without asking."""
+        self.make_repo("keep = 5\n")
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        first = self.current()
+        self.write("v", "2")
+        self.commit("v2")
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        second = self.current()
+        self.sb.chdir(self.repo)
+
+        rc, out, err = self.pp("--again", "stat")                  # a typo for a read-only verb
+        self.assertEqual(rc, 2, out)
+        self.assertIn("no such verb or path 'stat'", err)
+        self.assertEqual(self.current(), second)
+        self.assertEqual(len(self.stamps()), 2)
+
+        rc, out, err = self.pp("-y", "rollback")                   # the verb, with its option first
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.current(), first)
+        self.assertEqual(len(self.stamps()), 2, "it released the source instead of rolling back")
+        self.assertEqual(self.pp("--json", "status")[0], 0)        # a verb after an option it takes itself
+
+    def test_a_word_argparse_reads_as_the_path_is_judged_as_the_path(self):
+        """The scan for the word passed over every word starting with `-`, and argparse reads such a word as
+        the positional where it holds a space or looks like a negative number: `OPTS="--dirty --again"` in a
+        zsh, which does not split it, and `pp promote -1` both reached PATH, and a path that is not there
+        resolves to the project of the cwd, so each released it without asking."""
+        self.make_repo()
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        first = self.current()
+        self.write("v", "2")
+        self.commit("v2")
+        self.sb.chdir(self.repo)
+        for word in ("--dirty --again", "-1"):
+            with self.subTest(word=word):
+                rc, out, err = self.pp(word)
+                self.assertEqual(rc, 2, out)
+                self.assertIn(f"no such verb or path '{word}'", err)
+                self.assertEqual(self.current(), first)
+                self.assertEqual(self.stamps(), [first])
+        rc, out, _ = self.pp("rollback", "-h")      # the verb's own help: main() reads with no -h of its own
+        self.assertEqual(rc, 0)
+        self.assertIn("flip `current` back", out)
+
+    def test_an_option_of_a_verb_is_read_by_that_verbs_parser(self):
+        """main() looks the verb up before any option is read, because the options on that line are the verb's
+        own. Judged against `pp promote`'s options first, gc's documented `--keep` was a unique prefix of
+        `--keep-failed` there: `--keep=1` was refused with a usage line about a flag the user never typed,
+        while `--keep 1` ran, so the two spellings of one option disagreed."""
+        self.make_repo("keep = 5\n")
+        made = []
+        for i in range(3):
+            self.write("v", str(i))
+            self.commit(f"v{i}")
+            self.assertEqual(self.pp(self.repo)[0], 0)
+            made.append(self.current())
+        for spelling in (["--keep=1"], ["--keep", "1"]):
+            with self.subTest(spelling=spelling):
+                rc, out, err = self.pp("gc", "demo", *spelling, "-n")
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f"to remove: {made[0]}", out)
+        self.assertEqual(self.stamps(), sorted(made), "a dry run removed a release")
+
+    def test_a_mistaken_option_is_answered_with_the_usage_that_names_h(self):
+        """main() reads argv with a parser of no `-h` and no abbreviations of its own, so `pp promote rollback
+        -h` is the verb's help and an abbreviation is resolved by the parser that reports it. That parser
+        reports nothing: one command line has one usage line, and it names the flag that would explain the
+        rest."""
+        self.make_repo()
+        self.sb.chdir(self.repo)
+        for word in ("--dirty=x", "--qq", "--d"):
+            with self.subTest(word=word):
+                rc, out, err = self.pp(word)
+                self.assertEqual(rc, 2, out + err)
+                self.assertEqual(err.count("usage: pp promote"), 1)
+                self.assertIn("[-h]", err)
+        self.assertEqual(self.stamps(), [], "it released the project in the cwd")
+
+
 class TestATreeProjectPpCannotRead(Base):
     """A tree project is what `source = "tree"` is written for, and a service project holds more than regular
     files. The hash opened whatever the walk listed, with no bound and no handler."""

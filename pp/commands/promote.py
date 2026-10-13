@@ -59,6 +59,7 @@ Dev runs from the working tree (another port); prod only ever runs promoted byte
 """
 from __future__ import annotations
 
+import argparse
 import fnmatch
 import hashlib
 import json
@@ -609,8 +610,14 @@ def _gc(t: Target, gone: list[str], say=print) -> None:
 
 # ---- verbs ----------------------------------------------------------------------------------------
 
-def cmd_run(argv: list[str]) -> int:
-    ap = ui.parser("promote", __doc__)
+def _run_parser(**kw) -> argparse.ArgumentParser:
+    """What `pp promote` itself takes. main() and cmd_run read argv with this one parser, so the word that
+    becomes a path is the word argparse reads as the positional: a word starting with `-` is that word too
+    where argparse reads it as one, which is a word holding a space (an unsplit `$OPTS` in zsh) or one looking
+    like a negative number. main() reads with no `-h` and no abbreviations of its own, so `pp promote rollback
+    -h` is the verb's and `pp promote --dir` is resolved once, here: the parser that has `-h` is the one whose
+    usage a mistyped option is answered with, so one command line has one usage line."""
+    ap = ui.parser("promote", __doc__, **kw)
     ap.add_argument("path", nargs="?", help="a path in the project (default: cwd)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="preflight: list every blocker and the plan, change nothing")
     ap.add_argument("--dirty", action="store_true", help="git mode: snapshot the working tree as it is")
@@ -619,7 +626,11 @@ def cmd_run(argv: list[str]) -> int:
     ap.add_argument("--keep-failed", action="store_true", help="leave a failed staging dir for inspection")
     ap.add_argument("--force-links", action="store_true", help="replace regular files / foreign symlinks at link paths")
     ap.add_argument("-y", "--yes", action="store_true", help="do not ask")
-    a = ap.parse_args(argv)
+    return ap
+
+
+def cmd_run(argv: list[str]) -> int:
+    a = _run_parser().parse_args(argv)
 
     t = _project(a.path)
     f = Facts(t, a.dirty)
@@ -1044,6 +1055,30 @@ def cmd_init(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if argv and argv[0] in VERBS:
-        return globals()["cmd_" + argv[0]](argv[1:])
+    # the verb is the word of argv that names one, wherever it sits among the options: `pp promote -y
+    # rollback` means the verb it names, and not a release of the project in the cwd. It is read before any
+    # option, because the options on that line are the verb's own: `pp promote gc NAME --keep=1` is gc's
+    # `--keep`, which against `pp promote`'s own options is a unique prefix of `--keep-failed`.
+    word = next((w for w in argv if w in VERBS), None)
+    if word is not None:
+        at = argv.index(word)
+        return globals()["cmd_" + word](argv[:at] + argv[at + 1:])
+    # with no verb in it, the word argparse reads as the positional is the path `pp promote` releases. It is
+    # the parser cmd_run parses with, so a word that reaches `path` by any spelling is judged here and
+    # nowhere else. An abbreviation is left to that parser as well, since this one has no `-h` to name in a
+    # usage of its own: asked which word is the path, it answers that and resolves nothing.
+    try:
+        word = _run_parser(add_help=False, exit_on_error=False, allow_abbrev=False).parse_known_args(argv)[0].path
+    except argparse.ArgumentError:
+        return cmd_run(argv)        # the parser that has -h says what is wrong, in its own usage
+    if word is None:
+        return cmd_run(argv)
+    if not os.path.lexists(paths.expand(word)):
+        # a path that is not there would resolve to the project of the cwd: a mistyped verb, or a target named
+        # the way every other verb takes one, would release that
+        reg = _registry()
+        if word in reg:
+            ui.die(f"'{word}' is a promoted target, and `pp promote` releases a project by its path: `pp "
+                   f"promote` in {reg[word]['source']}, or `pp promote <path>`", 2)
+        ui.die(f"no such verb or path '{word}' (verbs: {', '.join(VERBS)})", 2)
     return cmd_run(argv)
