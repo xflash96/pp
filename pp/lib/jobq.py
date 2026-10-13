@@ -1286,7 +1286,6 @@ class Worker:
         it: a stop another actor wrote since those facts were read is part of it, so a job a kill has touched
         is never retried past its stop."""
         jid = j["id"]
-        line = None
         with txn() as s:
             cur = s.job(jid, must_be=("running",))
             if cur is None:
@@ -1304,12 +1303,11 @@ class Worker:
         if a.do in (TERM, KILL9):
             self._send(cur, a)
             return a
-        if line:
-            _append_log(cur, line)          # after the scope: a job's log is not the store
         if a.do == TIME_UP:
             self.log(f"timeout {jid} {cur.get('tag')} after {ui.human_duration(float(cur['timeout']))}: "
                      "stopping it")
         elif a.do == AGAIN:
+            _append_log(cur, line)          # after the scope: a job's log is not the store
             self.log(f"retry {jid} {cur.get('tag')}: attempt {cur['attempt']}/{int(cur.get('retries') or 0) + 1} "
                      f"in {_in_delay(cur['not_before'])}")
         elif a.do == ENDED_AS:
