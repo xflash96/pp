@@ -1690,15 +1690,16 @@ def worker_now(q: str) -> Holder:
 _none_came_up: dict[str, float] = {}
 
 
-def _no_worker_came_up(q: str, quiet: bool, said: bool, w: Holder, why: str | None = None) -> Holder:
+def _no_worker_came_up(q: str, quiet: bool, w: Holder, why: str | None = None) -> Holder:
     """This process's round of starts brought no worker up: hold off from starting another for START_EVERY,
-    and say so unless the caller asked quietly. -> that answer, carrying why on it for a quiet caller to say.
+    and say why unless the caller asked quietly, which is the reason a start gave or that none came up.
+    -> that answer, carrying why on it for a quiet caller to say.
 
     The clock is read here, after the starts, and not before them: a round can take longer than START_EVERY
     (a start waits for the worker to say it is ready), and a reading from before it would already be past."""
     _none_came_up[q] = time.time()
-    if not quiet and not said:
-        ui.warn(f"{_PROG}: the {q} worker did not come up; its log: {_worker_log(q)}")
+    if not quiet:
+        ui.warn(f"{_PROG}: {why or f'the {q} worker did not come up'}; its log: {_worker_log(q)}")
     return Holder(w.how, rec=w.rec, why=why)
 
 
@@ -1741,13 +1742,11 @@ def worker_up(q: str, quiet: bool = False, wake: bool = False) -> Holder:
         if not starts and time.time() < _none_came_up.get(q, 0.0) + START_EVERY:
             return w        # a round of this process's brought none up that recently: not another yet
         if len(starts) == WORKER_STARTS:
-            return _no_worker_came_up(q, quiet, False, w)    # the claim's next holder shut this many out
+            return _no_worker_came_up(q, quiet, w)      # the claim's next holder shut this many out
         try:
             starts.append(_start_worker(q).pid)     # starting a process is not store work: no lock is held
         except TimeoutError as e:
-            if not quiet:
-                ui.warn(f"{_PROG}: {e}; its log: {_worker_log(q)}")
-            return _no_worker_came_up(q, quiet, True, w, why=str(e))
+            return _no_worker_came_up(q, quiet, w, why=str(e))
 
 
 def work(q: str, backfill: bool | None = None, poll: float | None = None) -> int:
