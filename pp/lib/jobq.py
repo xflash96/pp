@@ -124,7 +124,7 @@ def _voice(q: str, log=None):
         if kind == "timeout":
             say(f"timeout {jid} {tag} after {ui.human_duration(float(job['timeout']))}: stopping it")
         elif kind == "again":
-            _append_log(job, _retry_line(f))        # the job's own log, before the queue's
+            _append_log(job, _retry_line(job))      # the job's own log, before the queue's
             say(f"retry {jid} {tag}: attempt {job['attempt']}/{int(job.get('retries') or 0) + 1} "
                 f"in {_in_delay(job['not_before'])}")
         elif kind == "ended":
@@ -641,11 +641,14 @@ def log_tail(job: dict, n: int = 40) -> list[str]:
         return []
 
 
-def _retry_line(said: dict) -> str:
-    """What a requeue writes in the job's own log, from what the store wrote: the attempt that ended, why, and
-    the one to come."""
-    return (f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} attempt {said['attempt']}/{said['of']} after "
-            f"{said['why']}; attempt {said['next']} in {ui.human_duration(said['delay'])}")
+def _retry_line(job: dict) -> str:
+    """What a requeue writes in the job's own log, read off the record it left: the attempt that ended, why,
+    and the one to come."""
+    last = (job.get("history") or [{}])[-1]
+    why = last.get("reason") or f"exit {last.get('rc')}"
+    return (f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} attempt {last.get('attempt')}/"
+            f"{int(job.get('retries') or 0) + 1} after {why}; attempt {job.get('attempt')} in "
+            f"{_in_delay(job.get('not_before'))}")
 
 
 def _append_log(job: dict, line: str):

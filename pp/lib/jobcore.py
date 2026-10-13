@@ -203,18 +203,11 @@ class Worker:
         with jobstore.listing() as s:    # one pass: the jobs to decide about, and the hooks the queue still owes
             jobs = list(s.jobs(("running",) + jobstore.ENDED, self.queue))
         owed = [j for j in jobs if j["state"] in jobstore.ENDED and j.get("hook_due")]
-        in_flight = 0
-        for j in [x for x in jobs if x["state"] == "running"]:
-            stop = j.get("stop") or {}
-            action = self._step(j, self._facts(j, now))
-            if action.do in (policy.TERM, policy.KILL9, policy.TIME_UP) or (action.do == policy.NOTHING and stop
-                                                       and not stop.get("denied") and not stop.get("kill9")):
-                in_flight += 1          # a stop with something still to go out for it
         # while a stop is in flight, and a verb is waking this worker for it, the loop's wait is STOP_PERIOD
-        # and not the poll (work()). A stop whose SIGKILL has gone out has nothing left to carry out, so it is
-        # not one: the worker waits for the kernel to end a job that is slow to die, at its poll or at the
-        # next wake of whoever is waiting, and the reap sees the run claim go like any other
-        self.serving = in_flight
+        # and not the poll (work()); `policy.in_flight` is what one of them is, over the record this pass
+        # listed and the action it came to
+        self.serving = sum(policy.in_flight(j, self._step(j, self._facts(j, now)))
+                           for j in jobs if j["state"] == "running")
         for j in owed:
             self.fire(j, j["hook_due"])     # owed by a worker that did not get to fire it
         # a child of this worker's whose record no longer says running: something outside pp ended the job
@@ -268,7 +261,7 @@ class Worker:
                 cur["stop"] = {"by": "timeout", "timeout": True, "t": a.t, "grace": a.grace}
                 s.save(cur)
             elif a.do == policy.AGAIN:
-                said = jobstore._requeue(s, cur, a)
+                jobstore._requeue(s, cur, a)
             elif a.do == policy.ENDED_AS:
                 jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
         if a.do in (policy.TERM, policy.KILL9):
@@ -277,7 +270,7 @@ class Worker:
         if a.do == policy.TIME_UP:
             self.say("timeout", cur, {})
         elif a.do == policy.AGAIN:
-            self.say("again", cur, said)    # after the scope: the line it writes in the job's log is not the store
+            self.say("again", cur, {})      # after the scope: the line it writes in the job's log is not the store
         elif a.do == policy.ENDED_AS:
             self.say("ended", cur, {})
             if a.hook:
@@ -363,7 +356,7 @@ class Worker:
     @staticmethod
     def wake(h: proc.Handle | None) -> None:
         """End the wait of the worker this handle names, so it ticks now instead of when its period is up. The
-        handle comes from the look `worker_up` has already taken (`Holder.handle`), so waking a worker costs no
+        handle comes from the look `worker_up` has already taken (`_handle`), so waking a worker costs no
         second look at the claim.
 
         The wake is a signal to a worker, never to a job: a worker inside `waking` takes it from its own
@@ -455,12 +448,10 @@ class Worker:
         jid, q = j["id"], self.queue
         argv = list(j.get("runner") or []) + list(j["cmd"])
         env = policy.job_env(j, gpu)
-        retries = int(j.get("retries") or 0)
-        attempt = f" attempt {j.get('attempt', 1)}/{retries + 1}" if retries else ""
         try:
             os.makedirs(os.path.dirname(j["log"]), exist_ok=True)
             with open(j["log"], "a") as f:
-                f.write(f"[pp queue] {datetime.now():%Y-%m-%d %H:%M:%S} job {jid} ({q}){attempt} in {j['cwd']}: {shlex.join(argv)}\n")
+                f.write(policy.banner(j, shlex.join(argv), f"{datetime.now():%Y-%m-%d %H:%M:%S}"))
                 f.flush()
                 p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
                                env="scrubbed", add_env=env, cwd=j["cwd"], stdout=f, stderr=proc.STDOUT)
@@ -553,50 +544,20 @@ def _start_worker(q: str) -> proc.Child:
 # A verb asks `worker_now`, which reports, or `worker_up`, which makes sure a worker is up, and prints from the
 # one answer it gets back. So no verb acts on a look it took outside the scope that acted.
 
-# what one look at the claim says, which is `policy.look`'s answer and the one word every verb prints from
+# what one look at the claim says, and the value it comes to, which is the one thing every verb prints from
 UP, STARTED, DOWN, STARTING = policy.UP, policy.STARTED, policy.DOWN, policy.STARTING
+Holder = policy.Holder
 
 WORKER_STARTS = 3       # workers `worker_up` starts at most, each one asked about after it
 STARTING_LOOKS = 25     # looks it takes at a claim whose holder has not recorded itself ...
 STARTING_PAUSE = 0.02   # ... and how long apart, which is many times the one write that ends that moment
 
 
-@dataclass(frozen=True)
-class Holder:
-    """What one look at a queue's worker claim came to, and the one thing every verb prints from.
-
-    how     up, started, down or starting, as above.
-    rec     the record of the worker that holds the claim. None where nobody holds it.
-    tried   whether this answer came from a round of starts of this process's that brought no worker up, which
-            is what a caller that is not quiet says. An ask inside the hold-off of an earlier round starts
-            nothing and carries nothing, so it says nothing either.
-    why     why a round of starts brought no worker up, where this answer came from such a round. None
-            otherwise. A start that times out is the one reason the worker's own log cannot carry, since a
-            worker that hung before it said it was ready has logged nothing, so a caller that asked quietly
-            says this itself.
-    """
-
-    how: str
-    rec: dict | None = None
-    why: str | None = None
-    tried: bool = False
-
-    @property
-    def up(self) -> bool:
-        """Whether a worker is up: the one answer, so nothing has to read a record to find out."""
-        return self.how in (UP, STARTED)
-
-    @property
-    def pid(self) -> int | None:
-        """The pid of the queue's worker. None where nobody holds the claim, and while a worker that holds it
-        has not recorded itself yet."""
-        return (self.rec or {}).get("pid") if self.up else None
-
-    @property
-    def handle(self) -> proc.Handle | None:
-        """The worker as the handle a signal to it goes through: a wake, or the SIGTERM of `worker stop`. None
-        where this look found no worker. A worker that is up has recorded itself, so both halves are there."""
-        return proc.Handle.recorded(self.pid, (self.rec or {}).get("pstart")) if self.up else None
+def _handle(w: policy.Holder) -> proc.Handle | None:
+    """The worker one look found, as the handle a signal to it goes through: a wake, or the SIGTERM of
+    `worker stop`. None where that look found no worker. A worker that is up has recorded itself, so both
+    halves of the handle are there."""
+    return proc.Handle.recorded(w.pid, (w.rec or {}).get("pstart")) if w.up else None
 
 
 def worker_now(q: str) -> Holder:
@@ -614,11 +575,11 @@ def worker_now(q: str) -> Holder:
     moment."""
     for _ in range(STARTING_LOOKS):
         rec = worker(q)
-        how = policy.look(rec, proc.Handle.running((rec or {}).get("pid"), (rec or {}).get("pstart")) is not None)
-        if how != STARTING:
-            return Holder(how, rec=rec)
+        w = policy.look(rec, proc.Handle.running((rec or {}).get("pid"), (rec or {}).get("pstart")) is not None)
+        if w.how != STARTING:
+            return w
         time.sleep(STARTING_PAUSE)      # its first moment: look again rather than decide from it
-    return Holder(STARTING, rec=rec)
+    return w
 
 
 # When a round of starts of this process last brought no worker up, per queue. A loop that asks on every pass
@@ -663,7 +624,7 @@ def worker_up(q: str, wake: bool = False) -> Holder:
             if w.pid is not None and w.pid in starts:
                 return Holder(STARTED, rec=w.rec)
             if wake:
-                Worker.wake(w.handle)
+                Worker.wake(_handle(w))
             return w
         if w.how == STARTING:
             return w
@@ -866,7 +827,7 @@ def worker_stop(q: str, sink=None) -> dict:
     w = worker_now(q)           # one look, and this stop signals the worker that look found
     if not w.up:                # nothing holds the claim, or a holder that has not recorded itself yet
         return {"did": "starting" if w.how == STARTING else "down", "pid": None}
-    h = w.handle                # the handle this one look gave: no second look decides what is signalled
+    h = _handle(w)              # the handle this one look gave: no second look decides what is signalled
     outcome = proc.signal_pid(h, signal.SIGTERM)
     if outcome in ("gone", "denied"):   # it exited since we looked, or it is another user's
         return {"did": "down" if outcome == "gone" else "denied", "pid": h.id}

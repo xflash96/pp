@@ -687,7 +687,7 @@ _CORE_NAMES = {
     "_new_rcfile", "_worker_claim", "_watcher_claim", "_group_handle", "ended_on_its_own",
     # the worker, its start, its loop and its wait
     "Worker", "worker", "worker_now", "worker_up", "_no_worker_came_up", "_start_worker", "worker_log",
-    "Holder", "work", "_settings", "Wait", "waking",
+    "_handle", "work", "_settings", "Wait", "waking",
     # the watchers, and the two signals a verb hands over
     "watching", "watchers", "ask_stop", "worker_stop",
 }

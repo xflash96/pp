@@ -407,21 +407,17 @@ def _finish(s: Txn, job: dict, state: str, rc: int | None, reason: str | None = 
     s.save(job)
 
 
-def _requeue(s: Txn, job: dict, a: policy.Action) -> dict:
+def _requeue(s: Txn, job: dict, a: policy.Action) -> None:
     """In a transaction: the job goes back to its queue for the attempt the action names, with the same id.
-    -> what the caller words: the attempt that ended, how many there are, why it ended, the attempt to come
-    and how long until it may start."""
-    attempt, retries = int(job.get("attempt", 1)), int(job.get("retries") or 0)
-    job.setdefault("history", []).append({"attempt": attempt, "rc": a.rc, "reason": a.reason,
-                                          "started": job.get("started"), "ended": a.ended,
-                                          "seconds": a.ended - (job.get("started") or a.ended),
-                                          "rcfile": job.get("rcfile")})
-    for k in ("pid", "pgid", "pstart", "boot", "started", "gpu", "stop", "rcfile"):
-        job.pop(k, None)            # this attempt's, including the file it wrote its code to
+
+    The action carries the entry the attempt that ended leaves in `history` and the keys that attempt's own
+    fields are, so this writes what the decision said and works nothing out again. What the caller says about
+    the retry it reads off the record this leaves."""
+    job.setdefault("history", []).append(a.history)
+    for k in a.clear:
+        job.pop(k, None)            # this attempt's, including the files it named
     job.update(attempt=a.attempt, not_before=a.not_before, state="queued")
     s.save(job)
-    return {"attempt": attempt, "of": retries + 1, "why": a.why, "next": a.attempt,
-            "delay": a.not_before - a.ended}
 
 
 # ---- the writes a verb hands over --------------------------------------------------------------------

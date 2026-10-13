@@ -72,10 +72,12 @@ class Action:
         term                                                         SIGTERM to its group
         kill9                                                        SIGKILL to its group
         ended-as  state, rc, reason, hook, ended, sweep, not_retried  record how it ended
-        again     attempt, not_before, rc, reason, ended, sweep       back to its queue for another attempt
+        again     attempt, not_before, history, clear, ended, sweep   back to its queue for another attempt
 
     hook is the event whose hook is owed ("failed", "done"), or None where the outcome owes none or the job
-    carries no such hook. sweep says anything left in the job's process group goes with it.
+    carries no such hook. sweep says anything left in the job's process group goes with it. history is the
+    entry a requeue writes for the attempt that ended, and clear the keys it takes off the record, so the
+    store writes what this says and works nothing out again.
     """
 
     do: str
@@ -90,11 +92,29 @@ class Action:
     not_retried: str | None = None
     t: float | None = None
     grace: float | None = None
+    history: dict | None = None
+    clear: tuple = ()
 
     @property
     def why(self) -> str:
         """The failure as the job's log names it and --retry-if matches it: a reason, or the exit code."""
         return self.reason or f"exit {self.rc}"
+
+
+# What one attempt of a job holds that the next one does not: the process it ran as, the stop it carried, the
+# files it wrote and the names it was given. A requeue takes each off the record and the history entry it
+# writes keeps them, so a job that ran three times names three sets of files and claims none of them twice.
+ATTEMPT = ("pid", "pgid", "pstart", "boot", "started", "gpu", "stop", "rcfile")
+KEPT = ("rcfile",)      # of those, the ones the history entry carries by name
+
+
+def attempt_of(job: dict, rc: int | None, reason: str | None, ended: float) -> dict:
+    """The history entry the attempt that just ended leaves behind: how it ended, how long it ran, and the
+    files and names that were its own."""
+    started = job.get("started")
+    return {"attempt": int(job.get("attempt", 1)), "rc": rc, "reason": reason, "started": started,
+            "ended": ended, "seconds": ended - (started or ended),
+            **{k: job.get(k) for k in KEPT}}
 
 
 def matches(job: dict, why: str, tail: str) -> bool:
@@ -194,10 +214,22 @@ def _or_again(job: dict, facts: Facts, rc: int | None, reason: str | None, ended
         base = job.get("retry_delay")
         delay = min(float(RETRY_DELAY if base is None else base) * 2 ** (attempt - 1), RETRY_DELAY_CAP)
         return Action(AGAIN, rc=rc, reason=reason, ended=now, sweep=sweep, attempt=attempt + 1,
-                      not_before=now + delay)
+                      not_before=now + delay, history=attempt_of(job, rc, reason, now), clear=ATTEMPT)
     # attempts were left, but retry_if says this failure is not worth one
     nr = f"neither the reason ({why}) nor the log tail matches /{job.get('retry_if')}/" if left else None
     return _ends(job, rc, reason, ended, sweep, "failed", nr)
+
+
+def in_flight(job: dict, action: Action) -> bool:
+    """Whether a stop of this job still has something to go out for it, which is what shortens the worker's
+    wait while a verb waits on one (`next_tick`).
+
+    A stop whose SIGKILL has gone out has nothing left to carry out: the worker waits for the kernel to end a
+    job that is slow to die, at its poll. A stop pp was refused has nothing more going out for it at all."""
+    stop = job.get("stop") or {}
+    if action.do in (TERM, KILL9, TIME_UP):
+        return True
+    return action.do == NOTHING and bool(stop) and not stop.get("denied") and not stop.get("kill9")
 
 
 def merge_stop(existing: dict | None, ask: dict) -> dict:
@@ -390,15 +422,47 @@ POLL = 2.0              # how long between ticks, and how long a worker waits id
 IDLE_EXIT = 600.0       # ... the settings it was handed say neither
 
 
-def look(rec: dict | None, alive: bool) -> str:
-    """What one look at a queue's worker claim says: `down` where nobody holds it, `up` where the record in
+@dataclass(frozen=True)
+class Holder:
+    """What one look at a queue's worker claim came to, and the one value every verb prints from.
+
+    how     up, started, down or starting, as above.
+    rec     the record of the worker that holds the claim. None where nobody holds it.
+    tried   whether this answer came from a round of starts of this process's that brought no worker up,
+            which is what a caller that is not quiet says. An ask inside the hold-off of an earlier round
+            starts nothing and carries nothing, so it says nothing either.
+    why     why a round of starts brought no worker up, where this answer came from such a round. None
+            otherwise. A start that times out is the one reason the worker's own log cannot carry, since a
+            worker that hung before it said it was ready has logged nothing, so a caller that asked quietly
+            says this itself.
+    """
+
+    how: str
+    rec: dict | None = None
+    why: str | None = None
+    tried: bool = False
+
+    @property
+    def up(self) -> bool:
+        """Whether a worker is up: the one answer, so nothing has to read a record to find out."""
+        return self.how in (UP, STARTED)
+
+    @property
+    def pid(self) -> int | None:
+        """The pid of the queue's worker. None where nobody holds the claim, and while a worker that holds it
+        has not recorded itself yet."""
+        return (self.rec or {}).get("pid") if self.up else None
+
+
+def look(rec: dict | None, alive: bool) -> Holder:
+    """What one look at a queue's worker claim came to: `down` where nobody holds it, `up` where the record in
     it names a process of its own that is alive, and `starting` while the holder has not recorded itself yet.
 
     rec is the record the claim holds, or None where nobody holds it; alive is whether the process that
     record names is running, which only a look at a process can say."""
     if rec is None:
-        return DOWN
-    return UP if alive else STARTING
+        return Holder(DOWN)
+    return Holder(UP if alive else STARTING, rec=rec)
 
 
 def next_tick(settings: dict, serving: int, woken: bool, idle_since: float | None, now: float):
@@ -428,6 +492,15 @@ def job_env(job: dict, card: int | None) -> dict:
     if card is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(card)
     return env
+
+
+def banner(job: dict, cmd: str, stamp: str) -> str:
+    """The line pp appends to a job's log before an attempt's output: whose output follows, which is what
+    makes a file several jobs write to readable. The caller passes the time, since a rule reads no clock, and
+    the command as one line, since a rule splits no words."""
+    retries = int(job.get("retries") or 0)
+    attempt = f" attempt {job.get('attempt', 1)}/{retries + 1}" if retries else ""
+    return f"[pp queue] {stamp} job {job['id']} ({job['queue']}){attempt} in {job['cwd']}: {cmd}\n"
 
 
 def hook_env(job: dict, event: str) -> dict:

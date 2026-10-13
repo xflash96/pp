@@ -1940,7 +1940,7 @@ class TestWorkerClaim(QueueCase):
         self.left_behind(pid=os.getpid(), pstart=me.start)
         self.assertIsNone(jobcore.worker("default"))
         self.assertIsNone(worker_pid())
-        self.assertIsNone(jobcore.worker_now("default").handle)
+        self.assertIsNone(jobcore._handle(jobcore.worker_now("default")))
         with jobq.lock.Claim.take(jobcore._worker_claim("default"), {"pid": os.getpid(), "pstart": me.start}):
             self.assertEqual(worker_pid(), os.getpid())   # held: the record is this holder's own
 
@@ -3151,7 +3151,7 @@ class TestTheDecision(unittest.TestCase):
         # attempts are left while the attempt number is no further than `retries`, so the row says both
         job = {"id": 1, "queue": "default", "state": "running", "tag": "t", "attempt": r["attempt"],
                "retries": r["attempt"] + 2 if r["left"] else 0, "retry_delay": self.DELAY,
-               "retry_if": r["retry_if"], "timeout": 60.0, "started": self.NOW - (120 if r["due"] else 1),
+               "retry_if": r["retry_if"], "timeout": 60.0, "started": self.started_at(r),
                "grace": self.JOB_GRACE, "on_fail": "echo failed", "on_done": "echo done"}
         st = self.stop(r["stop"], r["grace_up"])
         if st is not None:
@@ -3177,14 +3177,24 @@ class TestTheDecision(unittest.TestCase):
         return jobpolicy.Action(jobpolicy.ENDED_AS, state="done" if rc == 0 and not reason else "failed", rc=rc,
                            reason=reason, hook=hook, ended=ended, sweep=sweep, not_retried=not_retried)
 
+    def started_at(self, r: dict) -> float:
+        """When the attempt this row is about started, which is what the row's own timeout rests on."""
+        return self.NOW - (120 if r["due"] else 1)
+
     def failure(self, r, rc, reason, ended, sweep) -> jobpolicy.Action:
         """A failure of the job's own: another attempt where it has one left and --retry-if matches, else the
-        end of it, which says why it was not retried. The delay doubles per attempt, up to RETRY_DELAY_CAP."""
+        end of it, which says why it was not retried. The delay doubles per attempt, up to RETRY_DELAY_CAP.
+
+        A retry carries the entry the attempt that ended leaves in `history` and the keys that attempt's own
+        fields are, so the store writes what the decision said and works nothing out again."""
         if r["left"] and r["retry_if"] is None:
             at = self.NOW if ended is None else ended
             delay = min(self.DELAY * 2 ** (r["attempt"] - 1), jobpolicy.RETRY_DELAY_CAP)
+            was = {"attempt": r["attempt"], "rc": rc, "reason": reason, "started": self.started_at(r),
+                   "ended": at, "seconds": at - self.started_at(r), "rcfile": None}
             return jobpolicy.Action(jobpolicy.AGAIN, rc=rc, reason=reason, ended=at, sweep=sweep,
-                               attempt=r["attempt"] + 1, not_before=at + delay)
+                               attempt=r["attempt"] + 1, not_before=at + delay, history=was,
+                               clear=jobpolicy.ATTEMPT)
         why = reason or f"exit {rc}"
         nr = f"neither the reason ({why}) nor the log tail matches /{r['retry_if']}/" if r["left"] else None
         return self.ends(rc, reason, ended, sweep, "failed", nr)
@@ -3457,7 +3467,8 @@ class TestThePolicyTables(unittest.TestCase):
     # -- look: what one look at a worker's claim says, exhaustive --------------------------------------------
     def test_what_one_look_at_a_workers_claim_says(self):
         """Nobody holds the claim, a holder that has not recorded itself yet, and one whose record names a
-        live process: the three answers, over every record a claim can hold."""
+        live process: the three answers, over every record a claim can hold. The answer is a value, and what
+        it says about a worker being up and about the pid to signal comes from it alone."""
         live, dead = {"pid": 7, "pstart": 11}, {"pid": 8, "pstart": 12}
         rows = 0
         for rec in (None, {}, dead, live):
@@ -3468,7 +3479,10 @@ class TestThePolicyTables(unittest.TestCase):
                         continue        # nothing holds the claim, so no record of its can name a process
                     want = (jobpolicy.DOWN if rec is None else
                             jobpolicy.UP if alive else jobpolicy.STARTING)
-                    self.assertEqual(jobpolicy.look(rec, alive), want)
+                    w = jobpolicy.look(rec, alive)
+                    self.assertEqual((w.how, w.rec, w.why, w.tried), (want, rec, None, False))
+                    self.assertEqual(w.up, want == jobpolicy.UP)
+                    self.assertEqual(w.pid, (rec or {}).get("pid") if w.up else None)
         self.assertEqual(rows, 8)
         self.assertEqual((jobpolicy.UP, jobpolicy.DOWN, jobpolicy.STARTING), (jobcore.UP, jobcore.DOWN,
                                                                              jobcore.STARTING))
@@ -4963,7 +4977,7 @@ class TestOneWorkerPerQueue(InjectedCase):
     def stop_the_worker(self, q: str = "default") -> None:
         """Stop the worker a test of this class started, and wait for its claim to be free, so nothing of the
         test is left running."""
-        h = jobcore.worker_now(q).handle
+        h = jobcore._handle(jobcore.worker_now(q))
         if h is not None:
             proc.signal_pid(h, signal.SIGTERM)
         journey.until(lambda: jobcore.worker(q) is None, timeout=30,
