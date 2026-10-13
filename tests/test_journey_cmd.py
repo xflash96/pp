@@ -17,8 +17,10 @@ HELLO = '"""Say hello"""\ndef main(argv):\n    print("hello {v}")\n    return 0\
 
 class TestNew(Journey):
     def test_a_machine_local_command_from_scaffold_to_use(self):
-        r = self.pp("cmd", "new", "hello", "--user", "-s", "Say hello")
         path = os.path.join(self.env["PP_CONFIG_DIR"], "commands", "hello.py")
+        self.pp("cmd", "new", "hello", "--user", "-n")        # the plan names the file and writes nothing
+        self.assertFalse(os.path.lexists(path))
+        r = self.pp("cmd", "new", "hello", "--user", "-s", "Say hello")
         self.assertIn(f"wrote {path}", r.stdout)
         self.assertIn("try: pp hello -h", r.stdout)
         self.assertIn("Say hello", self.pp().stdout.split("user commands")[1])
@@ -28,6 +30,11 @@ class TestNew(Journey):
             self.assertIn(flag, h)
         self.assertEqual(self.pp("hello", "world").stdout, "world\n")
         self.assertIn("is taken: user command", self.pp("cmd", "new", "hello", "--user", code=2).stderr)
+        # a plan of what the run would refuse is that refusal's status, and the file it named stays as it is
+        was = self.read(path)
+        self.pp("cmd", "new", "hello2", "--user", "-n", code=0)
+        self.pp("cmd", "new", "hello", "--user", "-n", code=2)
+        self.assertEqual(self.read(path), was)
 
     def test_names_that_are_taken_or_invalid(self):
         self.tool("pp-ext", "echo ext\n")
@@ -213,6 +220,11 @@ class TestNamesAndSources(PluginJourney):
         self.assertIn("(v1) from", self.pp("cmd", "ls").stdout)
         row = next(x for x in json.loads(self.pp("cmd", "ls", "--json").stdout) if x["name"] == "hello")
         self.assertEqual(row["ref"], "v1")
+        self.assertEqual(row["aliases"], [])
+        # a command's short names are its own row's, so a reader needs no second command to find them
+        self.write("home/.config/pp/commands/quote.py", '"""Quote"""\nALIASES = ["qt"]\ndef main(argv):\n    pass\n')
+        rows = {x["name"]: x["aliases"] for x in json.loads(self.pp("cmd", "ls", "--json").stdout)}
+        self.assertEqual(rows["quote"], ["qt"])
 
 
 class TestWhatGitCanAsk(PluginJourney):

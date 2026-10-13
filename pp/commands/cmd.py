@@ -4,6 +4,7 @@
                                     tests/test_journey_NAME.py (its help examples, run through the real CLI);
                                     run from a promoted release, that is the tree it was released from
     pp cmd new NAME --user          ~/.config/pp/commands/NAME.py, on this machine only
+    pp cmd new NAME -n              the files it would write, writing none
     pp cmd new NAME --user -s "One-line summary"
     pp cmd add github.com/OWNER/REPO      clone it, pin it to one commit, show what it adds, then ask
     pp cmd add URL -n --show        only show: its commands, and their code
@@ -11,7 +12,7 @@
     pp cmd update                   every plugin: fetch, show the diff, ask, then move the pin
     pp cmd update tools -n          only show what would change
     pp cmd rm tools                 remove a plugin and its commands
-    pp cmd ls                       every command and where it comes from (--json)
+    pp cmd ls                       every command and where it comes from (--json, with its aliases)
 
 A new command has a docstring whose first line is its summary, a main(argv), and only the standard library at
 the top of the file (the rest: https://github.com/xflash96/pp/blob/main/CONTRIBUTING.md).
@@ -120,12 +121,26 @@ if __name__ == "__main__":
 
 # ---- new ------------------------------------------------------------------------------------------
 
+def _new_files(name: str, d: str, test_dir: str | None) -> list[tuple[str, str]]:
+    """Every file `cmd new` writes, in the order it writes them: the command first, then each test whose
+    harness is in that tests directory. A tests/ without `sandbox.py` or `journey.py` is a published subset
+    or a contributor's own, and a test that cannot import is worse than no test. The plan and the run read
+    this one list, so both name the same files."""
+    out = [(os.path.join(d, name + ".py"), TEMPLATE)]
+    for tmpl, fname, needed in ((TEST_TEMPLATE, f"test_{name}.py", "sandbox.py"),
+                                (JOURNEY_TEMPLATE, f"test_journey_{name}.py", "journey.py")):
+        if test_dir and os.path.exists(os.path.join(test_dir, needed)):
+            out.append((os.path.join(test_dir, fname), tmpl))
+    return out
+
+
 def cmd_new(argv: list[str]) -> int:
     ap = ui.parser("cmd new", "Write a new command, with its tests.")
     ap.add_argument("name")
     ap.add_argument("-s", "--summary", default="TODO: one-line summary")
     ap.add_argument("--user", action="store_true", help="write to ~/.config/pp/commands (machine-local)")
     ap.add_argument("--no-test", action="store_true")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show the files it would write, write none")
     a = ap.parse_args(argv)
     if not re.fullmatch(r"[a-z][a-z0-9_]*", a.name):
         ui.die("a command name is lowercase letters, digits and _ (it is a Python module name)", 2)
@@ -141,31 +156,26 @@ def cmd_new(argv: list[str]) -> int:
         if root != paths.pp_root():
             prog = "ppd"
         d = os.path.join(root, "pp", "commands")
-        test_dir = None if a.no_test else os.path.join(root, "tests")
-    path = os.path.join(d, a.name + ".py")
+        test_dir = os.path.join(root, "tests")
+    files = _new_files(a.name, d, None if a.no_test else test_dir)
+    cls = "".join(w.capitalize() for w in a.name.split("_"))
+    hint = f"try: {prog} {a.name} -h" + ("   (`pp` gets it at the next `pp promote` of that tree)" if prog == "ppd" else "")
+    if a.dry_run:
+        for path, _ in files:
+            print(f"{'exists already' if os.path.lexists(path) else 'would write'}: {path}")
+        print(hint)
+        return 2 if os.path.lexists(files[0][0]) else 0       # what the run itself would refuse
     os.makedirs(d, exist_ok=True)
-    try:
-        with open(path, "x") as f:      # "x": the file is this writer's own, or there was one already
-            f.write(TEMPLATE.format(name=a.name, summary=a.summary))
-    except FileExistsError:
-        ui.die(f"{path} exists", 2)
-    print(f"wrote {path}")
-    if test_dir and os.path.isdir(test_dir):
-        cls = "".join(w.capitalize() for w in a.name.split("_"))
-        for tmpl, fname in ((TEST_TEMPLATE, f"test_{a.name}.py"), (JOURNEY_TEMPLATE, f"test_journey_{a.name}.py")):
-            tpath = os.path.join(test_dir, fname)
-            # each template is written only where what it imports is: a tests/ without them is a published
-            # subset or a contributor's own, and a test that cannot import is worse than no test
-            needed = "journey.py" if tmpl is JOURNEY_TEMPLATE else "sandbox.py"
-            if not os.path.exists(os.path.join(test_dir, needed)):
-                continue
-            try:
-                with open(tpath, "x") as f:
-                    f.write(tmpl.format(name=a.name, cls=cls))
-            except FileExistsError:     # a test file of that name is the user's: never overwritten
-                continue
-            print(f"wrote {tpath}")
-    print(f"try: {prog} {a.name} -h" + ("   (`pp` gets it at the next `pp promote` of that tree)" if prog == "ppd" else ""))
+    for n, (path, tmpl) in enumerate(files):
+        try:
+            with open(path, "x") as f:  # "x": the file is this writer's own, or there was one already
+                f.write(tmpl.format(name=a.name, summary=a.summary, cls=cls))
+        except FileExistsError:
+            if n == 0:                  # the command file itself: the name is taken, and nothing is written
+                ui.die(f"{path} exists", 2)
+            continue                    # a test file of that name is the user's: never overwritten
+        print(f"wrote {path}")
+    print(hint)
     return 0
 
 
@@ -521,7 +531,8 @@ def cmd_ls(argv: list[str]) -> int:
     index, root = _index(), _root()
     rows = []
     for name, c in sorted(cli.discover().items()):
-        row = {"name": name, "origin": c.origin, "path": c.path, "summary": c.summary, "error": c.error}
+        row = {"name": name, "origin": c.origin, "path": c.path, "summary": c.summary, "error": c.error,
+               "aliases": list(c.aliases)}
         if c.origin == "plugin":
             plugin = os.path.relpath(c.path, root).split(os.sep)[0]
             rec = index.get(plugin, {})
