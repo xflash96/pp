@@ -2343,19 +2343,15 @@ def cmd_status(a, scope: list[str] | None) -> int:
                 print(ui.c("  a worker is starting; it launches them", "yellow"))
         if data["held"]:
             print(ui.c("held", "bold"))
-            rows = []
-            for j in data["held"]:
-                row = [j["id"], f"p{j.get('prio')}", _text(j.get("tag")), f"[{_text(j.get('project'))}]"]
-                rows.append(row + [_latest_note(j)])
+            rows = [[j["id"], f"p{j.get('prio')}", _text(j.get("tag")), f"[{_text(j.get('project'))}]",
+                     _latest_note(j)] for j in data["held"]]
             print("\n".join(_section(rows, 2, width)))
         if s["recent"]:
             print(ui.c("recent", "bold"))
-            rows = []
-            for j in s["recent"][:a.n]:
-                word = "done" if j["state"] == "done" else ui.c("FAILED", "red")
-                rows.append([j["id"], word, f"rc={_rc(j)}", ui.human_duration(j.get("seconds")),
-                             _text(j.get("tag")), f"[{_text(j.get('project'))}]", ui.human_age(j.get("ended"), now)
-                             + (f"  {j['reason']}" if j.get("reason") else "") + (f"  {_latest_note(j)}" if j.get("notes") else "")])
+            rows = [[j["id"], "done" if j["state"] == "done" else ui.c("FAILED", "red"), f"rc={_rc(j)}",
+                     ui.human_duration(j.get("seconds")), _text(j.get("tag")), f"[{_text(j.get('project'))}]",
+                     ui.human_age(j.get("ended"), now) + (f"  {j['reason']}" if j.get("reason") else "")
+                     + (f"  {_latest_note(j)}" if j.get("notes") else "")] for j in s["recent"][:a.n]]
             print("\n".join(_section(rows, 4, width)))
     return 1 if bad else 0
 
@@ -2891,10 +2887,7 @@ def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | No
     """
     if a.action == "status":
         qs = [q_given] if q_given else _scope_list(scope)
-        rows = []
-        for q in qs:
-            w = worker_now(q)
-            rows.append({"queue": q, "pid": w.pid, "how": w.how, "log": _worker_log(q)})
+        rows = [{"queue": q, "pid": (w := worker_now(q)).pid, "how": w.how, "log": _worker_log(q)} for q in qs]
         if a.json:
             ui.print_json([{**r, "up": r["pid"] is not None} for r in rows])
         elif not rows:
