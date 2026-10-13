@@ -40,9 +40,10 @@ A first project whose work runs in a container, in four steps
 
        2. Copy the guarded arguments below into that runner's `docker run` line.
        3. Delete any -e line in the runner for a variable the project sets in [queue] env: docker ranks -e above
-          --env-file, so a leftover -e wins over what pp hands the runner. A variable whose value in the image is
-          not its value here (HOME, PYTHONPATH, a cache path of the image's) stays a -e and goes in no [queue]
-          env, which the runner itself runs with: an image's HOME hides the docker client's own configuration.
+          --env-file, so a leftover -e wins over what pp hands the runner. A variable whose value in the image is not
+          its value here (HOME, PYTHONPATH, a cache path of the image's) stays a -e and goes in no [queue] env, which
+          the runner and the stop command both run with: an image's HOME, PYTHONPATH or cache path hides the docker
+          client's own.
        4. Prove the stop once: `pp queue add --tag stop_probe -- sleep 600`, then `pp queue kill stop_probe`, then
           look for what the runner started. It is gone. Then the same with `--tag stop_probe.t --timeout 15s`. An
           `add` is refused in a project that sets a runner and no stop.
