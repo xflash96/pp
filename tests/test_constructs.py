@@ -688,6 +688,82 @@ class TestContracts(unittest.TestCase):
                           if name.split(".")[0] in _IMPURE_MODULES], ["time.time"])
 
 
+def _source(path: str) -> ast.Module:
+    with open(os.path.join(ROOT, path)) as f:
+        return ast.parse(f.read(), path)
+
+
+def _functions(tree) -> dict:
+    """Every function of this tree by its own name, methods and nested ones included: the ones a call written
+    inside it can reach."""
+    return {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _in_a_txn(tree) -> list:
+    """Every statement written inside a `with txn()` scope of this tree."""
+    return [stmt for node in ast.walk(tree) if isinstance(node, ast.With)
+            and any(isinstance(i.context_expr, ast.Call) and _last(_dotted(i.context_expr.func)) == "txn"
+                    for i in node.items)
+            for stmt in node.body]
+
+
+def _reached(tree, nodes: list) -> list:
+    """(line, the dotted callee) for every call these nodes make, and for every call made by a function of
+    this tree that they reach. A function is followed once, so two that call each other end the walk."""
+    fns, out, todo, seen = _functions(tree), [], list(nodes), set()
+    while todo:
+        for line, name in _calls_under(todo.pop()):
+            out.append((line, name))
+            fn = fns.get(_last(name))
+            if fn is not None and fn.name not in seen:
+                seen.add(fn.name)
+                todo.append(fn)
+    return out
+
+
+class TestWhatAScopeAndADecisionReach(unittest.TestCase):
+    """The same two contracts, read one step further in: a helper called inside the store's transaction runs
+    inside it, and a helper the decision about a job is made of is part of that decision.
+
+    `TestContracts` reads the calls written in the scope itself. These follow every function of the file that
+    those calls reach, so a probe, a process start, a second scope or a reading of the clock moved into a
+    helper is one of these as well."""
+
+    def test_nothing_slow_runs_inside_the_transaction(self):
+        """`txn` holds the one store lock, so every reader of every queue waits for the scope. Nothing it
+        reaches may block: a probe, nvidia-smi, a process start, a sleep or a second scope."""
+        tree = _source("pp/lib/jobq.py")
+        inside = _in_a_txn(tree)
+        self.assertGreater(len(inside), 0, "no scope of the store's transaction was found to read")
+        bad = [f"pp/lib/jobq.py:{line} {name}" for line, name in _reached(tree, inside)
+               if _last(name) in _SLOW_IN_A_TXN]
+        self.assertEqual(bad, [], "these can block, and a reader of every queue waits for the scope")
+
+    def test_the_decision_and_every_helper_it_reaches_are_pure(self):
+        """`decide` and `merge_stop` are handed the record and the facts and give back one action. No clock,
+        no store and no process is reached from inside them, in their own code or in the helpers they are
+        made of, so the facts stay the one thing a decision is made from."""
+        tree = _source("pp/lib/jobq.py")
+        fns = _functions(tree)
+        pure = [fns[name] for name in _PURE if name in fns]
+        self.assertEqual(len(pure), len(_PURE), f"a pure function of {_PURE} is not in the file")
+        bad = [f"pp/lib/jobq.py:{line} {name}" for line, name in _reached(tree, pure)
+               if name.split(".")[0] in _IMPURE_MODULES or _last(name) in _IMPURE_CALLS]
+        self.assertEqual(bad, [], "a pure decision reads the record and the facts, and nothing else")
+
+    def test_these_checks_see_what_they_look_for(self):
+        """Each is tried on the call that breaks it one step further in than the scope it is written in, so
+        neither can pass by matching nothing."""
+        slow = ast.parse("def helper(j):\n    proc.spawn(argv, group='own')\n\n"
+                         "def act(jid):\n    with txn() as s:\n        helper(s.job(jid))\n")
+        self.assertEqual([name for _line, name in _reached(slow, _in_a_txn(slow))
+                          if _last(name) in _SLOW_IN_A_TXN], ["proc.spawn"])
+        impure = ast.parse("def _hook_due(job, event):\n    return stamp(job)\n\n"
+                           "def stamp(job):\n    return time.time()\n")
+        self.assertEqual([name for _line, name in _reached(impure, [_functions(impure)["_hook_due"]])
+                          if name.split(".")[0] in _IMPURE_MODULES], ["time.time"])
+
+
 class TestConstructs(unittest.TestCase):
     def test_every_rule_has_a_known_list(self):
         self.assertEqual(set(KNOWN), set(RULES))
