@@ -1085,9 +1085,11 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job, ap) -> int:
         job = {"queue": q, "tag": la.tag, "project": project_name(cwd), "cwd": cwd, "cmd": c, "runner": [],
                "shell_env": shell_env, "needs": needs, "owner": owner, "attempt": 1,
                **{r.on_record: gave[r.name] for r in JOB_ROWS if r.on_record != "needs"}}
-        if la.after:
-            # read once per value, however many lines carry it: a campaign file whose lines all name one
-            # stage reads the store once instead of once a line
+        if la.after is not None:
+            # every value the flag was given is read, the empty one too: `--after "$IDS"` over a variable a
+            # shell never set names no job, and a job queued with no `after` runs before the stage it
+            # follows. Read once per value, however many lines carry it: a campaign file whose lines all
+            # name one stage reads the store once instead of once a line
             if la.after not in waits:
                 waits[la.after] = _after(la.after, refuse)
             job["after"] = list(waits[la.after])

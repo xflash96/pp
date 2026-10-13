@@ -5748,7 +5748,10 @@ class TestAnUnmetAfter(InjectedCase):
         """The selection is read once, as the job is queued, and the record keeps the ids: a tag added to
         later is not picked up, which is what makes a campaign file reproducible. An id no job has is a typo
         and a job waiting forever for it is the worst outcome, so it is a usage error and nothing is queued.
-        A job may name a tag, and then it waits for the jobs that carried it at that moment."""
+        A job may name a tag, and then it waits for the jobs that carried it at that moment. A value naming
+        no selection at all is the same refusal, the empty one too: `--after "$(echo $IDS | tr ' ' ',')"`
+        over a variable a shell never set is empty, and a stage queued with no `after` would run before the
+        stage it was written to follow."""
         first = self.add("--tag", "s1_eval")
         named = self.add("--after", "s1_eval")
         self.assertEqual(jobstore.find(named)["after"], [first])
@@ -5756,7 +5759,7 @@ class TestAnUnmetAfter(InjectedCase):
         self.assertEqual(jobstore.find(named)["after"], [first])
         self.assertNotIn(later, jobstore.find(named)["after"])
         before = sorted(j["id"] for j in jobstore.jobs())
-        for spec in ("999999", "9-99", "s1_nothing", ","):
+        for spec in ("999999", "9-99", "s1_nothing", ",", " ", ""):
             with self.subTest(after=spec):
                 rc, _out, err = self.call("add", "--no-start", "--cwd", self.work, "--after", spec,
                                           "--", "true")
