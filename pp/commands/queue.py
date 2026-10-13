@@ -272,15 +272,17 @@ Workers, and after a reboot
     worker holds the queue's claim, so two cannot run on one queue and double its limits. A job runs in its own
     process group inside an `sh` that writes the attempt's exit code to a file of its own, so that code outlives the
     worker and a worker that comes back adopts running jobs instead of losing them. `pp queue worker stop` is not a
-    pause, since the next command that needs a worker starts one; `pp queue work -q NAME` runs one in the foreground
-    for a supervisor or a unit file; and --no-start on add, release, retry, wait and watch does the verb's work and
-    starts none, which is a different flag from --no-runner, one letter apart: that one puts no runner before the
-    job's own command. After a reboot the records need nothing arranged: a job that was running when the machine went
-    down has no exit code and no live run, so the first worker up records it failed with reason "lost", and retries it
-    where --retry-if matches "lost". A job left queued waits for a worker, which one of the five verbs above starts,
-    or `pp queue worker start -q NAME` does, for the one queue it names. Those records say running until that queue's
-    worker is up, so start the workers first and read `pp queue --json` after; bringing several queues back is one
-    `worker start` each, and `worker status` is the one that covers them all.
+    pause, since the next command that needs a worker starts one: to give the card back for an hour, `hold -q NAME
+    --all` parks what is queued and the jobs running end or are killed; `pp queue work -q NAME` runs one in the
+    foreground for a supervisor or a unit file; and --no-start on add, release, retry, wait and watch does the verb's
+    work and starts none, which is a different flag from --no-runner, one letter apart: that one puts no runner before
+    the job's own command. After a reboot the records need nothing arranged: a job that was running when the machine
+    went down has no exit code and no live run, so the first worker up records it failed with reason "lost", and
+    retries it where --retry-if matches "lost". A job left queued waits for a worker, which one of the five verbs
+    above starts, or `pp queue worker start -q NAME` does, for the one queue it names. Those records say running until
+    that queue's worker is up, so start the workers first and read `pp queue --json` after; bringing several queues
+    back is one `worker start` each, and `worker status` is the one that covers them all.
+
 A job's environment, later entries winning: the worker's own, which is that of the `pp queue add` that started it,
 without an agent session's identity;
 PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job; the project's [queue] env;
