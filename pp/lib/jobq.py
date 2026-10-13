@@ -2201,12 +2201,9 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
 
 
 def _scope_list(scope: list[str] | None) -> list[str]:
-    """The queues a verb works on: every one there is, or the ones it was given by name, each one opened."""
-    if scope is None:
-        return queues()
-    for q in scope:
-        open_queue(q)
-    return scope
+    """The queues a verb works on: every one there is, which `queues` opens as it finds it, or the one it was
+    given by name, which run_cli opened before any verb ran."""
+    return queues() if scope is None else scope
 
 
 def cmd_status(a, scope: list[str] | None) -> int:
