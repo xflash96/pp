@@ -28,19 +28,19 @@ If you installed pp as a tool, `uv tool uninstall ppkit` (or
 
 ## Building and testing
 
-You need Python 3.11 or later, git, sh and bash. The tests that need zsh
+You need Python 3.11.4 or later, git, sh and bash. The tests that need zsh
 skip without it. `ci/check` uses [uv](https://docs.astral.sh/uv/)
 for the linter and for other Python versions.
 
 ```
 ci/check                                 the linter, then every test, on python3
-ci/check 3.11                            the same on Python 3.11, which uv installs the first time
-ci/check --cpus 2 3.11                   the same on 2 CPUs, like a CI runner
+ci/check 3.11.4                          the same on Python 3.11.4, which uv installs the first time
+ci/check --cpus 2 3.11.4                 the same on 2 CPUs, like a CI runner
 python3 -m unittest discover -s tests    the tests alone
 ci/package                               build ppkit into dist/, install it fresh, and try it
 ```
 
-CI runs `ci/check 3.11`, `ci/check 3.14` and `ci/package` on every push to
+CI runs `ci/check 3.11.4`, `ci/check 3.14` and `ci/package` on every push to
 main and every pull request. The whole suite takes a few minutes. Most of
 that is the journeys (`tests/test_journey_*.py`), which run the real
 `bin/pp` once per step in a throwaway home directory.
@@ -55,7 +55,7 @@ on a developer's machine takes tens of milliseconds, and a runner's few
 hundred take a few. The test that needs another user's process is skipped
 there.
 
-A uv-managed CPython has no `os.pidfd_open`, so `ci/check 3.11`, `ci/check
+A uv-managed CPython has no `os.pidfd_open`, so `ci/check 3.11.4`, `ci/check
 3.14` and CI run `pp/lib/proc.py`'s ctypes syscall path, while the distro
 `python3` of a plain `ci/check` runs the wrapped calls. Both are tested only
 by running both.

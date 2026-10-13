@@ -63,7 +63,7 @@ shell that added it.
 
 ## Install
 
-pp runs on Linux, with Python 3.11 or later. Install it as a tool, in an
+pp runs on Linux, with Python 3.11.4 or later. Install it as a tool, in an
 environment of its own:
 
 ```
@@ -149,8 +149,9 @@ env = { HF_HUB_OFFLINE = "1" }
 job's environment, including `CUDA_VISIBLE_DEVICES`, and a container runner
 has to pass it in. Give a job a token or a secret with `--env` or the
 project's `env`: a variable exported in your shell reaches it only through
-the worker. `pp help queue` has the examples, and `pp help queue add` every
-option of `add`.
+the worker. `--json` gives a job's variables by name, with each value `***`.
+`pp help queue` has the examples, and `pp help queue add` every option of
+`add`.
 
 ## Working with agents
 
@@ -209,6 +210,10 @@ pp promote rollback notes      back to the release before
 database migration that cannot be undone does not belong in it. pp keeps the
 last five releases, and always keeps the current one and the one before.
 
+Each hook's output goes to a file beside the run's log, and pp shows it as it
+comes. pp waits for the hook itself, not for what the hook leaves running, so
+redirect the output of a process an `after` starts.
+
 A systemd service runs the release by pointing at `current`:
 
 ```
@@ -240,7 +245,7 @@ pp http ~/notes .              a tab for each folder, at http://127.0.0.1:8000
 ```
 
 `pp http` listens on 127.0.0.1 unless you pass `--bind`, and does not serve
-files such as `.env` or private keys.
+`.git` or files such as `.env` or private keys.
 
 ## Your own commands
 
@@ -292,7 +297,7 @@ too. To add a command to pp itself, see [CONTRIBUTING.md](https://github.com/xfl
 pp is new, and its version is 0.x. A command or a config key may still
 change, and so may a field of `--json` output; the
 [changelog](https://github.com/xflash96/pp/blob/main/CHANGELOG.md) says when one does. CI runs the tests on
-Python 3.11 and 3.14, on Ubuntu 24.04.
+Python 3.11.4 and 3.14, on Ubuntu 24.04.
 
 ## Contributing
 
