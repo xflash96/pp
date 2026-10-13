@@ -27,6 +27,13 @@ Config: ~/.config/pp/config.toml (every key optional)
                                     #   .pgpass .pypirc .npmrc); never listed, never served, hidden or not
     follow_symlinks = false         # true: serve symlinks that leave their root
     hosts = ["box.tailnet.ts.net"]  # Host names a proxy in front may pass through (loopback names always work)
+    cache_ttl = 10.0                # seconds a tab list and a Recent result are reused for before pp looks again
+    scan_budget = 2.0               # seconds one Recent scan may take; the view says when a scan was cut
+    scan_depth = 8                  # folders deep a Recent scan goes under a tab
+    scan_entries = 100000           # entries one Recent scan reads
+    recent_limit = 300              # files the Recent view lists
+    list_cap = 5000                 # entries a folder listing shows
+    embed_cap = 2000000             # bytes of a text file shown in its page (the raw view serves all of it)
 
     [[http.roots]]                  # a fixed tab
     name = "notes"

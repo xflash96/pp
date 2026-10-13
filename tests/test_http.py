@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 import urllib.parse
 from unittest import mock
@@ -296,6 +297,27 @@ class TestDiscovery(unittest.TestCase):
         self.assertIn("node_modules", s.exclude_dirs)
         self.assertIn("target2", s.exclude_dirs)
         self.assertEqual(s.recent, ["*.txt"])
+
+
+class TestTheHelpIsTheConfigReference(unittest.TestCase):
+    def test_every_key_is_in_the_help_and_every_number_with_its_default(self):
+        """`pp help http` is where a key is looked up, so every key pp reads is in it, the keys of a tab and a
+        rule included. The [http] block of the help is TOML, so the value beside each number is read here and
+        compared with the default the code holds: a key documented with another number is a help that sends a
+        reader to the source."""
+        doc = pphttp.__doc__
+        block = doc.split("    [http]\n", 1)[1].split("\n\n", 1)[0]
+        shown, s = tomllib.loads(block), pphttp.Settings()
+        for key in pphttp.KEYS:
+            self.assertIn(key, doc, key)
+        for key, inner in pphttp.TABLE_KEYS.items():
+            self.assertIn(f"[[http.{key}]]", doc, key)
+            for k in inner:
+                self.assertIn(k, doc, k)
+        numbers = [k for k in pphttp.KEYS if isinstance(getattr(s, k, None), (bool, int, float, str))]
+        self.assertEqual(sorted(k for k in shown if k in numbers), sorted(numbers))
+        for key in numbers:
+            self.assertEqual(shown[key], getattr(s, key), key)
 
 
 class TestTheRootAndRuleTables(unittest.TestCase):
