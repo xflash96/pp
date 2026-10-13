@@ -71,17 +71,17 @@ Selecting jobs
     jobs, so the lane refills within one poll, and kill starts a worker where none is up.
 
 Order, and a stage after another
-    Lower --prio runs first (default 10), ties by id, so in a lane (slots = 1) one campaign file's jobs run in its
-    own order; `reprio` takes the new priority as its last word (`reprio --prefix s1_v2 0`). Each queue is strict
-    head-of-line, so a big job is never starved by small ones; `backfill = true` in its config lets later jobs that
-    fit start while the head waits. --after SELECTION holds a job back until every job that selection named has
-    ended, in any outcome. Its value is ids, ranges and tags separated by commas (41,42,43 or 41-66 or
-    s1_eval,s1_report), as many as a command line holds, a trailing or empty item ignored and a value that names no
-    job refused. It is read when the job is added and the ids are kept, so nothing added later joins it, an id no job
-    has is an error that queues nothing, and a dropped job counts as ended. A job waiting on --after is skipped
-    rather than waited for, so it never becomes the head of its queue and never blocks the jobs behind it. `wait`
-    counts a held job as not ended: a wait over a stage still held says so and then waits for ever, so wait for the
-    stage before it and release this one.
+    Lower --prio runs first (default 10), ties by id, so in a lane (slots = 1) one campaign file's jobs run in its own
+    order; `reprio` takes the new priority as its last word (`reprio --prefix s1_v2 0`) and takes a queued or a held
+    job, so a parked stage is re-ordered before it is released. Each queue is strict head-of-line, so a big job is
+    never starved by small ones; `backfill = true` in its config lets later jobs that fit start while the head waits.
+    --after SELECTION holds a job back until every job that selection named has ended, in any outcome. Its value is
+    ids, ranges and tags separated by commas (41,42,43 or 41-66 or s1_eval,s1_report), as many as a command line
+    holds, a trailing or empty item ignored and a value that names no job refused. It is read when the job is added
+    and the ids are kept, so nothing added later joins it, an id no job has is an error that queues nothing, and a
+    dropped job counts as ended. A job waiting on --after is skipped rather than waited for, so it never becomes the
+    head of its queue and never blocks the jobs behind it. `wait` counts a held job as not ended: a wait over a stage
+    still held says so and then waits for ever, so wait for the stage before it and release this one.
 
         IDS=$(pp queue add --from stage1.txt)                         # one id per line on stdout
         pp queue add --from stage2.txt --after "$(echo "$IDS" | tr '\n' ',')"

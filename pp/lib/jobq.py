@@ -2013,7 +2013,7 @@ def _parser(prog: str, doc: str, add_args=None):
             p.add_argument("-y", "--yes", action="store_true", help="do not ask about a range or a shared tag")
         if name == "release":
             p.add_argument("--no-start", action="store_true", help="do not start a worker")
-    p = sp("reprio", help="change a queued job's priority")
+    p = sp("reprio", help="change a queued or held job's priority")
     p.add_argument("ids", nargs="*", metavar="ID")
     p.add_argument("prio", type=int)
     _selectors(p)
