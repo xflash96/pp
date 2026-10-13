@@ -5267,8 +5267,9 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         once, started after the decision's scope. Nobody asked for that stop, so nothing is recorded for it
         and the outcome is the one the attempt earned.
 
-        A stop whose command has already gone out is not run a second time: that command has done its work,
-        and a second run would say one stop happened twice."""
+        A run a stop was asked of is swept the same way, whatever went out for that stop already: the work a
+        stop command left behind is what a retry would start beside, and a run of that command the sweep
+        makes records nothing, so it states no second stop."""
         ran = self.sb.path("what-the-stop-command-did")
         j, w = self.a_running_job_whose_stop_is_a_command(ran)
         self.the_run_ends_with_no_code(j)
@@ -5283,7 +5284,8 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         for _ in range(3):
             w.tick()
         self.assertEqual(len(self.lines(ran)), 1)
-        # a kill whose stop command went out at the stop site: its code is recorded, and the sweep runs none
+        # a kill whose stop command went out at the stop site: its code is recorded for the stop it carried
+        # out, and the sweep of that attempt runs the command once more, for whatever it left behind
         k, w2 = self.a_running_job_whose_stop_is_a_command(ran, gate="go2")
         self.a_kill_asks(k, grace=30.0)
         w2.tick()
@@ -5291,10 +5293,13 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         journey.until(lambda: jobstore.find(k)["stop"].get("rc") == 0, timeout=30,
                       what="the exit code that command had, on the stop it carried out")
         self.the_run_ends_with_no_code(k)
+        w2.tick()
+        self.assertEqual(jobstore.find(k)["reason"], "killed")
+        journey.until(lambda: len(self.lines(ran)) == 3, timeout=30, what="the stop command the sweep ran")
+        self.assertEqual(self.lines(ran)[2], jobstore.find(k)["container"])
         for _ in range(3):
             w2.tick()
-        self.assertEqual(jobstore.find(k)["reason"], "killed")
-        self.assertEqual(len(self.lines(ran)), 2, "the sweep ran a stop command that had already gone out")
+        self.assertEqual(len(self.lines(ran)), 3, "the sweep of one attempt ran that command twice")
 
     def test_the_sweep_of_a_retried_attempt_names_that_attempts_own_container(self):
         """A requeue takes the attempt's own names off the record, and the sweep's stop command is started

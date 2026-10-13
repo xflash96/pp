@@ -979,13 +979,12 @@ def stop_command(job: dict) -> str | None:
 def swept_stop(job: dict, action: Action) -> str | None:
     """The project's stop command the sweep of an attempt whose run is over runs, or None where it runs none.
 
-    It runs where nothing of that attempt's stop ever went out: the attempt was lost, or died of a signal, or
-    a stop was asked of it that no worker carried out. Where the command has already gone out for that stop
-    it has done its work, and a second run would say one stop happened twice. Nobody asked for this one, so
-    its output goes to the job's log, nothing is recorded for it and no outcome rests on it (I25)."""
-    if not action.sweep or (job.get("stop") or {}).get("sent"):
-        return None
-    return stop_command(job)
+    It runs wherever the sweep of that attempt does: the attempt wrote no exit code of its own, or a stop had
+    been asked of the job and not denied. That is what stops a container outliving the attempt that started
+    it, so a retry can be trusted not to start beside one still holding a card. Nobody asked for this stop,
+    so its output goes to the job's log, nothing is recorded for it and no outcome rests on it, which is why
+    running the project's command again states no second stop (I25)."""
+    return stop_command(job) if action.sweep else None
 
 
 def regex(v) -> str | None:

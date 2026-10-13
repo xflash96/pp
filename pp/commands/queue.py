@@ -235,8 +235,9 @@ the job's process group, detached, in the job's directory, with the job's own en
 the job's log and its exit code onto the stop's `rc`. The grace and the SIGKILL that follow are unchanged, so
 a container that ignores its own shutdown is still ended on time, and `stop.rc: null` means pp has not seen
 that command end rather than that it worked. Anything left in the job's process group when its run is over
-goes with it, and a run that ended with no exit code of its own runs that stop command once more, so nothing
-the runner started outlives the attempt that started it.
+goes with it, and a run that ended with no exit code of its own, or that a stop was asked of, runs that stop
+command once more, so nothing the runner started outlives the attempt that started it and no retry starts
+beside what the last one left.
 
 Where a job's output goes: `log` in a project's [queue], or --log PATH on one job, is a path in which {tag}
 and {id} are filled in, those two and no others. {tag} is the job's tag, or its id where the job has none, so

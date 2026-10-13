@@ -1030,9 +1030,10 @@ class TestTheProject(Lab):
         self.wait(jid)
 
     def test_a_kill_and_a_timeout_both_end_what_the_runner_started(self):
-        """A kill runs the project's stop command once, with this attempt's container name in its environment,
-        and what the runner started is gone. A timeout does the same. The stop command's exit code is on the
-        record. A stop command that exits 1 leaves the kill at exit 0, and the record still names the
+        """A kill runs the project's stop command, with this attempt's container name in its environment, and
+        what the runner started is gone. The sweep of the attempt that ended runs that command once more, for
+        whatever a stop of it left behind. A timeout does both the same way. The stop command's exit code is
+        on the record. A stop command that exits 1 leaves the kill at exit 0, and the record still names the
         container. A job that skips the runner has its work in its own group, so its stop is the group: SIGTERM
         first, and SIGKILL once the grace is up."""
         root = self.lab()
@@ -1042,7 +1043,8 @@ class TestTheProject(Lab):
         self.until(lambda: not self.cell_up(root, name), what="the work the runner started to be gone")
         self.until(lambda: self.ended(jid), what=f"job {jid} ended")
         j = self.show(jid)
-        self.assertEqual(self.asked_to_stop(root), [[name, name]])
+        self.until(lambda: self.asked_to_stop(root) == [[name, name]] * 2,
+                   what="the stop command the kill ran, and the one the sweep of that attempt ran")
         self.assertEqual((j["state"], self.field(j, "stop").get("rc")), ("failed", 0))
         self.assertIsNone(self.field(j, "stop").get("kill9"))       # it ended inside its grace
         self.assertEqual(self.field(j, "container"), name)
@@ -1053,7 +1055,8 @@ class TestTheProject(Lab):
                    what="the work a timeout's stop reached to be gone")
         self.until(lambda: self.ended(timed), what=f"job {timed} ended")
         t = self.show(timed)
-        self.assertEqual([e[0] for e in self.asked_to_stop(root)], [name, tname])
+        self.until(lambda: [e[0] for e in self.asked_to_stop(root)] == [name, name, tname, tname],
+                   what="the stop command the timeout's stop ran, and the one the sweep ran after it")
         self.assertEqual((t["state"], self.field(t, "stop").get("rc")), ("failed", 0))
         self.assertIn("timeout", self.field(t, "stop"))             # a timeout's stop, not a kill's
 
@@ -1319,7 +1322,8 @@ class TestTheRetriesAndTheRecovery(Lab):
         self.until(lambda: not self.worker("lab")["up"], what="the lab worker's claim to be free")
         self.pp("queue", "kill", c)                              # the worker this starts carries out the stop
         self.until(lambda: not self.cell_up(root, name), what="the work the runner started to be gone")
-        self.assertEqual([e[0] for e in self.asked_to_stop(root)], [name])
+        self.until(lambda: [e[0] for e in self.asked_to_stop(root)] == [name, name],
+                   what="the stop command the kill ran, and the one the sweep ran after it")
 
     def test_after_a_reboot_a_running_job_is_reaped_as_lost(self):
         """A machine that went down leaves a job that was running with no live run and no exit code of its own.
