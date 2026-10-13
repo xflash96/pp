@@ -16,6 +16,8 @@
   (`12-15`), a tag matched whole, `--prefix P` (repeatable), and `--all`
   with `-q NAME`. `--all` without `-q` is a usage error, and a tag or a
   prefix that names jobs in two queues is an error that lists the ids.
+  `pp queue note` is the exception, and takes one job by its id or by a
+  tag that names one.
 - `pp queue clean` takes a selection as well as `--older AGE`.
 
 `pp queue`: a project says how its work is launched and stopped, so a kill

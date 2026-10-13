@@ -120,8 +120,9 @@ pp queue retry 11        pp queue hold 15        pp queue release 15
 ```
 
 Every verb that takes jobs takes the same five forms: an id, a range of ids,
-a `--tag` name matched whole, `--prefix P`, and `--all` with `-q NAME`. A job
-added without `--tag` has no name, and its id selects it.
+a `--tag` name matched whole, `--prefix P`, and `--all` with `-q NAME`. `pp
+queue note` is the exception, and takes one job by its id or by a tag that
+names one. A job added without `--tag` has no name, and its id selects it.
 
 Limits go in `~/.config/pp/config.toml`. Every queue draws on the shared
 GPU memory, CPUs and RAM; a queue's own pool caps what it may take of them.

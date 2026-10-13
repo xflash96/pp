@@ -56,7 +56,8 @@ Naming jobs
     never a key: adding a campaign file twice makes a second job per tag.
 
 Selecting jobs
-    Every verb that takes jobs takes the same five forms, and no others:
+    Every verb that takes jobs takes the same five forms, and no others; `note` is the exception and takes
+    one job, by its id or by a tag that names one:
         12              one job by id; ids are machine-wide, and `add` prints each one on stdout
         12-15           a range; one `add`'s ids are consecutive        c3_recall.s0   that tag, matched whole
         --prefix c3_    every job whose tag starts with c3_ (repeatable)  -q r1 --all    one queue's, whatever its tag
