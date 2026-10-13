@@ -67,7 +67,8 @@ Selecting jobs
     the ids, so -q narrows it, and --all needs -q. There is no glob: 'c3_*' is your shell's business. kill, drop and
     retry show a plan and ask where a selection names more than one job, and clean asks for any; each of those four
     takes -y (do not ask) and -n (only show), so a driver with no terminal passes -y. To stop a whole set, `hold -q
-    r1 --all` first, then `kill` and `drop` over it: a drop takes the held jobs too.
+    r1 --all` first, then `kill` and `drop` over it: a drop takes the held jobs too. A kill alone leaves the queued
+    jobs, so the lane refills within one poll, and kill starts a worker where none is up.
 
 Order, and a stage after another
     Lower --prio runs first (default 10), ties by id, so in a lane (slots = 1) one campaign file's jobs run in its
