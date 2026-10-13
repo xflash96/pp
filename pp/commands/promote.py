@@ -31,7 +31,7 @@ NAME is a promoted target's name, or a path into its project.
     dev_links = { "~/.local/bin/ppd" = "bin/pp" }   # stable path -> <source>/<rel>: the dev side
     after = "systemctl --user restart foo"          # after the flip
     verify = "curl -fsS localhost:8100/ >/dev/null" # after `after`; non-zero (or a failed `after`) rolls back
-    keep = 5               # releases kept; current and the one before it are never pruned
+    keep = 5               # releases kept; current, the one before it and the one a promote leaves always stay
 `after` is ACTIVATION: make what is running pick up `current` (restart or reload a service). It must be
 idempotent and correct for ANY release, because rolling back is "flip to the previous release, run `after`
 again". That is also why a failed `after` rolls back: whatever the cause, the previous release is the last state
@@ -143,7 +143,7 @@ class Target:
                     PP_RELEASE=release, PP_PREV=prev or "")
 
 
-DEFAULT_KEEP = 5         # releases kept; current and the one before it always stay
+DEFAULT_KEEP = 5         # releases kept; current, the one before it and the one a promote leaves always stay
 PROMOTE_KEYS = ("source", "exclude", "build", "check", "links", "dev_links", "after", "verify", "keep")
 
 
@@ -572,10 +572,13 @@ def _in_snapshot(t: Target, f: Facts, rel: str) -> bool:
     return os.path.lexists(os.path.join(t.source, rel))
 
 
-def _gc_victims(t: Target, keep: int) -> list[str]:
+def _gc_victims(t: Target, keep: int, also: str | None = None) -> list[str]:
+    """Releases to remove: the keep newest stay, and so do `current`, the one before it, and `also`. A promote
+    passes the release it has just flipped away from, which is the one its user was running until that flip and
+    the one they read as "the one before"; it is not the creation-order predecessor after a rollback."""
     stamps = t.stamps()
     cur = t.current()
-    spare = set(stamps[-max(keep, 0):] if keep > 0 else []) | {cur, t.previous(cur)}
+    spare = set(stamps[-max(keep, 0):] if keep > 0 else []) | {cur, t.previous(cur), also}
     return [s for s in stamps if s not in spare]
 
 
@@ -723,7 +726,7 @@ def _release(t: Target, f: Facts, a, plan: list[dict], log: Log, stamp: str, sta
     if failed:
         _auto_rollback(t, stamp, cur, failed, log)
         return 1
-    _gc(t, _gc_victims(t, int(t.cfg.get("keep", DEFAULT_KEEP))), log.say)
+    _gc(t, _gc_victims(t, int(t.cfg.get("keep", DEFAULT_KEEP)), also=cur), log.say)
     log.say(ui.c(f"promoted {t.name} -> {stamp}", "green"))
     return 0
 

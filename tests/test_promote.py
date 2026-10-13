@@ -420,6 +420,42 @@ class TestPromote(Base):
 
 
 
+class TestRollingBackAndForward(Base):
+    """The journey the whole command exists for: release, find it bad, go back, fix forward. What the user is
+    running is then not the newest release."""
+
+    def releases(self, n: int) -> list[str]:
+        made = []
+        for i in range(n):
+            self.write("v", str(i))
+            self.commit(f"v{i}")
+            self.assertEqual(self.pp(self.repo)[0], 0)
+            made.append(self.current())
+        return made
+
+    def test_the_release_a_promote_flips_away_from_stays(self):
+        """gc spared the newest releases, `current` and its creation-order predecessor, so the promote after a
+        rollback removed the release it had just flipped away from: the known-good one, in the same run."""
+        self.make_repo("keep = 2\n")
+        a, b = self.releases(2)
+        self.assertEqual(self.pp("rollback", "demo", "-y")[0], 0)
+        self.assertEqual(self.current(), a)
+        self.write("v", "c")
+        self.commit("c")
+        rc, out, _ = self.pp(self.repo)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(a, self.stamps())
+        self.assertNotIn("gc: removed", out)
+
+    def test_the_sweep_still_removes_what_no_longer_serves(self):
+        """The release a promote leaves is one more release that stays, and nothing else changes: at keep = 1
+        the fourth promote still removes the oldest."""
+        self.make_repo("keep = 1\n")
+        made = self.releases(4)
+        self.assertNotIn(made[0], self.stamps())
+        self.assertEqual(self.stamps(), sorted(made[2:]))
+
+
 class TestABadValue(Base):
     """config.py promises a loud error naming the file, and `_checked` promises that a misspelt key does not
     release with nothing gating it. A value of the wrong type is the same mistake: it used to pass preflight
