@@ -522,9 +522,12 @@ def cmd_ls(argv: list[str]) -> int:
     if a.json:
         ui.print_json(rows)
         return 0
-    print(ui.table([[r["name"], r["origin"], f"{r['plugin']} at {(r['commit'] or '?')[:7]}"
-                     + (f" ({r['ref']})" if r.get("ref") else "") + f" from {r['url']}"
-                     if r["origin"] == "plugin" else r["path"]] for r in rows], ["command", "from", "where"]))
+    shown = []
+    for r in rows:
+        where = (f"{r['plugin']} at {(r['commit'] or '?')[:7]}" + (f" ({r['ref']})" if r.get("ref") else "")
+                 + f" from {r['url']}") if r["origin"] == "plugin" else r["path"]
+        shown.append([ui.printable(r["name"]), r["origin"], ui.printable(where)])
+    print(ui.table(shown, ["command", "from", "where"]))
     return 0
 
 

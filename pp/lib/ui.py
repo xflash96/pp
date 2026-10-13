@@ -127,7 +127,12 @@ def printable(text: str, tabs: bool = True) -> str:
     """Text from elsewhere (another program's argv, a plugin's file, git's output, a requested URL) made safe
     to print: control characters shown as \\n, \\x1b and so on, so an escape sequence cannot redraw the
     terminal around what the user is reading. A tab stays a tab unless tabs is False (in a table, where it
-    would break the columns). The one escaper in pp: CONTRIBUTING.md, "Adding a command"."""
+    would break the columns). The one escaper in pp: CONTRIBUTING.md, "Adding a command".
+
+    A file name that is not valid UTF-8 is such text too: os.listdir hands it back with a lone surrogate per
+    byte it could not read, and a surrogate cannot be sent to a terminal at all (a UTF-8 locale's stdout
+    raises on one). It is shown as \\udcff, so what names it prints it."""
+    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
     return (_CTRL if tabs else _CTRL_TAB).sub(lambda m: repr(m.group())[1:-1], text)
 
 

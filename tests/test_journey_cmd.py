@@ -245,6 +245,16 @@ class TestWhatGitCanAsk(PluginJourney):
 
 
 class TestReadingAPlugin(PluginJourney):
+    def test_a_file_name_of_a_plugins_is_escaped_in_every_listing(self):
+        """A command file's name is the plugin author's text too, and it reaches `pp -h` and `pp cmd ls` long
+        after the screen that asked about it."""
+        self.commit("commands/zb\x1b[31mad.py", '"""Fine one"""\ndef main(argv):\n    return 0\n', "named")
+        self.pp("cmd", "add", self.src, "-y")
+        for argv in ((), ("-h", "--all"), ("cmd", "ls")):
+            out = self.pp(*argv).stdout
+            self.assertNotIn("\x1b", out, argv)
+            self.assertIn("zb\\x1b[31mad", out, argv)
+
     def test_what_a_remote_says_cannot_write_lines_on_the_screen_that_asks(self):
         """git relays the stderr of the helper it talks to a remote through, so an ssh banner is the remote's
         own text, and it arrives before there is anything to say yes to. pp names it in the refusal."""

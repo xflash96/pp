@@ -76,6 +76,17 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("ambiguous", r.stderr)
 
+    def test_a_file_name_cannot_redraw_a_listing(self):
+        """A command file's name and its path are whoever wrote the file's text, and git carries any byte but
+        NUL and /. CONTRIBUTING.md: such text goes through ui.printable, in every listing that prints it."""
+        esc = "zbad\x1b[31mRED"
+        self.write(f"plug/{esc}.py", '"""Fine one"""\ndef main(argv):\n    pass\n')
+        self.write(f"plug/{esc}2.py", '"""No main here"""\n')          # the broken table prints its own rows
+        for argv in ((), ("-h", "--all"), ("cmd", "ls")):
+            out = self.pp(*argv).stdout
+            self.assertNotIn("\x1b", out, argv)
+            self.assertIn("zbad\\x1b[31mRED", out, argv)
+
     def test_a_file_name_cannot_redraw_a_refusal_either(self):
         """A command file's name and its path are whoever wrote the file's text, and the listings escape them.
         The same names reach pp's own messages: an ambiguous prefix lists them, a typo is answered with the
@@ -95,6 +106,18 @@ class TestCli(unittest.TestCase):
             self.assertIn(says, r.stderr, argv)
             self.assertNotIn("\x1b", r.stderr, argv)
             self.assertIn("\\x1b[3", r.stderr, argv)
+
+    def test_a_file_name_that_is_not_valid_utf8_breaks_no_listing(self):
+        """Such a name reaches pp as lone surrogates, which a UTF-8 locale's stdout refuses to encode: every
+        listing that printed one raised, `pp cmd ls` and `pp cmd rm` among them, so a plugin that brought one
+        could not be listed or removed. It is listed escaped instead, like any other name from elsewhere."""
+        self.env["PYTHONIOENCODING"] = "utf-8"          # what a UTF-8 locale gives a child: errors strict
+        name = os.fsdecode(b"ztool\xff")
+        self.write(f"plug/{name}.py", '"""Odd name"""\ndef main(argv):\n    return 0\n')
+        for argv in ((), ("-h", "--all"), ("cmd", "ls")):
+            r = self.pp(*argv)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ztool\\udcff", r.stdout, argv)
 
     def test_help_subcommand(self):
         r = self.pp("help", "kill")

@@ -212,22 +212,23 @@ def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
         rows = []
         for c in group:
             label = c.name + (f" ({', '.join(c.aliases)})" if c.aliases else "")
-            extra = f"  [{c.path}]" if show_all else ""
+            extra = f"  [{ui.printable(c.path)}]" if show_all else ""
             if show_all and c.shadows:
-                extra += "  shadows: " + ", ".join(f"{s.origin}:{s.path}" for s in c.shadows)
+                extra += "  shadows: " + ", ".join(f"{s.origin}:{ui.printable(s.path)}" for s in c.shadows)
             rows.append([ui.printable(label), ui.printable(c.summary) + extra])
         out.append(ui.table(rows, indent="  "))
         out.append("")
     hidden = [s for c in cmds.values() for s in c.shadows if s.origin != "external"]
     if hidden and not show_all:      # a file someone wrote that can never run: say so where they look
         out.append(ui.c("hidden by a same-named command found first (rename to use):", "yellow"))
-        out.append(ui.table([[h.name, f"{h.origin}  [{h.path}]"] for h in sorted(hidden, key=lambda h: h.name)],
-                            indent="  "))
+        out.append(ui.table([[ui.printable(h.name), f"{h.origin}  [{ui.printable(h.path)}]"]
+                             for h in sorted(hidden, key=lambda h: h.name)], indent="  "))
         out.append("")
     broken = sorted((c for c in cmds.values() if c.error), key=lambda c: c.name)
     if broken:
         out.append(ui.c("broken (skipped):", "yellow"))
-        out.append(ui.table([[c.name, f"{c.error}  [{c.path}]"] for c in broken], indent="  "))
+        out.append(ui.table([[ui.printable(c.name), f"{ui.printable(c.error)}  [{ui.printable(c.path)}]"]
+                             for c in broken], indent="  "))
         out.append("")
     out.append("Unique prefixes work (`pp pro` = `pp promote`). `pp cmd new NAME --user` writes one of your own.")
     return "\n".join(out)

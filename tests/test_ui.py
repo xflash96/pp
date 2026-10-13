@@ -80,6 +80,15 @@ class TestWhatAMessageNames(unittest.TestCase):
         self.assertEqual(self.said("'zq' is ambiguous: zq\npp: added plugin trusted, zq2", 2),
                          ["pp: 'zq' is ambiguous: zq\\npp: added plugin trusted, zq2"])
 
+    def test_a_name_that_is_not_valid_utf8_is_shown_and_not_raised(self):
+        """A file name is bytes, and git carries any byte but NUL and /. os.listdir hands such a name back
+        with a lone surrogate per byte it could not read, and sending one to a UTF-8 terminal raises, so the
+        escaper is also where it stops being a name nothing can print."""
+        name = os.fsdecode(b"ztool\xff.py")
+        self.assertEqual(ui.printable(name), "ztool\\udcff.py")
+        self.assertEqual(ui.width(ui.printable(name)), len("ztool\\udcff.py"))
+        self.assertEqual(self.said(f"command '{name}' is broken"), ["pp: command 'ztool\\udcff.py' is broken"])
+
     def test_the_lines_of_a_message_are_the_ones_pp_asked_for(self):
         self.assertEqual(self.said(["these names are taken:", "  zq: user command /tmp/zq.py"], 2),
                          ["pp: these names are taken:", "  zq: user command /tmp/zq.py"])
