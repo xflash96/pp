@@ -1577,8 +1577,8 @@ def worker(q: str) -> dict | None:
     Only a worker ever holds the claim on worker.lock, and it holds it for as long as it runs: that is what
     being up means. A worker that was killed leaves it free at once, and one that is alive holds it however
     long a tick takes. The record is what it is doing, written under the claim. A record that names no live
-    process is a worker in its first moment, which has not recorded itself yet (`_said`). Asking never waits
-    for it.
+    process is a worker in its first moment, which has not recorded itself yet (`worker_now`). Asking never
+    waits for it.
 
     `worker_now` is the one place that asks this, and every verb asks `worker_now` or `worker_up`."""
     return lock.Claim.holder(_worker_claim(q))
@@ -1656,29 +1656,24 @@ def _starting(q: str) -> str:
     return f"the {q} worker is starting and has not recorded itself yet"
 
 
-def _said(rec: dict | None) -> bool:
-    """Whether the record in a worker claim is the record of the worker that holds it now.
-
-    A take locks the claim file, empties it and writes the record in that order (`lock.Claim.take`), so for
-    that moment a reader finds the file empty, or holding the record a worker that was killed left. A release
-    empties the file, and a worker's record names itself, so those bytes name a process that is gone. Either
-    way a record that names no process of its own, or one that names a process that is not running, is a
-    worker in its first moment."""
-    return proc.Handle.running((rec or {}).get("pid"), (rec or {}).get("pstart")) is not None
-
-
 def worker_now(q: str) -> Holder:
     """What q's worker is: the one look at the claim's holder. It writes nothing and starts nothing.
 
     A worker that holds the claim and has not recorded itself yet is no state to report, so this looks again,
     a bounded number of times. A holder that never records itself comes back as a worker starting, for the
-    verb to say so rather than name it as up."""
-    rec: dict | None = None
+    verb to say so rather than name it as up.
+
+    Whether the record is the holder's own is the process it names being alive. A take locks the claim file,
+    empties it and writes the record in that order (`lock.Claim.take`), so for that moment a reader finds the
+    file empty, or holding the record a worker that was killed left; a release empties the file, and a
+    worker's record names itself, so those bytes name a process that is gone. Either way a record that names
+    no process of its own, or one that names a process that is not running, is a worker in its first
+    moment."""
     for _ in range(STARTING_LOOKS):
         rec = worker(q)
         if rec is None:
             return Holder(DOWN)
-        if _said(rec):
+        if proc.Handle.running(rec.get("pid"), rec.get("pstart")) is not None:
             return Holder(UP, rec=rec)
         time.sleep(STARTING_PAUSE)      # its first moment: look again rather than decide from it
     return Holder(STARTING, rec=rec)
