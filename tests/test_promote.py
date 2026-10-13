@@ -309,6 +309,38 @@ class TestPromote(Base):
         self.assertIn("already current", out)
         self.assertTrue(os.path.islink(self.link))
 
+    def test_a_link_another_target_holds_is_not_taken_over(self):
+        """Two projects naming one link path. The first one's links are not the second's to move: a release
+        link is read back to the target it points into, a dev link to the project the registry records, and
+        both are refused until --force-links. Without this, the later promote won whichever ran last."""
+        self.make_repo()
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        held = (os.readlink(self.link), os.readlink(self.devlink))
+        other = os.path.join(self.tmp, "other")
+        self.write(".pp.toml", 'name = "other"\n[promote]\nsource = "tree"\n'
+                               f'links = {{ "{self.link}" = "bin/tool" }}\n'
+                               f'dev_links = {{ "{self.devlink}" = "bin/tool" }}\n', root=other)
+        self.write("bin/tool", "#!/bin/sh\necho other\n", exe=True, root=other)
+        self.assertEqual(self.pp(other)[0], 2)
+        self.assertEqual((os.readlink(self.link), os.readlink(self.devlink)), held)
+        t, reg = promote._project(other), promote._registry()
+        for path in (self.link, self.devlink):          # the refusal is told which target holds each path
+            full = os.path.join(os.path.dirname(path), os.readlink(path))
+            self.assertEqual(promote._link_owner(full, t, reg), "demo")
+        rc, out, err = self.pp(other, "--force-links", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(os.readlink(self.link),
+                         os.path.join(self.sb.data, "releases", "other", "current", "bin", "tool"))
+        self.assertEqual(os.readlink(self.devlink), os.path.join(other, "bin", "tool"))
+        # the first project under a new `name` is a new target, and a link into the tree it promotes is its
+        # own, although a registry row still calls that tree the old target's
+        with open(os.path.join(self.repo, ".pp.toml")) as f:
+            table = f.read()
+        self.write(".pp.toml", table.replace('name = "demo"', 'name = "demo-again"'))
+        renamed = promote._project(self.repo)
+        self.assertIsNone(promote._link_owner(os.path.join(self.repo, "bin", "tool"), renamed,
+                                              promote._registry()))
+
     def test_link_into_source_is_replaced_without_force(self):
         self.make_repo()
         os.makedirs(os.path.dirname(self.link))

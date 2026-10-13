@@ -30,6 +30,9 @@ NAME is a promoted target's name, or a path into its project.
     check = "python3 -m unittest discover -s tests -q"   # the gate; non-zero refuses, current untouched
     links = { "~/.local/bin/pp" = "bin/pp" }        # stable path -> releases/<name>/current/<rel>
     dev_links = { "~/.local/bin/ppd" = "bin/pp" }   # stable path -> <source>/<rel>: the dev side
+                                                    #   a link path another target holds stays that
+                                                    #   target's: --force-links moves it, and the
+                                                    #   refusal names the target that holds it
     after = "systemctl --user restart foo"          # after the flip
     verify = "curl -fsS localhost:8100/ >/dev/null" # after `after`; non-zero (or a failed `after`) rolls back
     keep = 5               # releases kept; current, the one before it and the one a promote leaves always stay
@@ -477,10 +480,35 @@ def _inside(path: str, root: str) -> bool:
     return False
 
 
+def _under(path: str, root: str) -> str | None:
+    """The first path component of `path` under `root`, or None where it is not under it."""
+    for a, b in ((os.path.normpath(path), os.path.normpath(root)), (os.path.realpath(path), os.path.realpath(root))):
+        if a.startswith(b.rstrip(os.sep) + os.sep):
+            return os.path.relpath(a, b).split(os.sep)[0]
+    return None
+
+
+def _link_owner(target: str, t: Target, reg: dict) -> str | None:
+    """Which other target holds a link that points at `target`, or None. A releases path names its target in
+    the link itself, and a dev link's path is a registered project's own tree, which the registry names. So a
+    second project taking over a tool's name is told whose it is, rather than told the path is not pp's."""
+    name = _under(target, paths.data_dir("releases", create=False))
+    if name and name != t.name:
+        return name
+    for other, row in reg.items():
+        # a link into the tree this promote is of is this target's, whatever a registry row calls that tree:
+        # a project that changed its `name` is a new target, and its own dev link is still its own
+        if other != t.name and row.get("source") not in (None, t.source) and _inside(target, row["source"]):
+            return other
+    return None
+
+
 def _link_plan(t: Target, force: bool) -> list[dict]:
-    """Every link with its action: ok (already right), create, replace (pp's own, or forced), conflict."""
+    """Every link with its action: ok (already right), create, replace (pp's own, or forced), conflict. A link
+    another target holds is a conflict, so `--force-links` is what takes a path a second project registered:
+    its own links are the ones a promote may move by itself."""
     plan = []
-    rel_root = paths.data_dir("releases", create=False)
+    reg = _registry()
     for kind, base in (("link", os.path.join(t.releases, "current")), ("dev_link", t.source)):
         for path, rel in (t.cfg.get(kind + "s") or {}).items():
             path, target = paths.expand(path), os.path.join(base, rel)
@@ -488,12 +516,14 @@ def _link_plan(t: Target, force: bool) -> list[dict]:
             if os.path.islink(path):
                 have = os.readlink(path)
                 abs_have = os.path.join(os.path.dirname(path), have)
+                owner = _link_owner(abs_have, t, reg)
                 if have == target:
                     row["action"] = "ok"
-                elif _inside(abs_have, rel_root) or _inside(abs_have, t.source):
+                elif not owner and (_inside(abs_have, t.releases) or _inside(abs_have, t.source)):
                     row.update(action="replace", why=f"was -> {have}")
                 else:
-                    row.update(action="replace" if force else "conflict", why=f"a symlink to {have}, not pp's", foreign=True)
+                    row.update(action="replace" if force else "conflict", foreign=True,
+                               why=f"a symlink to {have}, " + (f"which {owner} holds" if owner else "not pp's"))
             elif os.path.isdir(path):
                 row.update(action="conflict", why="a directory (never replaced, even with --force-links)")
             elif os.path.lexists(path):
@@ -731,7 +761,8 @@ def _run_parser(**kw) -> argparse.ArgumentParser:
     ap.add_argument("--no-check", action="store_true", help="skip the gate (recorded in the log)")
     ap.add_argument("--again", action="store_true", help="promote even if HEAD is already current")
     ap.add_argument("--keep-failed", action="store_true", help="leave a failed staging dir for inspection")
-    ap.add_argument("--force-links", action="store_true", help="replace regular files / foreign symlinks at link paths")
+    ap.add_argument("--force-links", action="store_true",
+                    help="replace a file, a foreign symlink or another target's link at a link path")
     ap.add_argument("-y", "--yes", action="store_true", help="do not ask")
     return ap
 
@@ -940,11 +971,11 @@ def _status_row(name: str, src: str) -> dict:
                 continue
             if not os.path.lexists(p):
                 problem = "missing"
-            elif os.path.islink(p) and any(_inside(os.path.realpath(p), os.path.realpath(d)) for d in
-                                           (paths.data_dir("releases", create=False), src)):
-                problem = "stale"           # pp's own link, to something other than it should (`pp promote link`)
+            elif os.path.islink(p) and any(_inside(os.path.realpath(p), os.path.realpath(d))
+                                           for d in (t.releases, src)):
+                problem = "stale"           # this target's own link, to something other than it should (`pp promote link`)
             else:
-                problem = "conflict"        # a file or a link that is not pp's (preflight says the same)
+                problem = "conflict"        # a file, or a link another target holds (preflight says the same)
             row["link_problems"].append({"path": p, "kind": kind[:-1], "problem": problem})
     row["links_ok"] = not row["link_problems"]
     return row
