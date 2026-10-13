@@ -6,6 +6,7 @@ Named queues, one directory each: ~/.local/state/pp/queue/<name>/
     jobs/<id>.run   the claim one run of that job holds, from its own wrapper, for exactly as long as it runs
     rc/<id>.<attempt>.<token>   the exit code, written by the job's own `sh` under the name its record names,
                     so ANY worker can tell how it ended, and no attempt can read another's code
+    rc/<id>.<attempt>.<token>.env   the environment that attempt's runner is handed, mode 0600
     logs/<id>.log  hooks/<id>-<event>.log   worker.lock (the worker's claim, and its record)  worker.log
     FORMAT          the number this layout is, written by the first writer that reaches the queue: a queue
                     whose jobs another pp wrote is refused where it is opened (open_queue), never read
@@ -35,7 +36,7 @@ ENDED = ("done", "failed")
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 RECORD = re.compile(r"\d+\.json")     # what a job record is called: jobs/<id>.json, and nothing else is one
 RESERVED = ("probes", "watchers")     # directories beside the queues
-FORMAT = 1                  # what a queue's FORMAT file holds: the layout of everything under queue/<name>/
+FORMAT = 2                  # what a queue's FORMAT file holds: the layout of everything under queue/<name>/
 CLEAN_BATCH = 100           # job records `forget` removes in one transaction, so a reader never waits long
 
 
