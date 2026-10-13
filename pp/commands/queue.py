@@ -274,13 +274,13 @@ Workers, and after a reboot
     worker and a worker that comes back adopts running jobs instead of losing them. `pp queue worker stop` is not a
     pause, since the next command that needs a worker starts one; `pp queue work -q NAME` runs one in the foreground
     for a supervisor or a unit file; and --no-start on add, release, retry, wait and watch does the verb's work and
-    starts none. After a reboot the records need nothing arranged: a job that was running when the machine went down
-    has no exit code and no live run, so the first worker up records it failed with reason "lost", and retries it
+    starts none, which is a different flag from --no-runner, one letter apart: that one puts no runner before the
+    job's own command. After a reboot the records need nothing arranged: a job that was running when the machine went
+    down has no exit code and no live run, so the first worker up records it failed with reason "lost", and retries it
     where --retry-if matches "lost". A job left queued waits for a worker, which one of the five verbs above starts,
     or `pp queue worker start -q NAME` does, for the one queue it names. Those records say running until that queue's
     worker is up, so start the workers first and read `pp queue --json` after; bringing several queues back is one
     `worker start` each, and `worker status` is the one that covers them all.
-
 A job's environment, later entries winning: the worker's own, which is that of the `pp queue add` that started it,
 without an agent session's identity;
 PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job; the project's [queue] env;
