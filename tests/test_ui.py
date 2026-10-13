@@ -1,5 +1,6 @@
 """ui.parse_intermixed: one parse on every Python pp supports (argparse differs between 3.11, 3.12.3 and
-3.12.12); and what a message, a usage error and a question print of the text they name."""
+3.12.12); what a message, a usage error and a question print of the text they name; and ui.follow, the one reader of
+a file something else is writing."""
 import io
 import os
 import sys
@@ -9,6 +10,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import sandbox  # noqa: E402
 from pp.lib import ui  # noqa: E402
 
 
@@ -206,6 +210,110 @@ class TestTable(unittest.TestCase):
     def test_a_double_width_cell_does_not_move_the_columns_after_it(self):
         lines = ui.table([["报告报告.txt", "one"], ["aaaaaaaa.txt", "two"]]).splitlines()
         self.assertEqual(column_of(lines[0], "one"), column_of(lines[1], "two"))
+
+
+class Counted:
+    """A stream that keeps no text: what a follow writes to it is counted and dropped, so a test can show a
+    200 MB file without holding it."""
+
+    def __init__(self):
+        self.n = 0
+
+    def write(self, text: str) -> None:
+        self.n += len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+class TestFollow(unittest.TestCase):
+    """What `follow` promises about a file something else is writing: the reads are bounded, the whole follow
+    decodes as one, every stream given gets the text, and a pass stops where it was told to.
+
+    The writer here is the test itself, so one thread steps the writer and the reader in the order a poll loop
+    over a running program's output meets them."""
+
+    def setUp(self):
+        self.sb = sandbox.enter(self)
+        path = os.path.join(self.sb.root, "out")
+        self.w = open(path, "wb")
+        self.addCleanup(self.w.close)
+        self.r = open(path, "rb")
+        self.addCleanup(self.r.close)
+
+    def add(self, raw: bytes) -> None:
+        self.w.write(raw)
+        self.w.flush()
+
+    def test_a_character_the_writer_split_is_shown_whole(self):
+        """A program flushes where its own block ended, which is no character boundary: an ordinary C program
+        writing to a file flushes at 4096 bytes. Each pass decoded on its own showed two replacements where
+        one character was split, and dropped the character."""
+        shown = io.StringIO()
+        with ui.follow(self.r.fileno(), shown) as show:
+            self.add(b"ok " + "\u20ac".encode()[:1])
+            self.assertEqual(show(), 4)
+            self.assertEqual(shown.getvalue(), "ok ")        # half a character shows nothing yet
+            self.add("\u20ac".encode()[1:] + b"\n")
+            self.assertEqual(show(), 3)
+        self.assertEqual(shown.getvalue(), "ok \u20ac\n")
+
+    def test_a_byte_that_is_no_character_is_one_replacement(self):
+        """One decoder for the whole follow is still a decoder that replaces: a program's output is bytes,
+        and a byte that is not UTF-8 stands for itself and does not hold up what comes after it."""
+        shown = io.StringIO()
+        with ui.follow(self.r.fileno(), shown) as show:
+            self.add(b"a\xffb")
+            self.assertEqual(show(), 3)
+        self.assertEqual(shown.getvalue(), "a\ufffdb")
+
+    def test_a_character_the_file_ends_in_the_middle_of_is_shown_at_the_end(self):
+        """Half a character is held back while more may come, and shown when the follow ends, since the
+        program that wrote it wrote no more."""
+        shown = io.StringIO()
+        with ui.follow(self.r.fileno(), shown) as show:
+            self.add("\u20ac".encode()[:2])
+            self.assertEqual(show(), 2)
+            self.assertEqual(shown.getvalue(), "")
+        self.assertEqual(shown.getvalue(), "\ufffd")
+
+    def test_every_stream_given_gets_the_same_text(self):
+        """`pp promote` shows a hook's output and appends it to the run's log: one follow over two streams,
+        and not two readings of the file."""
+        a, b = io.StringIO(), io.StringIO()
+        with ui.follow(self.r.fileno(), a, b) as show:
+            self.add(b"line\n")
+            show()
+        self.assertEqual((a.getvalue(), b.getvalue()), ("line\n", "line\n"))
+
+    def test_a_pass_stops_where_it_was_told_to(self):
+        """The last pass over a hook's output stops at the size the file had when the hook exited, so a
+        process the hook left behind writing to that file is followed no further."""
+        shown = io.StringIO()
+        with ui.follow(self.r.fileno(), shown) as show:
+            self.add(b"hook\nleft behind\n")
+            self.assertEqual(show(5), 5)
+            self.assertEqual(shown.getvalue(), "hook\n")
+            self.assertEqual(show(5), 0)        # that point is reached, and nothing before it is left
+            self.assertEqual(show(), 12)        # what came after it is still there to be followed
+
+    def test_a_200_mb_file_is_read_in_bounded_blocks(self):
+        """What a program dumped between two passes decides how long a pass takes and never how much memory
+        it needs. Read with no size, the same file came back as one 200 MB object, which took three times
+        that in memory and showed nothing until the program had finished writing."""
+        big = 200 * 1024 * 1024
+        self.w.truncate(big)            # a file with a hole in it: the reads are the point, not the bytes
+        counted, sizes, real = Counted(), [], os.pread
+
+        def spy(fd, n, at):
+            sizes.append(n)
+            return real(fd, n, at)
+        with mock.patch.object(ui.os, "pread", spy), ui.follow(self.r.fileno(), counted) as show:
+            self.assertEqual(show(), big)
+        self.assertEqual(counted.n, big)
+        self.assertLessEqual(max(sizes), ui._BLOCK)
+        self.assertEqual(len(sizes), big // ui._BLOCK + 1)      # and the one that found the end
+
 
 if __name__ == "__main__":
     unittest.main()

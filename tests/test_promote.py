@@ -82,6 +82,15 @@ class Base(unittest.TestCase):
             return []
         return sorted(n for n in os.listdir(self.rel) if not n.startswith(".") and n not in ("current", "revisions.log"))
 
+    def run_log(self, kind: str = "") -> str:
+        """The newest of this target's run logs, where a run's full output is kept: what a run said outlives
+        the caller's pipe there, so a line only the terminal saw is a line that run cannot account for. A
+        hook's own output file is in that directory too, under a name holding the hook's label."""
+        d = os.path.join(self.sb.state, "promote", "logs")
+        names = sorted(n for n in os.listdir(d) if kind in n)
+        with open(os.path.join(d, names[-1])) as f:
+            return f.read()
+
     def revlog(self):
         with open(os.path.join(self.rel, "revisions.log")) as f:
             return f.read()
@@ -418,6 +427,72 @@ class TestPromote(Base):
             data = tomllib.load(f)
         self.assertEqual((data["name"], "promote" in data), ("keepme", True))
 
+
+
+class TestAHookThatLeftSomethingRunning(Base):
+    def test_what_a_hook_leaves_running_keeps_running_and_does_not_hold_the_promote(self):
+        """A hook writes to a file of its own, so a process the hook leaves behind holds nothing pp waits
+        for, and keeps holding nothing while it writes to that output for days. Read through a pipe instead,
+        an `after` that starts the service it activates held the promotion for as long as that service lived,
+        past the flip and with the target's lock in its hand: `current` named the new release, and the run
+        that made it never said so, never gc'd and never ended.
+
+        The run's log is pp's own: what pp showed is appended there, and it stops where the run stopped."""
+        pidfile = os.path.join(self.tmp, "left.pid")
+        self.make_repo(f'after = "( while : ; do echo serving; sleep 0.1; done ) & echo $! > {pidfile}; '
+                       f'echo activated"\n')
+        done = []
+        t = threading.Thread(target=lambda: done.append(self.pp(self.repo)), daemon=True)
+        t.start()
+        t.join(120)
+        self.assertFalse(t.is_alive(), "the process the hook left behind held the promote")
+        rc, out, err = done[0]
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("--- after: ok", out)
+        self.assertIn("activated", out)
+        self.assertIn("promoted demo ->", out)
+        self.assertIn("--- after: ok", self.run_log())
+        self.assertIn("activated", self.run_log())      # pp appends what it shows, so the log has it too
+        with open(pidfile) as f:
+            left = int(f.read())
+        self.addCleanup(journey.kill_pid, left)
+        self.assertTrue(promote.proc.alive(left), "the service the hook left running was ended")
+        kept, so_far = len(self.run_log()), len(self.run_log("-after"))
+        journey.until(lambda: len(self.run_log("-after")) > so_far,
+                      what="what the hook left running still writing to the hook's output file")
+        self.assertEqual(len(self.run_log()), kept, "the run's log grew after the run ended")
+
+
+class TestWhatAHooksStreamsAre(Base):
+    """A hook's two streams are a file of that hook's own: never what pp's own output goes to, which pp's
+    caller may be reading, and never this run's log, which is pp's account of the run."""
+
+    def test_a_hook_that_reopens_its_own_output_leaves_the_runs_log_whole(self):
+        """`> /dev/stdout` in a hook is /proc/self/fd/1 opened again, with O_TRUNC. Handed the run's log, a
+        hook doing that threw away the lines naming the project, the revision and the new release, and pp's
+        reader was then past the end of a file that had shrunk, so none of the hook's output was shown
+        either. What such a hook truncates now is its own output file."""
+        head = self.make_repo('build = "echo before; echo HELLO > /dev/stdout; echo after"\n')
+        rc, out, err = self.pp(self.repo)
+        self.assertEqual(rc, 0, out + err)
+        log = self.run_log()
+        self.assertIn(f"promote demo: {self.repo} (git) rev {head[:12]}", log)      # the lines it destroyed
+        self.assertIn("log:", log)
+        self.assertIn("--- build: echo before", log)
+        for said in ("HELLO", "after"):
+            self.assertIn(said, out)
+            self.assertIn(said, log)
+
+    def test_each_hook_of_a_run_has_an_output_file_of_its_own(self):
+        """One file per hook, named from the run's log and the hook's label, so what a `build` wrote and what
+        an `after` wrote are each where a reader of that run can find them."""
+        self.make_repo('build = "echo building"\nafter = "echo activating"\n')
+        self.assertEqual(self.pp(self.repo)[0], 0)
+        d = os.path.join(self.sb.state, "promote", "logs")
+        names = sorted(os.listdir(d))
+        self.assertEqual(len(names), 3, names)
+        self.assertIn("building", self.run_log("-build"))
+        self.assertIn("activating", self.run_log("-after"))
 
 
 class TestARemoveThatCannotFinish(Base):

@@ -39,6 +39,11 @@ again". That is also why a failed `after` rolls back: whatever the cause, the pr
 known to work, and leaving `current` on a release nothing runs would make the pointer lie. Irreversible steps
 (schema migrations, data rewrites) do not belong in `after`, because no rollback can undo them; run them by
 hand, and keep them compatible with the release before. `verify` is the health check of the activated release.
+A hook writes its output to a file of its own, beside this run's log; pp shows that file's new bytes as the
+hook runs and appends them to the run's log. pp waits for the hook's own process and for nothing the hook
+leaves running: a service an `after` starts holds that file open, and what it writes keeps landing there.
+Redirect the output of what a hook leaves running (`./serve >/dev/null 2>&1 &`): otherwise it writes into that
+hook's output file for as long as it lives, and pp prunes neither those files nor the run's logs.
 Commands run in the release dir with PP_NAME PP_SOURCE PP_REV PP_RELEASE (where the release's bytes are: a
 staging dir during build/check) and PP_PREV (the previous release dir, or empty). Git submodules are not
 included (git archive leaves them out).
@@ -74,6 +79,7 @@ import shutil
 import signal
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from contextlib import ExitStack, contextmanager
@@ -85,6 +91,7 @@ VERBS = ("status", "ls", "rollback", "diff", "link", "gc", "init")
 DEFAULT_EXCLUDE = [".git", "node_modules", "__pycache__", ".venv", "*.pyc"]
 META = paths.RELEASE_META          # its fields and readers: pp/lib/paths.py
 NOT_RELEASES = ("current", "revisions.log")
+_SHOW = 0.05            # how often a running hook's output file is looked at for new output to show
 
 
 # ---- targets --------------------------------------------------------------------------------------
@@ -531,6 +538,8 @@ class Log:
     def __init__(self, path: str | None):
         self.path = path
         self.f = open(path, "a") if path else None
+        self.stem = path.removesuffix(".log") if path else None     # each hook's output file is named from it
+        self.hooks = 0
 
     def __enter__(self) -> "Log":
         return self
@@ -555,21 +564,54 @@ class Log:
             self.f.flush()
 
     def sh(self, label: str, cmd: str, cwd: str, env: dict) -> int:
-        """Run the check, printing its output as it comes. In pp's own group, so a Ctrl-C in this terminal reaches
-        the check as well: that is how a person stops a promotion."""
+        """Run a hook, showing its output as it comes. In pp's own group, so a Ctrl-C in this terminal reaches
+        the hook and what it started as well: that is how a person stops a promotion.
+
+        Both of the hook's streams are a file of that hook's own (`_hook_out`), and pp shows its new bytes
+        (`ui.follow`) while it waits for the hook's own process, then once more up to the size that file had
+        when the hook exited: everything the hook itself wrote is there by then. So nothing pp waits for is
+        held by a process the hook leaves running, and nothing pp's own caller reads is ever handed to a hook:
+        that process keeps the hook's output file open, what it writes keeps landing there, and pp follows it
+        no further. Read through a pipe instead, an `after` that starts the service it activates held the
+        promotion, and the target's lock with it, for as long as that service lived."""
         self.say(f"--- {label}: {cmd}")
-        c = proc.spawn(["/bin/sh", "-c", cmd], group="shared", stdin="none", env=env, cwd=cwd, stdout=proc.PIPE,
-                       stderr=proc.STDOUT)
-        for raw in iter(c.stdout.readline, b""):
-            line = raw.decode(errors="replace")
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            if self.f:
-                self.f.write(line)
-        c.close_pipes()
-        rc = c.wait()
+        with ExitStack() as st:
+            out = st.enter_context(self._hook_out(label))
+            show = st.enter_context(ui.follow(out.fileno(), *((sys.stdout, self.f) if self.f else (sys.stdout,))))
+            c = proc.spawn(["/bin/sh", "-c", cmd], group="shared", stdin="none", env=env, cwd=cwd, stdout=out,
+                           stderr=out)
+            while c.poll() is None:
+                if not show():
+                    time.sleep(_SHOW)
+            rc = c.wait()
+            show(os.fstat(out.fileno()).st_size)
         self.say(f"--- {label}: {'ok' if rc == 0 else f'FAILED (exit {rc})'}")
         return rc
+
+    def _hook_out(self, label: str):
+        """Open the file a hook's two streams go to: one file per hook, beside this run's log, opened by pp
+        and read by pp while the hook writes it.
+
+        A hook is handed neither pp's own output, which a process the hook leaves running would then hold open
+        for pp's caller, nor this run's log, which a `> /dev/stdout` in a hook would truncate. Nothing prunes
+        these files, as nothing prunes the run's logs.
+
+        It is opened for append, as the run's log is, so every write lands at the end whatever the offset of
+        the descriptor it came through: a hook that reopens its own output (`> /dev/stdout`, which truncates
+        it) leaves no hole in what pp has still to show.
+
+        A run that keeps no log keeps none of this either: the file has no name, so what the hook wrote is
+        shown and kept nowhere, and the space a process the hook left running goes on taking is the kernel's
+        again when that process exits."""
+        self.hooks += 1
+        if self.stem:
+            try:
+                fd = os.open(f"{self.stem}-{self.hooks}-{label.split()[0]}.log",
+                             os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o666)
+                return os.fdopen(fd, "r+b")
+            except OSError:
+                pass        # a name pp cannot open is a file with no name, as a log it cannot open is none
+        return tempfile.TemporaryFile()
 
 
 def _flip(t: Target, stamp: str):

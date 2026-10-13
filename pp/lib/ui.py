@@ -4,12 +4,14 @@ terminal decides it."""
 from __future__ import annotations
 
 import argparse
+import codecs
 import re
 import json
 import os
 import sys
 import time
 import unicodedata
+from contextlib import contextmanager
 
 
 class _Parser(argparse.ArgumentParser):
@@ -231,3 +233,50 @@ def human_age(ts: float | None, now: float | None = None) -> str:
     if not ts:
         return "-"
     return human_duration((now or time.time()) - ts) + " ago"
+
+
+# ---- a file something else is writing -------------------------------------------------------------
+
+_BLOCK = 1 << 16        # how much of a followed file one read takes
+
+
+@contextmanager
+def follow(fd: int, *streams, at: int = 0):
+    """Show a growing file's new bytes on each of streams: a hook's output file while the hook runs
+    (`promote.Log.sh`). The block yields `show`.
+
+    `show(end=None)` writes what the file holds beyond what it has shown already, and answers with how many
+    bytes that was. Those reads are bounded, so what a writer dumped between two passes decides how long one
+    takes and never how much memory it needs: a program that prints a 200 MB build log is read in blocks like
+    any other. `end` is an offset to stop at, for a pass that must not follow a writer pp is not waiting for.
+
+    The bytes go through one incremental UTF-8 decoder for the whole follow, so a character a read ended in
+    the middle of is shown whole, and not as a replacement on each side of the split. Where a read lands is
+    the writer's own flushing and nothing a reader decides, which is why joining them is the reader's job.
+
+    `at` is where in the file the showing starts. The file's own offset is never used, so pp may be holding
+    that same descriptor open for the writer, and a reader of its own needs no second open."""
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def write(text: str) -> None:
+        for s in streams if text else ():       # a read that was half a character shows nothing yet
+            s.write(text)
+            s.flush()
+
+    def show(end: int | None = None) -> int:
+        nonlocal at
+        shown = 0
+        while end is None or at < end:
+            raw = os.pread(fd, _BLOCK if end is None else min(_BLOCK, end - at), at)
+            if not raw:
+                break
+            at, shown = at + len(raw), shown + len(raw)
+            write(dec.decode(raw))
+        return shown
+
+    try:
+        yield show
+    finally:
+        # the file ends in the middle of a character where its writer wrote half of one: that is shown, as
+        # one replacement, since nothing is coming to finish it
+        write(dec.decode(b"", True))

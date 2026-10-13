@@ -322,6 +322,24 @@ class TestHousekeeping(PromoteJourney):
         self.assertIn("(gone)", r.stdout)
 
 
+class TestAHookThatLeavesAWriter(PromoteJourney):
+    def test_a_promote_piped_to_another_command_ends_when_pp_does(self):
+        """`pp promote | cat`, the shape of a CI line, with an `after` that starts the service it activates and
+        redirects nothing.
+
+        A hook's two streams are a file of that hook's own, so what the hook leaves running holds no stream pp
+        reads and none pp's caller reads: the promotion finishes and the pipeline ends when pp does. Read
+        through a pipe, pp waited for that service, past the flip and with the target's lock held."""
+        src = self.tool_repo('after = "sh ./serve.sh & echo up"\n',
+                             {"serve.sh": "#!/bin/sh\nwhile : ; do echo serving; sleep 0.2; done\n"})
+        out = self.sh(f"{sys.executable} {PP} promote -y | cat", cwd=src)
+        self.assertIn("up", out)                        # the hook's own output, shown as it comes
+        self.assertIn("promoted tool ->", out)
+        self.assertIsNotNone(self.current(), "the release never went out")
+        self.assertTrue(self.logs_say("--- after: ok"))         # and the run's own log says so too
+        self.assertTrue(self.logs_say("up"))
+
+
 class TestSelfPromotion(PromoteJourney):
     def test_pp_releases_itself_then_rolls_back(self):
         """CONTRIBUTING's "Running pp from a clone", then "Running your changes", in a sandbox: a copy of this tree,
