@@ -302,7 +302,9 @@ Agents
     timeout, retries, attempt, rc, reason, not_retried, added, started, ended, seconds, log, log_at, container,
     envfile, rcfile, owner, history (one entry per attempt that ended, with its own files and cards), notes, reported,
     hooks, stop (by, t, grace, timeout, sent, kill9, denied, was, cmd, rc), env and shell_env (their names, every
-    value ***), and from `show` also watchers. A field is added and never renamed or retyped inside a minor version.
+    value ***), and from `show` also watchers. Every one of those is on a job in every state, null or empty where the
+    record does not hold it yet, but `after` is there only on a job that names the jobs it waits for and `stop` only
+    on a job asked to stop. A field is added and never renamed or retyped inside a minor version.
 
 What is left to you, on purpose
     A dependency graph: --after is ids that already exist, with no cycles and no forward references. A log read as a

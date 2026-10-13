@@ -142,7 +142,9 @@ its sources.
   `log_at`, and `cards`, `container`, `envfile` and `log_at` in each
   `history` entry. `show --json` carries every promised field on a job in
   each of the five states: a field the record does not hold yet is null, or
-  an empty list.
+  an empty list. The two exceptions are `after`, which is there only on a
+  job that names the jobs it waits for, and `stop`, only on a job asked to
+  stop.
 - `pp help queue` is one page: a first job, a project whose work runs in a
   container in four steps, names and selection, campaign files, the settings
   table, how a job ends, workers, and what is left to you.
