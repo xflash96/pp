@@ -85,15 +85,19 @@ def _starting(q: str) -> str:
 
 def _read_settings(q: str, backfill: bool | None, poll: float | None):
     """What one pass of q's worker loop runs under: {poll, idle_exit, backfill}, read once per pass, so a
-    queue's limits change under its running jobs with no restart. A config that cannot be read comes back as
-    `error` beside the defaults, which is what stops that pass launching anything."""
+    queue's limits change under its running jobs with no restart.
+
+    `work --backfill` fixes backfill, and otherwise the queue's config says. A config that cannot be read
+    comes back as `error` beside the defaults, and says nothing about backfill unless the flag did, so a
+    worker keeps running the way it was until that file is fixed."""
     def read():
+        fixed = {} if backfill is None else {"backfill": bool(backfill)}
         try:
             cfg = _qcfg(q)
         except config.ConfigError as e:
-            return {"poll": float(poll or 2), "idle_exit": 600.0, "backfill": bool(backfill), "error": str(e)}
+            return {"poll": float(poll or 2), "idle_exit": 600.0, "error": str(e), **fixed}
         return {"poll": float(poll or cfg.get("poll", 2)), "idle_exit": float(cfg.get("idle_exit", 600)),
-                "backfill": bool(cfg.get("backfill", False)) if backfill is None else bool(backfill)}
+                "backfill": bool(cfg.get("backfill", False)), **fixed}
     return read
 
 
