@@ -5392,6 +5392,48 @@ class TestAStopAndAReapThatCross(InjectedCase):
         self.assertEqual([h["event"] for h in jobstore.find(j)["hooks"]], ["failed"])
         self.assertEqual(self.ran(f), 1)
 
+    def test_a_stop_commands_code_lands_on_the_stop_it_was_run_for(self):
+        """The code of a stop command is recorded on the stop that command carried out, and on no other. A
+        requeue takes the attempt's stop off the record, so a command still running then would otherwise land
+        its code on the next attempt's stop, for which nothing has gone out: the record would say a stop
+        failed that nothing had yet been sent for."""
+        opens = self.gate("the-stop-command-may-end")
+        j = self.add("--retries", "1", "--retry-delay", "0.01", "--retry-if", "^timeout$", cmd=self.gated())
+        w = jobq.worker_for("default")
+        w.tick()
+        self.nothing_of_the_job_is_left(w, j)
+        self.the_run_is_live(j)
+        with jobstore.txn() as s:       # a timeout's stop, whose command outlives the attempt it ended
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = f"while [ ! -f {opens} ]; do sleep 0.02; done; exit 3"
+            cur["stop"] = {"by": "timeout", "timeout": True, "t": time.time(), "grace": 30.0}
+            s.save(cur)
+        w.carry_out()
+        self.assertIsNotNone(jobstore.find(j)["stop"]["cmd"])
+        h = jobcore._group_handle(jobstore.find(j))       # the attempt's run is over, having written no code
+        self.assertIsNotNone(h, f"job {j}'s record names no group")
+        proc.signal_group(h, signal.SIGKILL)
+        self.the_run_is_over(j)
+        w.tick()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["attempt"], rec.get("stop")), ("queued", 2, None))
+        self.run_until(w, lambda: self.state(j) == "running")
+        self.nothing_of_the_job_is_left(w, j)
+        with jobstore.txn() as s:       # whose own stop is one pp's signal carries out
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = jobpolicy.GROUP
+            s.save(cur)
+        fresh = self.a_kill_asks(j, grace=30.0)
+        self.open_the_gate("the-stop-command-may-end")
+        journey.until(lambda: all(h.poll() is not None for h in w.stops.values()), timeout=30,
+                      what="the stop command of the attempt that ended")
+        w.tick()
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual(stop["t"], fresh["t"])
+        self.assertIsNotNone(stop["sent"])
+        self.assertNotIn("rc", stop, "a code of a command run for the stop of an attempt that has ended")
+        self.assertNotIn("cmd", stop)
+
     def test_the_decision_is_made_on_the_record_the_store_holds(self):
         """The facts of a pass are read before its transaction and the record is read inside it. A stop
         written in between is carried out by that same pass: the SIGTERM goes out for it, and the record says

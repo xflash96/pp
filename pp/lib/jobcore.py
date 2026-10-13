@@ -160,7 +160,9 @@ class Worker:
         self.queue = queue
         self.children: dict[int, proc.Child] = {}    # jobs this worker launched; others are adopted
         self.hooks: list[proc.Child] = []            # kept only to reap them
-        self.stops: dict[int, proc.Child] = {}       # a stop command per job: reaped onto that stop's rc
+        # the stop commands this worker started, by the job and the stop each one was run for: reaped onto
+        # that stop's rc, and onto no later stop of the same job
+        self.stops: dict[tuple[int, float], proc.Child] = {}
         self.backfill = backfill
         self.pstart = me.start if me else None
         self.waiting: dict | None = None    # {id, tag, why, t}: what the head of the queue waits for
@@ -303,7 +305,9 @@ class Worker:
         # that stop instead, so the job is left no worse off than 0.1.1
         cmd = policy.stop_command(job) if a.do == policy.TERM else None
         h = self._stop(job, cmd) if cmd else None
-        self.stops.update({job["id"]: h} if h is not None else {})   # the worker reaps it onto this stop
+        # the worker reaps it onto this stop, which its own time names: one run of a job carries one stop,
+        # and the stop of a later attempt is another
+        self.stops.update({(job["id"], job["stop"]["t"]): h} if h is not None else {})
         outcome = "alive" if h is not None else self._signal_group(job, sig)
         if outcome is None or outcome == "gone":
             return          # nothing to signal: its run is starting, or it is over and the next pass says how
@@ -337,12 +341,16 @@ class Worker:
 
     def _reap_stops(self):
         """The exit code each stop command of this worker's had, onto the stop it carried out, once it has
-        ended. A stop pp has not seen end keeps `rc` null, so null never reads as "it worked"."""
-        for jid in [jid for jid, h in self.stops.items() if h.poll() is not None]:
-            h = self.stops.pop(jid)
+        ended. A stop pp has not seen end keeps `rc` null, so null never reads as "it worked".
+
+        The stop it carried out is the one whose time it was started for: a requeue takes the attempt's stop
+        off the record, so a command still running then would otherwise land its code on the next attempt's
+        stop, for which nothing had gone out."""
+        for key in [k for k, h in self.stops.items() if h.poll() is not None]:
+            (jid, t), h = key, self.stops.pop(key)
             with jobstore.txn() as s:
                 cur = s.job(jid)
-                if cur and cur.get("stop"):
+                if cur and (cur.get("stop") or {}).get("t") == t:
                     cur["stop"]["rc"] = h.poll()
                     s.save(cur)
 
