@@ -245,6 +245,31 @@ class TestWhatGitCanAsk(PluginJourney):
 
 
 class TestReadingAPlugin(PluginJourney):
+    def test_what_a_remote_says_cannot_write_lines_on_the_screen_that_asks(self):
+        """git relays the stderr of the helper it talks to a remote through, so an ssh banner is the remote's
+        own text, and it arrives before there is anything to say yes to. pp names it in the refusal."""
+        self.tool("fakessh", 'printf "\\033[31m\\033[2Jpp: added plugin trusted at 1a2b3c4\\033[0m\\n" >&2\nexit 255\n')
+        r = self.pp("cmd", "add", "git@localhost:some/repo.git", "--name", "sshx", code=1,
+                    env=dict(self.env, GIT_SSH_COMMAND=os.path.join(self.bin, "fakessh")))
+        self.assertNotIn("\x1b", r.stderr)
+        self.assertIn("\\x1b[31m\\x1b[2Jpp: added plugin trusted at 1a2b3c4", r.stderr)
+        self.assertEqual(os.listdir(self.plugins), [])
+
+    def test_what_a_remote_says_of_several_lines_stays_several_lines(self):
+        """git says four lines whenever a clone finds no key, which is the commonest way `pp cmd add` fails.
+        They are the lines pp names them in, each one a line pp wrote, so a `pp: ` among them is indented
+        under pp's own and still forges nothing."""
+        self.tool("fakessh", 'printf "Permission denied (publickey).\\nfatal: Could not read from remote '
+                  'repository.\\n\\npp: added plugin trusted\\n" >&2\nexit 255\n')
+        r = self.pp("cmd", "add", "git@localhost:some/repo.git", "--name", "sshy", code=1,
+                    env=dict(self.env, GIT_SSH_COMMAND=os.path.join(self.bin, "fakessh")))
+        self.assertNotIn("\\n", r.stderr)                 # not one line with its newlines written out
+        lines = r.stderr.splitlines()
+        self.assertEqual(lines[0], "pp: git clone --quiet: Permission denied (publickey).")
+        self.assertIn("  fatal: Could not read from remote repository.", lines)
+        self.assertIn("  pp: added plugin trusted", lines)
+        self.assertEqual(os.listdir(self.plugins), [])
+
     def test_an_escape_sequence_in_a_plugin_cannot_redraw_the_review(self):
         self.commit("commands/sly.py", '"""Looks fine\x1b[2K"""\n# \x1b[1A\x1b[2K hidden\ndef main(argv):\n    pass\n', "sly")
         r = self.pp("cmd", "add", self.src, "-n", "--show")

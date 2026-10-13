@@ -1,4 +1,6 @@
-"""Terminal helpers shared by commands: argument parsers, confirmation, tables, colour, human units."""
+"""Terminal helpers shared by commands: argument parsers, confirmation, tables, colour, human units.
+A parser's usage error and a question are escaped here like any message, so no site that writes text to a
+terminal decides it."""
 from __future__ import annotations
 
 import argparse
@@ -10,10 +12,24 @@ import time
 import unicodedata
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse's parser, with the words of its usage errors escaped. A word on pp's command line is text from
+    elsewhere as much as a file's name is: a glob hands pp the names of the files in a directory, and
+    "unrecognized arguments" names them as they are. The help text itself is printed as it is, since a
+    command's docstring is pp's own and its tables are meant to line up.
+
+    add_subparsers passes the parser's own class on, so a verb's parser escapes the same way."""
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {printable(message)}", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def parser(cmd: str, doc: str | None, **kw) -> argparse.ArgumentParser:
     """An ArgumentParser for `pp <cmd>`: the module docstring is the help text, kept verbatim."""
-    return argparse.ArgumentParser(prog=f"pp {cmd}", description=doc,
-                                   formatter_class=argparse.RawDescriptionHelpFormatter, **kw)
+    return _Parser(prog=f"pp {cmd}", description=doc,
+                   formatter_class=argparse.RawDescriptionHelpFormatter, **kw)
 
 
 def parse_intermixed(p: argparse.ArgumentParser, argv: list[str]) -> argparse.Namespace:
@@ -35,14 +51,36 @@ def parse_intermixed(p: argparse.ArgumentParser, argv: list[str]) -> argparse.Na
     return ns
 
 
-def die(msg: str, code: int = 1):
+def _said(msg: str | list[str]) -> str:
+    """`pp: ` and the message, each line of it through printable(): a message is pp's own words with text from
+    elsewhere in them (a file's name, a path, an exception's words, git's output), and the escaping is here, so
+    no site that reports an error decides it and none can be missed. A piece of that text is no line of its
+    own either, the way a table's cell is no row of its own; pp's own lines are the items of a list. A colour
+    from c() belongs outside a message, since its bytes are escaped here like any others."""
+    lines = [msg] if isinstance(msg, str) else list(msg)
+    return "pp: " + "\n".join(printable(line) for line in lines)
+
+
+def die(msg: str | list[str], code: int = 1):
     """Print `pp: msg` to stderr and exit with code (1 failure, 2 usage/refusal)."""
-    print(f"pp: {msg}", file=sys.stderr)
+    print(_said(msg), file=sys.stderr)
     raise SystemExit(code)
 
 
-def warn(msg: str):
-    print(f"pp: {msg}", file=sys.stderr)
+def warn(msg: str | list[str]):
+    print(_said(msg), file=sys.stderr)
+
+
+def relayed(text: str, head: str = "") -> list[str]:
+    """Another program's output as the lines die() and warn() take: its first line after head (pp's own words
+    about it), and its other lines indented under them.
+
+    Output is several lines at run time where no literal is (git says four when a clone finds no key), and a
+    message of several lines passed as one string would print them with their newlines written out. Each line
+    here is a line pp wrote, so the escaping still leaves nothing from elsewhere able to start a line of pp's
+    own shape."""
+    lines = text.strip().splitlines() or [""]
+    return [f"{head}: {lines[0]}" if head else lines[0]] + ["  " + ln if ln else ln for ln in lines[1:]]
 
 
 def confirm(prompt: str, yes: bool = False) -> bool:
@@ -50,6 +88,7 @@ def confirm(prompt: str, yes: bool = False) -> bool:
     sys.stdout.flush()      # the plan printed so far comes before the question or the refusal, even into a pipe
     if yes:
         return True
+    prompt = printable(prompt)      # it names a project, a job or a plugin, so it is escaped like a message
     if not sys.stdin.isatty():
         print(f"{prompt} There is no terminal to ask at; pass -y to proceed.", file=sys.stderr)
         return False

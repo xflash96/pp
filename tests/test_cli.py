@@ -76,6 +76,26 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("ambiguous", r.stderr)
 
+    def test_a_file_name_cannot_redraw_a_refusal_either(self):
+        """A command file's name and its path are whoever wrote the file's text, and the listings escape them.
+        The same names reach pp's own messages: an ambiguous prefix lists them, a typo is answered with the
+        closest one, a file pp cannot parse is named by its name, its path and python's words, and argparse
+        names a word pp was handed, which a glob fills with the names of the files in a directory."""
+        esc = "zbad\x1b[31mRED"
+        self.write(f"plug/{esc}.py", '"""Fine one"""\ndef main(argv):\n    pass\n')
+        self.write(f"plug/{esc}2.py", '"""Also fine"""\ndef main(argv):\n    pass\n')
+        self.write("plug/zalias.py", '"""Aliased"""\nALIASES = ["zq\x1b[35mAL"]\ndef main(argv):\n    pass\n')
+        self.write("plug/zbroke\x1b[32mX.py", "def main(argv:\n")
+        for argv, code, says in ((("zbad",), 2, "is ambiguous"), (("zq\x1b[35mA",), 2, "did you mean"),
+                                 (("zbroke\x1b[32mX",), 1, "is broken"),
+                                 # argparse writes this one, and a glob is where such a word comes from
+                                 (("cmd", "ls", f"{esc}.txt"), 2, "unrecognized arguments")):
+            r = self.pp(*argv)
+            self.assertEqual(r.returncode, code, r.stderr)
+            self.assertIn(says, r.stderr, argv)
+            self.assertNotIn("\x1b", r.stderr, argv)
+            self.assertIn("\\x1b[3", r.stderr, argv)
+
     def test_help_subcommand(self):
         r = self.pp("help", "kill")
         self.assertEqual(r.returncode, 0)

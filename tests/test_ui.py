@@ -1,8 +1,12 @@
-"""ui.parse_intermixed: one parse on every Python pp supports (argparse differs between 3.11, 3.12.3 and 3.12.12)."""
+"""ui.parse_intermixed: one parse on every Python pp supports (argparse differs between 3.11, 3.12.3 and
+3.12.12); and what a message, a usage error and a question print of the text they name."""
+import io
 import os
 import sys
 import unicodedata
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pp.lib import ui  # noqa: E402
@@ -39,6 +43,97 @@ class TestParseIntermixed(unittest.TestCase):
                 sys.stderr = old
         self.assertEqual(e.exception.code, 2)
 
+
+
+class Terminal(io.StringIO):
+    """A stream that says it is a terminal, which is what confirm asks before it asks anything."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class TestWhatAMessageNames(unittest.TestCase):
+    """A refusal names what it is about: a command file's name, its path, an exception's words, git's stderr.
+    CONTRIBUTING.md has such text go through printable() before it is printed, and every message pp prints
+    goes through die or warn, so that is where it happens."""
+
+    def said(self, msg, code: int | None = None) -> list[str]:
+        """The lines a message leaves on stderr: warn's (no code), or die's (its exit code)."""
+        err = io.StringIO()
+        with redirect_stderr(err):
+            if code is None:
+                ui.warn(msg)
+            else:
+                with self.assertRaises(SystemExit) as e:
+                    ui.die(msg, code)
+                self.assertEqual(e.exception.code, code)
+        return err.getvalue().splitlines()
+
+    def test_an_escape_sequence_in_what_a_message_names_cannot_redraw_the_terminal(self):
+        self.assertEqual(self.said("git clone: \x1b[2Jpp: added plugin trusted", 1),
+                         ["pp: git clone: \\x1b[2Jpp: added plugin trusted"])
+        self.assertEqual(self.said("command 'z\x1b[31mb' is broken"), ["pp: command 'z\\x1b[31mb' is broken"])
+
+    def test_what_a_message_names_is_no_line_of_its_own(self):
+        """A file name carries any byte but NUL and /, a newline among them, so a name in a refusal could
+        otherwise write a line of pp's own shape below it."""
+        self.assertEqual(self.said("'zq' is ambiguous: zq\npp: added plugin trusted, zq2", 2),
+                         ["pp: 'zq' is ambiguous: zq\\npp: added plugin trusted, zq2"])
+
+    def test_the_lines_of_a_message_are_the_ones_pp_asked_for(self):
+        self.assertEqual(self.said(["these names are taken:", "  zq: user command /tmp/zq.py"], 2),
+                         ["pp: these names are taken:", "  zq: user command /tmp/zq.py"])
+
+    def test_another_programs_output_keeps_the_lines_it_was_written_as(self):
+        """git says four lines when a clone finds no key, and a message is several lines only at run time
+        there. relayed() makes them lines pp wrote, so they read as lines and a `pp: ` among them is still
+        indented under pp's own."""
+        said = "Permission denied (publickey).\nfatal: Could not read from remote.\n\npp: added plugin trusted\n"
+        self.assertEqual(self.said(ui.relayed(said, "git clone"), 1),
+                         ["pp: git clone: Permission denied (publickey).",
+                          "  fatal: Could not read from remote.", "", "  pp: added plugin trusted"])
+        self.assertEqual(self.said(ui.relayed("it went wrong"), 1), ["pp: it went wrong"])
+
+
+class TestAUsageError(unittest.TestCase):
+    """argparse writes its own refusals, and a word on pp's command line is text from elsewhere as much as a
+    file's name is: a glob hands pp the names of the files in a directory. ui.parser is the one place a
+    parser is made, so that is where the escaping is, and a verb's parser is made from the same class."""
+
+    def said_by(self, p, argv: list[str]) -> list[str]:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit) as e:
+                p.parse_args(argv)
+            self.assertEqual(e.exception.code, 2)
+        return err.getvalue().splitlines()
+
+    def test_a_word_argparse_names_cannot_redraw_the_usage_it_prints(self):
+        lines = self.said_by(ui.parser("t", None), ["x\x1b[2Jy.txt"])
+        self.assertEqual(lines[-1], "pp t: error: unrecognized arguments: x\\x1b[2Jy.txt")
+        self.assertTrue(lines[0].startswith("usage: pp t"), lines)
+
+    def test_a_verbs_parser_refuses_the_same_way(self):
+        p = ui.parser("t", None)
+        verb = p.add_subparsers(dest="verb").add_parser("add")
+        verb.add_argument("--port")
+        self.assertEqual(self.said_by(p, ["add", "--port"])[-1],
+                         "pp t add: error: argument --port: expected one argument")
+
+
+class TestConfirm(unittest.TestCase):
+    def test_what_the_question_names_cannot_redraw_the_screen_it_is_asked_on(self):
+        """A question names a project, a release or a plugin, and a project's name is its directory's. It is
+        the one message that asks for a yes, so what it names is escaped like any other."""
+        out = Terminal()
+        with mock.patch("sys.stdin", Terminal("y\n")), redirect_stdout(out):
+            self.assertTrue(ui.confirm("roll proj\x1b[2Jx back?"))
+        self.assertEqual(out.getvalue(), "roll proj\\x1b[2Jx back? [y/N] ")
+        err = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO()), redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertFalse(ui.confirm("roll proj\x1b[2Jx back?"))
+        self.assertNotIn("\x1b", err.getvalue())
+        self.assertIn("roll proj\\x1b[2Jx back?", err.getvalue())
 
 
 def column_of(line: str, text: str) -> int:

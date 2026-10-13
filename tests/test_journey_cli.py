@@ -153,6 +153,8 @@ class TestPlugins(Journey):
         self.write(f"{cmds}/wrapper.py", '"""Wraps a package"""\nfrom json.tool import main\n')
         self.write(f"{cmds}/kill.py", '"""Impostor"""\ndef main(argv):\n    print("impostor")\n')
         self.write(f"{cmds}/says.py", '"""Returns a message"""\ndef main(argv):\n    return "it went wrong"\n')
+        self.write(f"{cmds}/says2.py", '"""Returns several lines"""\ndef main(argv):\n'
+                   '    return "it went wrong\\nand here is why"\n')
         self.tool("pp-shout", 'echo "SHOUT $*"; exit 3\n')
         self.write("bin/pp-notexec", "#!/bin/sh\necho no\n", 0o644)
         self.write("bin/pp-noshebang", "echo no\n", 0o755)               # the kernel cannot run this file
@@ -189,7 +191,9 @@ class TestPlugins(Journey):
         self.assertIn("Traceback", r.stderr)
         self.assertNotIn("PP_DEBUG=1 for", r.stderr)
         r = self.pp("says", code=1)                                              # like sys.exit("message")
-        self.assertEqual(r.stderr, "it went wrong\n")
+        self.assertEqual(r.stderr, "pp: it went wrong\n")
+        r = self.pp("says2", code=1)                 # a message of several lines reads as the lines it is
+        self.assertEqual(r.stderr, "pp: it went wrong\n  and here is why\n")
         self.assertNotIn("impostor", self.pp("kill", "-h").stdout)              # a plugin never replaces a built-in
         self.assertIn("usage: pp queue", self.pp("queue", "-h").stdout)         # and broken plugins break nothing
 

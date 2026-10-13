@@ -191,7 +191,8 @@ def run(cmd: Command, argv: list[str]) -> int:
     rc = mod.main(argv)
     if rc is None or isinstance(rc, int):
         return int(rc or 0)
-    print(rc, file=sys.stderr)      # like sys.exit("message"): a message is a failure
+    # like sys.exit("message"): a message is a failure, and a command's words are its own, lines and all
+    ui.warn(ui.relayed(str(rc)))
     return 1
 
 

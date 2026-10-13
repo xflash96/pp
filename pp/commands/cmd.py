@@ -261,7 +261,7 @@ def _git(*args: str, group: str, cwd: str | None = None) -> str:
     if r.returncode is None:
         ui.die("git is not installed; pp cmd add and update need it", 1)
     if r.returncode:
-        ui.die(f"git {' '.join(args[:2])}: {r.stderr.strip() or 'failed'}", 1)
+        ui.die(ui.relayed(r.stderr.strip() or "failed", f"git {' '.join(args[:2])}"), 1)
     return r.stdout
 
 
@@ -321,7 +321,7 @@ def _unclashed(staging: str) -> None:
     """Refuse unless every command the clone provides still has a free name. Same two moments as _free."""
     clashes = _clashes([n for n, _, _ in _commands_in(staging)])
     if clashes:
-        ui.die("these names are taken; nothing was added:\n  " + "\n  ".join(clashes), 2)
+        ui.die(["these names are taken; nothing was added:"] + ["  " + c for c in clashes], 2)
 
 
 def _show_commands(clone: str, show: bool) -> None:
