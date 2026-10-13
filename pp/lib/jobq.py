@@ -2033,7 +2033,7 @@ def _parser(prog: str, doc: str, add_args=None):
         p.add_argument("--tail", type=int, default=15, help="log lines shown with a failure")
         p.add_argument("--no-start", action="store_true", help="do not start a worker for queued jobs")
     p = sp("work", help="run a queue's worker in the foreground")
-    p = sp("worker", help="start | stop | status of the background workers")
+    p = sp("worker", help="start | stop one queue's worker (-q, else the default queue); status covers every queue")
     p.add_argument("action", choices=("start", "stop", "status"))
     p.add_argument("--json", action="store_true", help="status as JSON")
     return ap
