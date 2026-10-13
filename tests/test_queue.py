@@ -906,6 +906,28 @@ class TestWorker(QueueCase):
         self.assertEqual(rec["state"], "failed")
         self.assertIn("launch failed", rec["reason"])
 
+    def test_a_launch_that_cannot_happen_is_one_jobs_failure_and_not_the_passs(self):
+        """Whatever stopped a start is recorded on the job it belongs to, and the pass goes on launching the
+        rest. A pass has marked every job it admitted `running` before it starts any of them, so a job that
+        takes the pass down with it leaves the others with no process, and the next tick reads them as lost:
+        jobs of other projects, which asked for none of it, end FAILED without ever running.
+
+        An environment name holding a `=` is such a start: no execve takes it, and a project's [queue] env
+        can hold one."""
+        bad = self.add("--prio", "1", cmd="echo bad")
+        good = self.add("--prio", "2", cmd="echo good")
+        with jobq.txn() as s:
+            cur = s.job(bad)
+            cur["env"] = {"PP_IS=NO_NAME": "1"}         # what no execve takes, so this job can never start
+            s.save(cur)
+        w = jobq.Worker("default")
+        w.tick()
+        rec = jobq.find(bad)
+        self.assertEqual(rec["state"], "failed", rec)
+        self.assertIn("launch failed", rec["reason"])
+        self.assertEqual(self.state(good), "running")   # the pass went on, so this one has its process
+        self.run_until(w, lambda: self.state(good) == "done")
+
 
 class TestNamedQueues(QueueCase):
     def test_independent_workers_and_head_of_line(self):

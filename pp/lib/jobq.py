@@ -1499,7 +1499,12 @@ class Worker:
 
     def _spawn(self, j: dict, gpu: int | None, claim: lock.Claim) -> dict | None:
         """Start the attempt's wrapper, and hand it the run claim as its stdin: it holds that claim for exactly
-        as long as the attempt lives. pp closes its own copy here, so nothing but the wrapper holds it."""
+        as long as the attempt lives. pp closes its own copy here, so nothing but the wrapper holds it.
+
+        Whatever stopped this start is this job's launch failure, recorded on it: a directory that is gone, a
+        log that cannot be opened, an environment name the kernel will not take. The pass that got here has
+        marked every job it admitted `running` already, so one job that cannot start must not end the pass
+        for the others: they would be left with no process, and read as lost."""
         jid, q = j["id"], self.queue
         argv = list(j.get("runner") or []) + list(j["cmd"])
         env = {**(j.get("shell_env") or {}), **(j.get("env") or {}),
@@ -1515,7 +1520,7 @@ class Worker:
                 f.flush()
                 p = proc.spawn(["/bin/sh", "-c", WRAP, "pp-queue-job", *argv], group="own", stdin=claim.fd,
                                env="scrubbed", add_env=env, cwd=j["cwd"], stdout=f, stderr=proc.STDOUT)
-        except OSError as e:
+        except Exception as e:
             with txn() as s:
                 cur = s.job(jid, must_be=("running",))
                 if cur:
