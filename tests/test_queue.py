@@ -1314,6 +1314,14 @@ class TestPools(QueueCase):
         self.assertEqual(rc, 2)
         self.assertIn("not a queue name", err)
 
+    def test_a_queue_named_like_the_id_counter_is_refused_and_every_other_add_still_works(self):
+        """The id counter is a file beside the queues, so a queue of that name would take its place."""
+        rc, _, _ = self.call("add", "-q", "counter", "--no-start", "--", "true")
+        self.assertEqual(rc, 2)
+        self.assertNotIn("counter", jobstore.queues())
+        first = self.add(cmd="true")
+        self.assertEqual(self.add(cmd="true"), first + 1)
+
 
 class TestProbe(QueueCase):
     def test_free_amount_minus_what_was_launched_since(self):

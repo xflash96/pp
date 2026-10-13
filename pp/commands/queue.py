@@ -27,8 +27,8 @@ starts the queue's worker itself.
 `status` is the verb the bare command runs: `pp queue` is `pp queue status`, and a flag goes there too, so `pp queue
 --json` and `pp queue status --json` are one command. `status --here` is this directory's project only, `--project
 NAME` one named project. -q narrows any verb to one queue, before or after the verb. A queue name begins with a
-lowercase letter or a digit and holds letters, digits, - and _; `probes` and `watchers` are taken. `pp help queue
-add`, or `pp -h queue add`, prints that verb's own flags.
+lowercase letter or a digit and holds letters, digits, - and _; `probes`, `watchers` and `counter` are taken.
+`pp help queue add`, or `pp -h queue add`, prints that verb's own flags.
 
 A first project whose work runs in a container, in four steps
 

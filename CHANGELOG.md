@@ -9,6 +9,9 @@
 - A `--tag` is at most 64 characters of letters, digits and `.`, `_`, `-`
   and `:`. It may not hold `..`, be `.` on its own, or read as an id or a
   range, because a tag can be part of a log file's name.
+- `counter` is not a queue name, beside `probes` and `watchers`: a queue of
+  that name took the place of the job id counter, and every later `add`
+  failed.
 - Every verb that takes jobs takes the same five forms: an id, a range
   (`12-15`), a tag matched whole, `--prefix P` (repeatable), and `--all`
   with `-q NAME`. `--all` without `-q` is a usage error, and a tag or a

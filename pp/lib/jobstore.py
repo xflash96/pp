@@ -35,7 +35,7 @@ LIVE = ("queued", "held", "running")
 ENDED = ("done", "failed")
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 RECORD = re.compile(r"\d+\.json")     # what a job record is called: jobs/<id>.json, and nothing else is one
-RESERVED = ("probes", "watchers")     # directories beside the queues
+RESERVED = ("probes", "watchers", "counter")     # names beside the queues: two directories and the id counter
 FORMAT = 2                  # what a queue's FORMAT file holds: the layout of everything under queue/<name>/
 CLEAN_BATCH = 100           # job records `forget` removes in one transaction, so a reader never waits long
 
