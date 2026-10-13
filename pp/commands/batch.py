@@ -19,8 +19,20 @@ written --template=-... or -t-...:
     pp batch undo --list                                          what undo can see
     pp batch undo --partial                                       some were moved or deleted since: restore the rest
 
-RUN is one command per file. Fields are quoted for you, so names with spaces or quotes are safe; the rest of
-the command is ordinary shell (pipes and > work):
+RUN is one command per file. Each field is quoted for you where it sits, so a name with spaces, quotes or
+semicolons in it is one word; the rest of the command is ordinary shell (pipes and redirections work). A
+field whose value is a name sits in a word of a command the template itself runs, or in quoting of your own
+there ('{}' and "{}"). Any other position is refused, and the refusal names it: inside $( ), backticks,
+${ }, $'...', arithmetic ($(( )), (( )), $[ ], let), a [[ ]] test, a case pattern, a comment, the target of
+>& or <&, right after a \ or a $, and in eval, trap or the script of a shell's -c. The -c pp reads is the
+template's own sh, bash, dash, ksh or zsh, written plain or behind env, VAR=value, nice, stdbuf, timeout,
+nohup, command, exec or builtin. The word after that script is an argument of the shell again, which is
+where such a field goes: sh -c 'cmd "$1"' sh {}. A template that opens a heredoc (any <<) or defines a
+function (NAME ( ), or the word function where a command's words start) is refused a name anywhere in it:
+put the script in a file and hand the name to it as an argument (sh script.sh {}). A shell pp cannot see
+there (setsid sh -c, sudo sh -c, $SHELL -c) and a program that reads an argument of its own as code (xargs,
+ssh, python -c, find -exec) read a name as code, as they would any argument. {n} {N} {i} {mtime} are digits
+pp writes, so they sit anywhere. The plan lists every command it will run:
     pp batch run 'magick {} {base}.png' '*.webp'
     pp batch run 'ffmpeg -i {} {out}' '*.wav' --out 'mp3/{stem}.mp3' -j 4   skips files already converted
                                         (a command that fails has the {out} it started removed, so a rerun redoes it)
@@ -66,11 +78,13 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
+from typing import NamedTuple
 
 from pp.lib import config, lock, paths, proc, ui
 
 PRUNE = {".git", "node_modules", "__pycache__", ".venv"}
 FIELDS = {"path", "name", "stem", "ext", "dir", "parent", "base", "n", "N", "i", "mtime"}
+COUNTS = {"n", "N", "i", "mtime"}             # pp's own numbers: digits pp makes, not text off the disk
 PATHLIKE = {"path", "dir", "base", "out"}     # quoted into a command: one starting with "-" gets "./" in front
 
 
@@ -175,10 +189,17 @@ FILTERS = {"lower": str.lower, "upper": str.upper, "title": str.title, "strip": 
 _TOK = re.compile(r"\{\{|\}\}|\{([^{}]*)\}|[{}]")
 
 
-def compile_template(text: str, allowed: set[str]) -> list:
-    """Parse once, validating every field and filter up front: [literal str | (field, [filters], fmt)]."""
+def compile_template(text: str, allowed: set[str], shell: bool = False) -> list:
+    """Parse once, validating every field and filter up front: [literal str | (field, [filters], fmt, quoting)].
+
+    quoting is where each field sits, which only a shell command has: with shell, the text is read once as a
+    shell reads it (_reading), and a field whose value comes off the disk is accepted in a word of a command
+    the template itself runs, or in quoting of your own there, and refused anywhere else (_place). It is
+    decided here, once, because the text is the same for every item."""
+    toks = list(_TOK.finditer(text))
+    sits = _reading(_masked(text, toks)) if shell else []
     parts, buf, pos = [], [], 0
-    for m in _TOK.finditer(text):
+    for m in toks:
         buf.append(text[pos:m.start()])
         pos = m.end()
         tok = m.group(0)
@@ -200,24 +221,233 @@ def compile_template(text: str, allowed: set[str]) -> list:
             for fl in filters:
                 if fl not in FILTERS:
                     raise TemplateError(f"unknown filter |{fl} in {{{m.group(1)}}}; filters: {' '.join(FILTERS)}")
-            parts.append((field, filters, fmt))
+            parts.append((field, filters, fmt,
+                          _place(sits[m.start()], m.group(1), field in COUNTS) if shell else None))
     buf.append(text[pos:])
     if "".join(buf):
         parts.append("".join(buf))
     return parts
 
 
-def _shell_state(text: str, state: str | None) -> str | None:
-    """The quoting a shell is in after reading text, starting in state: None, "'" or '"'."""
+def _masked(text: str, toks: list) -> str:
+    """text as a shell reads it: every {field} written as the one word the command is handed there, and every
+    {{ or }} as the one brace it stands for, both the same length as what they replace, so every index still
+    names the same place.
+
+    A quote or a `#` inside a field's own format ({stem:'^10}) is no quoting and no comment of the command's,
+    and `{{ cmd; }}` is the group a shell runs, not a brace of pp's."""
+    out = list(text)
+    for m in toks:
+        if m.group(1) is not None:
+            out[m.start():m.end()] = "x" * (m.end() - m.start())
+        elif m.group(0) in ("{{", "}}"):
+            out[m.start():m.end()] = m.group(0)[0] + " "
+    return "".join(out)
+
+
+class _No(NamedTuple):
+    """A position no name field may sit in: how a refusal names it, and the text a shell closes the position
+    with ("" where the command it stands in closes it, None where only the end of the template does)."""
+    why: str
+    close: str | None = None
+
+
+# Every position the reading knows a name cannot sit in, by what opens one. A value is written into the
+# command as one quoted word, and these are the positions where one word is not what arrives: a second
+# reading of the text (arithmetic, a command of its own, eval, the script of a shell's -c), a word whose own
+# meaning the reading cannot tell (${ }, a [[ ]] test, a case pattern, a descriptor), and a place where a
+# character beside the word decides what the quoting means (a backslash, a $, a comment a newline ends).
+EXPANDS = {"$((": _No("inside $(( )), where a shell reads a value as arithmetic", "))"),
+           "$[": _No("inside $[ ], where a shell reads a value as arithmetic", "]"),
+           "$(": _No("inside $( ), which is a command of its own", ")"),
+           "${": _No("inside ${ }, where a shell reads what the braces hold", "}"),
+           "$'": _No("inside $'...', where a shell reads a backslash in the value", "'"),
+           "`": _No("inside backticks, which are a command of its own", "`")}
+ARITH = _No("inside (( )), where a shell reads a value as arithmetic", "))")
+TEST = _No("inside a [[ ]] test, where a shell reads a word as a pattern", "]]")
+PATTERN = _No("in a case pattern, which a shell matches a word against")
+FD = _No("in the target of a >& or a <&, which a shell reads as a descriptor", "")
+SCRIPT = _No("in the script of a shell's -c, which that shell reads as a command", "")
+ESCAPED = _No("right after a \\, where a shell reads the next character as itself")
+DOLLAR = _No("right after a $, where a shell reads the value as an expansion of its own")
+COMMENT = _No("in a comment, which ends where its line does whatever a name holds")
+RUNS = {"eval": _No("inside eval, which reads its argument as a command", ""),
+        "trap": _No("inside trap, which reads its argument as a command when the signal arrives", ""),
+        "let": _No("inside let, which reads its argument as arithmetic", "")}
+# A heredoc and a function definition are facts about the whole template, not positions in it: where either
+# body starts cannot be told from the text a field sits in, and a shell of its own reads that body. So a
+# template holding one takes pp's own numbers and no name.
+HEREDOC = _No("in a template holding a <<, whose body a shell can read as a command")
+FUNCTION = _No("in a template that defines a function, whose body has a $1 of its own")
+REMEDY = ("a name sits in a word of a command this template runs, or in quoting of your own there. To let a "
+          """shell read the name, hand it over as an argument: sh -c 'cmd "$1"' sh {}""")
+ONE_WORD = (SCRIPT, FD, "target")             # positions one word long: the word read there ends them
+SHELLS = {"sh", "bash", "dash", "ksh", "zsh"}
+# words before the command they run: a prefix pp reads through to the program, whose own options it does not
+PREFIX = {"env", "command", "exec", "nohup", "nice", "stdbuf", "timeout", "builtin"}
+KEYWORDS = {"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until", "in", "time"}
+_EMPTYPAREN = re.compile(r"\(\s*\)")
+_REDIR = re.compile(r"(>>|<>|>&|<&|>\||>|<)[ \t]*")
+_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=")
+
+
+def _cmd_name(words: list[str]) -> str:
+    """The program a command's words name so far, without its directory, or "" while none is named: the
+    first word that is neither an assignment nor a word that runs the rest, so `env A=1 /bin/sh` names sh."""
+    for w in words:
+        if not _ASSIGN.match(w) and os.path.basename(w) not in PREFIX:
+            return os.path.basename(w)
+    return ""
+
+
+def _shell(words: list[str]) -> bool:
+    """Whether a command's words name a shell, which reads text pp writes for it as a command of its own: the
+    program itself, or any word behind a prefix, since a prefix takes words of its own that pp does not read
+    (`timeout 10 sh`, `nice -n 5 sh`). So `grep sh` names grep and the -c after it is grep's own option.
+
+    A shell these words do not name reads a value as code all the same, and the help says which those are:
+    one behind a word that is no prefix of pp's (setsid, sudo), one an expansion names ($SHELL), and a
+    program that reads an argument of its own as code (xargs, ssh, python -c)."""
+    prefixed = False
+    for w in words:
+        if _ASSIGN.match(w) or os.path.basename(w) in PREFIX:
+            prefixed = True             # the program comes later, and pp does not read what the prefix takes
+        elif os.path.basename(w) in SHELLS:
+            return True
+        elif not prefixed:
+            return False                # this word is the program, and it is no shell
+    return False
+
+
+def _word_read(words: list[str], word: str, frames: tuple) -> tuple:
+    """The words of the command after one more was read, and the stack after it: a word that hands the next
+    one to a second reading opens a position, and a position one word long ends with the word read in it. A
+    keyword names no command, so the word after it still can."""
+    top = frames[-1] if frames else None
+    if top in ONE_WORD:
+        return words, frames[:-1]           # a script, or a redirection's target, names no command
+    if word == "esac" and "case" in frames:
+        while frames[-1] != "case":
+            frames = frames[:-1]
+        return [], frames[:-1]
+    if top == "case" and word == "in" and len(words) == 1:
+        return [], frames + (PATTERN,)      # the words up to the branch's ) are a pattern
+    if not word or word in KEYWORDS:
+        return words, frames
+    if not words and word == "case":
+        return [], frames + ("case",)
+    name, named = _cmd_name(words), _cmd_name(words + [word])
+    if not name and named in RUNS:
+        frames += (RUNS[named],)
+    elif _shell(words) and word.startswith("-") and not word.startswith("--") and "c" in word:
+        frames += (SCRIPT,)                 # -c, or any cluster holding one: the next word is the script
+    return words + [word], frames
+
+
+def _line(text: str, i: int) -> str:
+    """The line of text that starts at i, without its newline."""
+    end = text.find("\n", i)
+    return text[i:len(text) if end < 0 else end]
+
+
+def _reading(text: str) -> list[tuple]:
+    """Where every character of text sits, as the stack of what the text before it left open: "'" or '"' for
+    quoting of the user's own, "case" for a case waiting for its patterns, "target" for a redirection's
+    target, and a _No for a position no name may sit in. Entry k is the stack before text[k], and the top of
+    it is where a field written at k sits.
+
+    One reading of the template decides where every field sits, so the position a refusal names and the
+    quoting a value is written in cannot disagree. The positions a name is accepted in are a word of a
+    command the template itself runs and quoting of the user's own there, which is where quoting the value
+    makes it one word and nothing else; every other position the reading meets opens a _No that names it,
+    and a position it does not recognise at all is no position to stand in either. A stack, and not one
+    state, because a position holds positions: a bracket inside arithmetic is not the bracket that ends it,
+    and quoting inside $( ) is quoting of its own. The words of the command being read are kept as well,
+    since eval, trap and a shell's -c are known by the words that name them. A heredoc (any << outside
+    quoting) and a function definition stand at the bottom of every stack, since each is a fact about the
+    whole text and no position in it. A comment ends where its line does, and a shell reads no quoting in
+    it, so an apostrophe in a comment opens nothing."""
+    at: list[tuple] = []
+    frames: tuple = ()
+    whole: _No | None = None            # the construct the whole text holds, where it holds one
+    words, word = [], ""                # the words of the command being read, and the one being read now
     i = 0
     while i < len(text):
-        ch = text[i]
-        if ch == "\\" and state != "'":
-            i += 1                  # the next character is escaped
-        elif state is None and ch in "'\"" or ch == state:
-            state = None if ch == state else ch
+        at += [frames] * (i + 1 - len(at))
+        ch, top = text[i], frames[-1] if frames else None
+        cmd = (top is None or top in ("case", "target")
+               or isinstance(top, _No) and top.close in ("", None))     # where the words are read
+        if not words and word == "function" and ch in " \t\n;|&()<>":
+            whole = whole or FUNCTION                   # the word a definition starts with, body or no body
+        if text[i:i + 2] == "<<" and top not in ("'", '"'):
+            whole = whole or HEREDOC                    # the operator, wherever it stands
+        if top == "'":
+            if ch == "'":                               # nothing else ends a single-quoted word
+                frames = frames[:-1]
+        elif ch == "\\":
+            at += [frames + (ESCAPED,)] * (i + 2 - len(at))     # what it spells out is a place of its own
+            i += 1                                      # the next character is escaped
+        elif isinstance(top, _No) and top.close and text.startswith(top.close, i):
+            frames, i = frames[:-1], i + len(top.close) - 1
+        elif ch == top == '"':
+            frames = frames[:-1]
+        elif (o := next((o for o in EXPANDS if text.startswith(o, i)), None)):
+            frames, i = frames + (EXPANDS[o],), i + len(o) - 1
+        elif ch == '"' or ch == "'" and top != '"':
+            frames += (ch,)
+        elif ch == "$":
+            at += [frames + (DOLLAR,)] * (i + 2 - len(at))      # a value there is read as an expansion
+        elif ch in "([{" and isinstance(top, _No) and top.close in (")", "))", "]", "}"):
+            frames += (_No(top.why, {"(": ")", "[": "]", "{": "}"}[ch]),)   # a bracket of its own
+        elif not cmd:
+            pass                                        # inside a position, only what ends it is read
+        elif ch == "#" and text[i - 1:i] in ("", " ", "\t", "\n", ";", "&", "|", "("):
+            line = _line(text, i)
+            at += [frames + (COMMENT,)] * (i + len(line) - len(at))
+            i += len(line) - 1                          # a comment is the rest of its line, read as nothing
+        elif text[i:i + 2] == "((" and not words and not word:
+            frames, i = frames + (ARITH,), i + 1
+        elif text[i:i + 2] == "[[" and not word:
+            frames, i = frames + (TEST,), i + 1
+        elif ch in "<>" and (m := _REDIR.match(text, i)):
+            if not (word.isascii() and word.isdecimal()):       # else the digits are the descriptor's own
+                words, frames = _word_read(words, word, frames)
+            frames += (FD if m[1] in (">&", "<&") else "target",)
+            word, i = "", m.end() - 1                   # the target is the next word, whatever lies between
+        elif ch in ";|&\n()":
+            if ch == "(" and _EMPTYPAREN.match(text, i) and (word or words):
+                whole = whole or FUNCTION               # `name ( )`: a definition, whatever holds the body
+            words, frames = _word_read(words, word, frames)
+            words, word = [], ""                        # the next word names a command of its own
+            while frames and (frames[-1] in ONE_WORD
+                              or isinstance(frames[-1], _No) and frames[-1].close == ""):
+                frames = frames[:-1]                    # a position the command ends ends here
+            back = frames[-1] if frames else None
+            if ch == ")" and back == PATTERN:
+                frames = frames[:-1]                    # a branch's pattern ends at its )
+            elif ch == ";" and text[i + 1:i + 2] == ";" and back == "case":
+                frames, i = frames + (PATTERN,), i + 1  # and the word after ;; is a pattern again
+        elif ch in " \t":
+            words, frames = _word_read(words, word, frames)
+            word = ""
+        else:
+            word += ch
         i += 1
-    return state
+    at += [frames] * (len(text) + 1 - len(at))
+    return [(whole,) + f for f in at] if whole else at
+
+
+def _place(frames: tuple, shown: str, number: bool) -> str | None:
+    """Where a field sits, as _shell_quote reads it: "'" or '"' for quoting of the user's own, None for a
+    word of a command. A position no name may sit in is a refusal, which names the position and the spelling
+    that works.
+
+    number says the value is one of pp's own ({n}, {N}, {i}, {mtime}): what is in it is pp's own digits and
+    the template's own format, and nothing off the disk, so every position takes it as 0.1.0 took it."""
+    no = None if number else next((f for f in frames if isinstance(f, _No)), None)
+    if no:
+        raise TemplateError(f"{{{shown}}} sits {no.why}; {REMEDY}")
+    return next((f for f in reversed(frames) if f in ("'", '"')), None)
 
 
 def _shell_quote(s: str, state: str | None) -> str:
@@ -231,20 +461,18 @@ def _shell_quote(s: str, state: str | None) -> str:
 
 
 def render(parts: list, fields: dict, quote: bool = False, expand=None) -> str:
-    """Fill a compiled template. quote: shell-quote each substituted value (for the quoting it sits in). expand:
-    applied to literal parts (rename passes match.expand, so \\1 and \\g<name> work between the {fields})."""
+    """Fill a compiled template. quote: shell-quote each substituted value, for the quoting compile_template
+    read it in. expand: applied to literal parts (rename passes match.expand, so \\1 and \\g<name> work
+    between the {fields})."""
     out = []
-    state = None
     for p in parts:
         if isinstance(p, str):
             try:
                 out.append(expand(p) if expand else p)
             except (re.error, IndexError) as e:
                 raise TemplateError(f"in {p!r}: {e}") from None
-            if quote:
-                state = _shell_state(out[-1], state)
             continue
-        field, filters, fmt = p
+        field, filters, fmt, state = p
         v = fields[field]
         if filters:
             v = str(v)
@@ -723,7 +951,7 @@ def cmd_run(a) -> int:
             ui.die(f"no preset {tmpl!r}; have: {have}", 2)
         tmpl, out_t = ps[tmpl[1:]]["cmd"], out_t or ps[tmpl[1:]].get("out")
     try:
-        parts = compile_template(tmpl, FIELDS | ({"out"} if out_t else set()))
+        parts = compile_template(tmpl, FIELDS | ({"out"} if out_t else set()), shell=True)
         out_parts = compile_template(out_t, FIELDS) if out_t else None
         items = collect(a.paths, a.recursive, a.hidden, a.type, a.ext)
         if not items:
@@ -742,10 +970,11 @@ def cmd_run(a) -> int:
         ui.die(_shown(str(e)), 2)
     if not any(isinstance(p, tuple) for p in parts) and len(jobs) > 1:
         ui.warn(f"the command uses no {{field}}: the same command would run {len(jobs)} times")
-    for _, cmd, _ in jobs[:10]:
+    # every command, as rename shows every pair: a plan is what the user says yes to, and a command the plan
+    # leaves out is one nobody approved. A name decides how its command reads, so no ten of them stand for
+    # the rest
+    for _, cmd, _ in jobs:
         print(f"  $ {_shown(cmd)}")
-    if len(jobs) > 10:
-        print(f"  ... {len(jobs) - 10} more")
     print(f"{len(jobs)} command(s) to run" + (f", {len(skipped)} skipped (output exists; --overwrite to redo)" if skipped else ""))
     by_out: dict = {}
     for path, _, out in jobs:

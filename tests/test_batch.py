@@ -566,7 +566,86 @@ class TestRename(BatchCase):
         self.assertIn("rolled-back", out)
 
 
+HOSTILE = ["a;touch PWNED-semi;.txt", "b|touch PWNED-pipe|.txt", "c&touch PWNED-amp&.txt",
+           "d$(touch PWNED-sub).txt", "e`touch PWNED-tick`.txt", "f'g\"h.txt", "i\nj.txt", "-k.txt"]
+
+
 class TestRun(BatchCase):
+    def test_a_name_that_holds_a_command_is_one_word_wherever_a_field_may_sit(self):
+        """A file name can hold any byte but a slash and a NUL, so it can hold every character a shell reads
+        as code, and these names do. In every position a field may sit in, the name reaches the command as
+        one word: each command reads the file it is about, and nothing the name holds runs."""
+        for i, n in enumerate(HOSTILE):
+            touch(n, f"[{i}]")                                  # what only this file holds
+        for tmpl in ("cat {}", "cat '{}'", 'cat "{}"', "cat -- {}", "case {stem} in *) cat {};; esac",
+                     "if true; then cat {}; fi", """sh -c 'cat "$1"' sh {}"""):
+            rc, out, err = self.run_pp("run", tmpl, "*.txt", "-y", "--keep-going")
+            self.assertEqual(rc, 0, f"{tmpl}\n{out}{err}")
+            for i in range(len(HOSTILE)):
+                self.assertIn(f"[{i}]", out, tmpl)              # every command read the file it is about
+            self.assertEqual(self.tree(), sorted(HOSTILE), tmpl)    # and nothing else happened
+        # a name is one word as a redirection's target too, so each file is copied to its own name
+        rc, out, err = self.run_pp("run", "cat {} > {out}", "*.txt", "--out", "copy/{stem}.c", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([read(f"copy/{os.path.splitext(n)[0]}.c") for n in HOSTILE],
+                         [f"[{i}]" for i in range(len(HOSTILE))])
+        copies = ["copy/"] + [f"copy/{os.path.splitext(n)[0]}.c" for n in HOSTILE]
+        self.assertEqual(self.tree(), sorted(HOSTILE + copies))     # the copies, and nothing a name made
+
+    def test_a_name_field_a_shell_would_read_again_is_refused(self):
+        """A value a shell reads a second time is a value it can read as code, and quoting it for the word it
+        sits in says nothing about that second reading. Every such position is refused before anything runs,
+        and the refusal names the position and the spelling that hands the name over as an argument."""
+        touch("a;touch PWNED;.txt", "[0]")
+        rc, out, err = self.run_pp("run", 'echo "$(head -c 3 {})"', "*.txt", "-y", "--keep-going")
+        self.assertEqual(rc, 2, out + err)
+        self.assertEqual(self.tree(), ["a;touch PWNED;.txt"])   # what the name holds is no command of its own
+        touch("a.txt")
+        refused = {"echo $(basename {})": "inside $( )",
+                   "echo `basename {}`": "inside backticks",
+                   "echo ${{a{}b}}": "inside ${ }",
+                   "cat \"$'{}'\"": "inside $'...'",
+                   "echo $(( {stem} + 1 ))": "inside $(( ))",
+                   "(( {stem} ))": "inside (( ))",
+                   "echo $[ {stem} ]": "inside $[ ]",
+                   "[[ {} = x ]]": "inside a [[ ]] test",
+                   "case x in {stem}) echo hi;; esac": "in a case pattern",
+                   "echo hi >& {}": "in the target of a >& or a <&",
+                   "echo \\{}": "right after a \\",
+                   "echo ${}": "right after a $",
+                   "echo hi # {}": "in a comment",
+                   "eval cat {}": "inside eval",
+                   'trap "cat {}" INT': "inside trap",
+                   "let x={stem}": "inside let",
+                   "sh -c 'cat {}'": "in the script of a shell's -c",
+                   'timeout 5 env A=1 bash -ec "cat {}"': "in the script of a shell's -c",
+                   "cat {} <<EOF\nx\nEOF\n": "in a template holding a <<",
+                   "f() {{ cat {}; }}": "in a template that defines a function",
+                   "function f {{ cat {}; }}": "in a template that defines a function"}
+        for tmpl, why in refused.items():
+            rc, out, err = self.run_pp("run", tmpl, "a.txt", "-y")
+            self.assertEqual(rc, 2, f"{tmpl}\n{out}{err}")
+            self.assertIn(why, err, tmpl)
+            self.assertIn("""sh -c 'cmd "$1"' sh {}""", err, tmpl)
+        self.assertEqual(self.tree(), ["a.txt", "a;touch PWNED;.txt"])      # not one of them ran
+        # pp's own numbers are digits pp writes, so they sit in those positions, and the word after a
+        # script is an argument of that shell again, which is the spelling the refusals name
+        rc, out, err = self.run_pp("run", "echo $(( {n} + 1 ))", "a.txt", "-y")
+        self.assertEqual((rc, out.count("2")), (0, 1), out + err)
+        rc, out, err = self.run_pp("run", """sh -c 'cat "$1"' sh {}""", "a.txt", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("a.txt", out)
+
+    def test_the_plan_shows_every_command_it_will_run(self):
+        """The plan is what the user says yes to. A name decides how its command reads, so ten of them stand
+        for nothing: the one that differs is the one a cap hides."""
+        for i in range(12):
+            touch(f"f{i}.txt")
+        rc, out, _ = self.run_pp("run", "cat {}", "*.txt", "-n")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("$ cat "), 12)
+        self.assertNotIn("more", out)
+
     def test_quoting_names_with_spaces_and_quotes(self):
         name = "it's a \"file\" $HOME.txt"
         touch(name, "payload")

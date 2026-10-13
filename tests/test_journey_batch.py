@@ -157,6 +157,31 @@ class TestRunJourneys(Journey):
         self.assertTrue(os.path.exists(f"{self.work}/-n.bak"))
         self.assertIn("{out} exists only with --out", self.pp("batch", "run", "echo {out}", "*.txt", code=2).stderr)
 
+    def test_a_name_that_holds_a_command_runs_nothing_of_its_own(self):
+        """A folder the person did not fill holds a file whose name is a command. Every field of theirs is
+        quoted where it sits, so the name is one word and the command they wrote is the only one that runs.
+        A position where a shell would read the name again is refused, and the refusal says how to hand the
+        name to a shell: as an argument."""
+        for n in ("a;touch PWNED;.txt", "b $(touch PWNED2).txt"):
+            self.write(f"work/{n}", f"<{n}>")
+        here = sorted(os.listdir(self.work))
+        r = self.pp("batch", "run", "cat {}", "*.txt", "-y")
+        self.assertIn("2 ok, 0 failed", r.stdout)
+        self.assertIn("<a;touch PWNED;.txt>", r.stdout)
+        self.assertEqual(sorted(os.listdir(self.work)), here)       # no PWNED: the name ran nothing
+        r = self.pp("batch", "run", 'echo "$(head -c 3 {})"', "*.txt", "-y", code=2)
+        self.assertIn("sits inside $( ), which is a command of its own", r.stderr)
+        self.assertIn("""sh -c 'cmd "$1"' sh {}""", r.stderr)
+        r = self.pp("batch", "run", """sh -c 'head -c 3 "$1"' sh {}""", "*.txt", "-y")  # the spelling it names
+        self.assertIn("2 ok, 0 failed", r.stdout)
+        self.assertIn("<a;", r.stdout)
+        self.assertEqual(sorted(os.listdir(self.work)), here)
+        # the plan lists every command, so the one a name made different is not hidden behind a cap
+        for i in range(12):
+            self.write(f"work/f{i}.keep", "")
+        r = self.pp("batch", "run", "cat {}", "*.keep", "-n")
+        self.assertEqual(r.stdout.count("$ cat "), 12)
+
     def meet(self, where: str, tries: int) -> str:
         """A command for every job: say it started, then wait for all N of them to have started. Run at once
         they all meet; run one at a time the first waits for jobs that cannot start and gives up. There is no
