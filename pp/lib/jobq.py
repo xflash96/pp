@@ -2103,19 +2103,29 @@ def _latest_note(j: dict, width: int = 60) -> str:
 
 
 def public(j: dict) -> dict:
-    """A job as JSON consumers (`show/status --json`) see it: every stored field.
+    """A job as JSON consumers (`show/status --json`) see it: every stored field, with the job's environment
+    masked.
 
     Fields others rely on: id (int), state, queue, tag, project, cwd, cmd (argv), runner (argv, maybe []), needs,
     prio, owner {session, cwd} or None, timeout, retries, attempt, rc, reason, seconds, log,
     notes [{t, by, text}], reported [{t, by, session}], stop {by, t, grace, timeout, sent, kill9, denied, was}
     on a job asked to stop, and from `show` also watchers [{pid, verb, session}].
 
+    `env` and `shell_env` keep their keys and give every value as "***". A token or a secret is what the help
+    says to pass with --env, and an agent reads `--json` to see how its jobs are getting on, so the values
+    would land in a transcript and in whatever keeps one. The text `show` prints neither, and the record on
+    disk, which is the job's own, holds what the job runs with.
+
     A stop's `timeout` is set on the one a worker wrote because the job's own time ran out, and on no other,
     so what a stop is never rests on the name of whoever asked. `sent` and `kill9` are when each signal went
     out, and `denied` is when pp was refused the job's process group. A stop with `denied` set is not in
     flight: nothing more goes out for it, and the job runs on until it ends on its own. `was` is who asked
     for the stop this one landed on, where a kill landed on a timeout's."""
-    return {k: v for k, v in j.items() if not k.startswith("_")}
+    out = {k: v for k, v in j.items() if not k.startswith("_")}
+    for k in ("env", "shell_env"):
+        if isinstance(out.get(k), dict):
+            out[k] = dict.fromkeys(out[k], "***")
+    return out
 
 
 def _ended_line(j: dict | None, jid: int) -> str:

@@ -1563,6 +1563,23 @@ class TestShowNote(QueueCase):
         self.assertIn("attempt 1: rc=- (timeout)", out)
         self.assertNotIn("None", out)
 
+    def test_the_json_gives_a_jobs_variables_by_name_and_not_by_value(self):
+        """The help says to pass a token or a secret with --env, and `--json` is what an agent reads to see
+        how its jobs are getting on, so the values of a job's environment would land in a transcript. The
+        names are kept, since a reader wants to know which variables a job carries; the values are ***. The
+        job's own record is where what it runs with lives."""
+        j = self.add("--hold", "--env", "HF_TOKEN=hf-secret-123")
+        for argv in (("show", str(j), "--json"), ("status", "--json")):
+            out = self.call(*argv)[1]
+            self.assertNotIn("hf-secret-123", out, argv)
+            self.assertIn("HF_TOKEN", out, argv)
+        shown = json.loads(self.call("show", str(j), "--json")[1])
+        self.assertEqual(shown["env"], {"HF_TOKEN": "***"})
+        self.assertEqual(set(shown["shell_env"]), set(jobq.find(j)["shell_env"]))
+        self.assertEqual(set(shown["shell_env"].values()) - {"***"}, set())
+        self.assertNotIn("HF_TOKEN", self.call("show", str(j))[1])      # the text form says neither
+        self.assertEqual(jobq.find(j)["env"], {"HF_TOKEN": "hf-secret-123"})
+
     def test_note_by_session(self):
         j = self.add("--hold")
         self.sb.as_session("test-session-3")

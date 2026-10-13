@@ -598,12 +598,13 @@ class TestProjectRunner(QueueJourney):
         self.assertIn(f"bare\n{plain}", log)
 
     def test_no_runner_skips_the_wrapper_for_one_job(self):
-        j = self.exp("--no-runner", "--", "echo", "unwrapped")
+        j = self.exp("--no-runner", "--", "sh", "-c", "echo unwrapped hf=$HF_HUB_OFFLINE")
         self.wait(j)
         log = self.pp("queue", "log", j).stdout
         self.assertNotIn("RUNNER", log)
-        self.assertIn("unwrapped", log)
-        self.assertEqual(self.show(j)["env"]["HF_HUB_OFFLINE"], "1")      # the project's env still applies
+        self.assertIn("unwrapped hf=1", log)            # the project's env still applies
+        # --json names the variables a job carries and gives no value: a secret goes in with --env
+        self.assertEqual(self.show(j)["env"], {"HF_HUB_OFFLINE": "***", "SEED": "***"})
 
     def test_each_broken_project_says_what_to_fix(self):
         missing = self.project("missing", '[queue]\nrunner = "docker/run.sh"\n')

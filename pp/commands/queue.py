@@ -49,7 +49,8 @@ A job's environment, later entries winning: the worker's (that of the `pp queue 
 agent session's identity); PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job;
 the project's [queue] env; add's --env; then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE and CUDA_VISIBLE_DEVICES. A
 variable you export before `pp queue add` reaches the job only through the worker that add started, so pass a
-token or a secret with --env or the project's env.
+token or a secret with --env or the project's env. `--json` gives the names of a job's own variables with every
+value as ***, and `show` prints neither, so a secret you pass stays in the job's record and in the job.
 
 Timeouts and retries
     --timeout DUR      the worker SIGTERMs the job's process group after DUR (90s, 30m, 2h, 1d) and SIGKILLs
