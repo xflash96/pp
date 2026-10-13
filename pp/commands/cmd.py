@@ -170,15 +170,16 @@ def cmd_new(argv: list[str]) -> int:
 
 
 def _taken(name: str, cmds: dict | None = None) -> str | None:
-    """Why NAME cannot be a new command: an existing one would hide it, or it would hide an existing one."""
+    """Why NAME cannot be a new command: an existing one would hide it, or it would hide an existing one. The
+    answer is printed, and a path or a name in it may be someone else's, so it comes back escaped."""
     if name == "help":
         return "`pp help CMD` is pp's own"
     cmds = cli.discover() if cmds is None else cmds
     if name in cmds:
         c = cmds[name]
-        return f"{c.origin} command {c.path}"
+        return f"{c.origin} command {ui.printable(c.path)}"
     owner = next((c for c in cmds.values() if name in c.aliases), None)
-    return f"an alias of '{owner.name}' ({owner.path})" if owner else None
+    return f"an alias of '{ui.printable(owner.name)}' ({ui.printable(owner.path)})" if owner else None
 
 
 def _source_tree() -> str:
@@ -204,6 +205,10 @@ def _source_tree() -> str:
 # (the plugin origin, after builtin and user). .index.json beside the clones records {NAME: {url, ref, commit,
 # added, updated}}: where it came from and which ref `update` follows (null: the remote's default branch). Its
 # leading dot keeps it out of discovery and out of the names a plugin can have, and so does .lock's.
+#
+# What a plugin brings is read, never trusted to print: its commit subject, its file names, its summaries and
+# the URL it came from all go through ui.printable, so the screen a person says yes to is pp's own lines and
+# nothing else can write one. git's output reaches pp with \r read as a newline, which is a line of its own.
 #
 # add, update and rm each hold the plugins directory's lock (_holding) for the part that must not interleave
 # with another `pp cmd`: the checks that say a name is free, the install, checkout or removal they allow, and
@@ -304,7 +309,7 @@ def _clashes(names: list[str], skip: str | None = None) -> list[str]:
     """Which of names are taken, leaving out the plugin being updated (skip)."""
     mine = os.path.join(_root(), skip) + os.sep if skip else None
     cmds = {n: c for n, c in cli.discover().items() if not (mine and c.path.startswith(mine))}
-    return [f"{name}: {why}" for name in names for why in [_taken(name, cmds)] if why]
+    return [f"{ui.printable(name)}: {why}" for name in names for why in [_taken(name, cmds)] if why]
 
 
 def _free(name: str, dest: str, index: dict) -> None:
@@ -367,13 +372,15 @@ def cmd_add(argv: list[str]) -> int:
         _git("checkout", "--quiet", "--detach", commit, cwd=staging, group="own")
         if not _commands_in(staging):
             ui.die(f"{url} has no command files (commands/*.py, or *.py at its top)", 2)
-        print(f"plugin  {name}  from {url}" + (f"  ({a.ref})" if a.ref else ""))
-        print("commit  " + _git("log", "-1", "--format=%h %ad %s", "--date=short", cwd=staging, group="own").strip())
+        print(ui.printable(f"plugin  {name}  from {url}" + (f"  ({a.ref})" if a.ref else "")))
+        print("commit  " + ui.printable(_git("log", "-1", "--format=%h %ad %s", "--date=short", cwd=staging,
+                                             group="own").strip()))
         print("adds")
         _show_commands(staging, a.show)
         _unclashed(staging)
         if not a.show:
-            print(ui.c(f"its code runs as you: read it first (pp cmd add {a.url} -n --show)", "yellow"))
+            print(ui.c(f"its code runs as you: read it first (pp cmd add {ui.printable(a.url)} -n --show)",
+                       "yellow"))
         rc = _proceed(a, f"add plugin {name}?")
         if rc is not None:
             return rc
@@ -385,7 +392,8 @@ def cmd_add(argv: list[str]) -> int:
             except OSError as e:          # something outside pp put it there: say so, do not trace back
                 ui.die(f"{name} could not be installed at {dest}: {e}", 1)
             index[name] = {"url": url, "ref": a.ref, "commit": commit, "added": time.time(), "updated": time.time()}
-            print(f"added {name} at {commit[:7]}: " + ", ".join(n for n, _, _ in _commands_in(dest)))
+            print(f"added {name} at {commit[:7]}: "
+                  + ui.printable(", ".join(n for n, _, _ in _commands_in(dest))))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return 0
@@ -485,9 +493,9 @@ def cmd_rm(argv: list[str]) -> int:
     if a.name not in index:
         ui.die(f"no plugin named {a.name} (pp cmd ls)", 2)
     clone, rec = os.path.join(_root(), a.name), index[a.name]
-    print(f"plugin  {a.name}  at {rec['commit'][:7]} from {rec['url']}")
-    print("removes " + (", ".join(n for n, _, _ in _commands_in(clone)) + f"  ({clone})" if os.path.isdir(clone)
-                        else f"its record alone: the clone {clone} is already gone"))
+    print(ui.printable(f"plugin  {a.name}  at {rec['commit'][:7]} from {rec['url']}"))
+    print("removes " + (ui.printable(", ".join(n for n, _, _ in _commands_in(clone))) + f"  ({clone})"
+                        if os.path.isdir(clone) else f"its record alone: the clone {clone} is already gone"))
     rc = _proceed(a, f"remove plugin {a.name}?")
     if rc is not None:
         return rc

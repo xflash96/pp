@@ -245,6 +245,21 @@ class TestWhatGitCanAsk(PluginJourney):
 
 
 class TestReadingAPlugin(PluginJourney):
+    def test_a_commit_subject_cannot_write_lines_onto_the_screen_that_asks(self):
+        """The commit line is git's output, so its subject is the repository author's text. A carriage return
+        in it reaches pp as a newline, and a line of its own on that screen could name a command the plugin
+        does not add, or hide the ones it does."""
+        forged = ("tidy up\radds\r  harmless     A tiny helper  (harmless.py, 4 lines)\r"
+                  "\x1b[33mits code runs as you: read it first\x1b[0m\x1b[8m")
+        msg = self.write("work/subject.txt", forged)
+        self.commit("commands/sly.py", '"""Steals your keys"""\ndef main(argv):\n    return 0\n', "sly")
+        self.sh(f"git commit -q --amend -F {msg}", cwd=self.src)
+        r = self.pp("cmd", "add", self.src, "-n")
+        self.assertNotIn("\x1b", r.stdout)                        # no mode the rest of the screen is drawn in
+        self.assertEqual(r.stdout.count("\nadds\n"), 1)           # one adds block, and pp wrote it
+        self.assertNotIn("harmless", r.stdout.splitlines()[-1])   # the forged line is inside the commit line
+        self.assertIn("sly          Steals your keys", r.stdout)  # what it really adds is still on the screen
+
     def test_a_file_name_of_a_plugins_is_escaped_in_every_listing(self):
         """A command file's name is the plugin author's text too, and it reaches `pp -h` and `pp cmd ls` long
         after the screen that asked about it."""
@@ -254,6 +269,20 @@ class TestReadingAPlugin(PluginJourney):
             out = self.pp(*argv).stdout
             self.assertNotIn("\x1b", out, argv)
             self.assertIn("zb\\x1b[31mad", out, argv)
+
+    def test_a_plugin_whose_file_name_is_not_valid_utf8_is_listed_and_removable(self):
+        """os.listdir hands such a name back with a lone surrogate per byte it could not read, and a UTF-8
+        locale's stdout refuses to encode one. A plugin could bring one, and then `pp -h`, `pp cmd ls` and
+        `pp cmd rm` all raised, so it could be neither read about nor taken off."""
+        self.commit(os.fsdecode(b"commands/ztool\xff.py"),
+                    '"""Odd name"""\ndef main(argv):\n    return 0\n', "odd")
+        env = dict(self.env, PYTHONIOENCODING="utf-8")      # what a UTF-8 locale gives a child: errors strict
+        self.pp("cmd", "add", self.src, "-y", env=env)
+        for argv in ((), ("-h", "--all"), ("cmd", "ls")):
+            out = self.pp(*argv, env=env).stdout
+            self.assertIn("ztool\\udcff", out, argv)
+        self.assertIn("ztool\\udcff", self.pp("cmd", "rm", "tools", "-y", env=env).stdout)
+        self.assertEqual(json.loads(self.read(os.path.join(self.plugins, ".index.json"))), {})
 
     def test_what_a_remote_says_cannot_write_lines_on_the_screen_that_asks(self):
         """git relays the stderr of the helper it talks to a remote through, so an ssh banner is the remote's
