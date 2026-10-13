@@ -833,18 +833,25 @@ def _under(spec: str, root: str) -> str:
     return spec if os.path.isabs(spec) else os.path.join(root, spec)
 
 
-def _from_lines(src: str) -> list[list[str]]:
+def _from_lines(src: str, refusing) -> list[tuple[int, list[str], list[str]]]:
+    """A campaign file read: one (line number, flags, command) per line that is a job.
+
+    A line whose first non-blank character is `#` and a blank line are skipped, and nothing else is: a `#`
+    anywhere else is an ordinary character, so there are no inline comments. Every other line is a job, and
+    one that is refused is refused with its number before anything is queued."""
     try:
         text = sys.stdin.read() if src == "-" else open(paths.expand(src)).read()
     except OSError as e:
         ui.die(f"{_PROG} add --from: {e.strerror}: {src}", 2)
     out = []
     for n, line in enumerate(text.splitlines(), 1):
-        if line.strip() and not line.lstrip().startswith("#"):
-            try:
-                out.append(shlex.split(line))
-            except ValueError as e:
-                ui.die(f"{_PROG} add --from {src}: line {n}: {e}: {line.strip()[:80]}  (nothing was queued)", 2)
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        try:
+            flags, cmd = policy.campaign(line)
+        except ValueError as e:
+            refusing(n)(f"{e}: {_text(line.strip(), 80)}")
+        out.append((n, flags, cmd))
     return out
 
 
@@ -987,38 +994,80 @@ def _given(a, row: policy.Setting):
         ui.die(f"{_PROG}: {row.flag}: {e}", 2)
 
 
-def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
-    cmds = _from_lines(a.from_) if a.from_ else [cmd]
-    if not cmds or not all(cmds):
-        ui.die(f"{_PROG} add: no command. Put it after --  (pp {_PROG} add -- python x.py)", 2)
-    cwd = paths.expand(a.cwd) if a.cwd else os.getcwd()
-    if not os.path.isdir(cwd):
-        ui.die(f"{_PROG} add: no directory {cwd}", 2)
-    # every per-job row, resolved here and nowhere else: the flag, then this project's [queue], then the
-    # queue's table, then the row's own default. What they come to goes on the record, so a config edit
-    # after this never changes the job
-    project, qc = _pcfg(cwd), _qcfg(q)
-    gave = {r.name: policy.resolve(r, _given(a, r), project.gives.get(r.name, policy.NOTSET),
-                                   qc.get(r.name, policy.NOTSET)) for r in JOB_ROWS}
-    if gave["log"]:
-        gave["log"] = _under(gave["log"], project.root or cwd)   # the store fills in its {tag} and its {id}
-    needs = {"slots": 1, **{k: gave[k] for k in ("gpu_gb", "cpu", "mem_gb") if gave[k] is not None},
-             **gave["need"]}
-    why = Resources(q, needs, live=False).check(needs)
-    if why:
-        ui.die(f"{_PROG} add: {why}", 2)
-    owner = session.caller()
-    shell_env = {k: os.environ[k] for k in CAPTURED_ENV if k in os.environ}
-    state = "held" if a.hold else "queued"
-    named = project_name(cwd)
-    records = []
-    for c in cmds:
-        job = {"queue": q, "tag": a.tag, "project": named, "cwd": cwd, "cmd": c, "runner": [],
+# The arguments of one `add`, which are the batch's and no line's of a campaign file: the queue the jobs go
+# to, the file the lines were read from, whether they are parked, and whether a worker starts for them. A
+# line that names one is refused, since a file cannot say it for the jobs of another line.
+OF_THE_BATCH = ("queue", "from_", "hold", "no_start")
+
+
+def cmd_add(a, cmd: list[str], q: str, prepare_job, ap=None) -> int:
+    """Queue one job per command: the one this command line names, or one per line of a campaign file.
+
+    A line of a campaign file is the rest of an `add` command line: its own flags, then `--`, then the
+    command (`jobpolicy.campaign`). Its flags are read by `add`'s own parser, so every flag `add` ever gains
+    works in a campaign file on the day it lands, and a line's own flag wins over the `add`'s own, per flag.
+    A file one line of which is refused queues nothing, not even the lines before it: a half-queued campaign
+    is the one state a plan script cannot see."""
+    def refusing(n: int):
+        """How a refusal of one line names where it came from, and that nothing was queued for it."""
+        where, tail = (f" --from {a.from_}: line {n}", "  (nothing was queued)") if a.from_ else ("", "")
+        return lambda msg: ui.die(f"{_PROG} add{where}: {msg}{tail}", 2)
+
+    def settings(flags: list[str], refuse):
+        """One line's own flags, over the `add`'s: the namespace the job of that line is read from. The
+        parser's own defaults say which flags the line gave, so a flag it did not give stays the `add`'s."""
+        try:
+            got = ap.parse_args(["add", *flags])
+        except SystemExit:
+            refuse("a flag `add` does not take, or a value its row refuses")
+        out = argparse.Namespace(**vars(a))
+        rows = {r.name: r for r in JOB_ROWS + PROJECT_ROWS}
+        for k, v in vars(got).items():
+            if v == getattr(base, k):
+                continue            # the line did not give it
+            if k in OF_THE_BATCH:
+                refuse(f"--{k.rstrip('_').replace('_', '-')} is the `add`'s own and no line's")
+            row = rows.get(k)
+            setattr(out, k, policy.given(row, v, getattr(a, k)) if row else v)
+        return out
+
+    def record(la, c: list[str], refuse) -> dict:
+        """One job, as this line or this command line asked for it. Every per-job row is resolved here and
+        nowhere else: the flag, then this project's [queue], then the queue's table, then the row's own
+        default. What they come to goes on the record, so a config edit after this never changes the job."""
+        cwd = paths.expand(la.cwd) if la.cwd else os.getcwd()
+        if not os.path.isdir(cwd):
+            refuse(f"no directory {cwd}")
+        project = _pcfg(cwd)
+        gave = {r.name: policy.resolve(r, _given(la, r), project.gives.get(r.name, policy.NOTSET),
+                                       qc.get(r.name, policy.NOTSET)) for r in JOB_ROWS}
+        if gave["log"]:
+            gave["log"] = _under(gave["log"], project.root or cwd)   # the store fills in {tag} and {id}
+        needs = {"slots": 1, **{k: gave[k] for k in ("gpu_gb", "cpu", "mem_gb") if gave[k] is not None},
+                 **gave["need"]}
+        why = Resources(q, needs, live=False).check(needs)
+        if why:
+            refuse(why)
+        job = {"queue": q, "tag": la.tag, "project": project_name(cwd), "cwd": cwd, "cmd": c, "runner": [],
                "shell_env": shell_env, "needs": needs, "owner": owner, "attempt": 1,
                **{r.on_record: gave[r.name] for r in JOB_ROWS if r.on_record != "needs"}}
         if prepare_job:
-            prepare_job(job, a, project)
-        records.append(job)
+            prepare_job(job, la, project)
+        return job
+
+    lines = _from_lines(a.from_, refusing) if a.from_ else [(0, [], cmd)]
+    if not lines:
+        ui.die(f"{_PROG} add --from {a.from_}: no command in it", 2)
+    qc, owner = _qcfg(q), session.caller()
+    shell_env = {k: os.environ[k] for k in CAPTURED_ENV if k in os.environ}
+    state = "held" if a.hold else "queued"
+    base = ap.parse_args(["add"]) if ap is not None else a      # what the parser gives a line that gave none
+    records = []
+    for n, flags, c in lines:
+        refuse = refusing(n)
+        if not c:
+            refuse(f"no command. Put it after --  (pp {_PROG} add -- python x.py)")
+        records.append(record(settings(flags, refuse) if flags else a, c, refuse))
     # The records and the ids they were given, whole: a batch lands in one transaction of the store, and the
     # signals that transaction holds back are delivered the moment it ends. They wait for these lines too, so
     # every job pp stored has its id on stdout and a Ctrl-C on a long `--from` file leaves a script the id of
@@ -1026,14 +1075,13 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     with lock.deferring():
         ids = jobcore.add_jobs(records, state)      # n records, n ids, one scope
         for jid, job in zip(ids, records):
-            c = job["cmd"]
             print(jid)
-            extra = " ".join(x for x in (f"timeout {ui.human_duration(gave['timeout'])}" if gave["timeout"] else "",
-                                          f"retries {gave['retries']}" if gave["retries"] else "",
-                                          f"on-fail {gave['on_fail']}" if gave["on_fail"] else "") if x)
+            extra = " ".join(x for x in (f"timeout {ui.human_duration(job['timeout'])}" if job["timeout"] else "",
+                                          f"retries {job['retries']}" if job["retries"] else "",
+                                          f"on-fail {job['on_fail']}" if job["on_fail"] else "") if x)
             via = f"  (via {_text(os.path.basename(job['runner'][0]))})" if job["runner"] else ""
-            print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(named)}] p{gave['prio']} {_needs_str(needs)} {extra}  "
-                  f"{_text(shlex.join(c), 100)}{via}", file=sys.stderr)
+            print(f"pp {_PROG}: {state} {jid} ({q}) [{_text(job['project'])}] p{job['prio']} "
+                  f"{_needs_str(job['needs'])} {extra}  {_text(shlex.join(job['cmd']), 100)}{via}", file=sys.stderr)
     if not a.hold and not a.no_start:
         _worker_up(q, wake=True)
     if owner:     # the pull side: an agent hears the outcome by waiting on it in the background
@@ -1955,7 +2003,8 @@ def _verb(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job,
     if argv[0] == "add" and "--" in argv:
         i = argv.index("--")
         argv, cmd = argv[:i], argv[i + 1:]
-    a = _parser(prog, doc, add_args).parse_args(argv)
+    ap = _parser(prog, doc, add_args)
+    a = ap.parse_args(argv)
     q = getattr(a, "queue", None) or q_top
     if q is not None and (not jobstore.NAME_RE.fullmatch(q) or q in jobstore.RESERVED):
         ui.die(f"{prog}: '{q}' is not a queue name (lowercase letters, digits, - and _; not {' or '.join(jobstore.RESERVED)})", 2)
@@ -1964,9 +2013,11 @@ def _verb(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job,
         jobcore.open_queue(q)       # a queue named with -q is opened once here, whatever the verb does with it
     if a.verb == "add" and cmd and a.cmd:
         ui.die(f"{prog} add: put the whole command after --", 2)
+    if a.verb == "add" and a.from_ and (cmd or a.cmd):
+        ui.die(f"{prog} add: --from reads every command from that file, so this command line carries none", 2)
     # one row per verb: what it is called with is in the row, and nothing else is keyed on a verb's name. The
     # call is held back until the verb is chosen, so a verb's own options are read on that verb's path only
-    verbs = {"add": lambda: cmd_add(a, cmd or a.cmd, q or default_queue, prepare_job),
+    verbs = {"add": lambda: cmd_add(a, cmd or a.cmd, q or default_queue, prepare_job, ap),
              "status": lambda: cmd_status(a, scope), "ls": lambda: cmd_status(a, scope),
              "show": lambda: cmd_show(a), "note": lambda: cmd_note(a), "log": lambda: cmd_log(a),
              "kill": lambda: cmd_kill(a), "reprio": lambda: _reprio(a), "retry": lambda: cmd_retry(a),

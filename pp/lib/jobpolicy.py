@@ -682,6 +682,80 @@ def select(records: list[dict], selection) -> list[int]:
     return out
 
 
+# ---- one line of a campaign file -----------------------------------------------------------------------
+#
+# A line is the rest of an `add` command line: its own flags, then `--`, then the command. It is split into
+# words the way a shell splits them and nothing more: pp expands no variable, no `~` and no glob, because a
+# command is argv and pp grows no shell parser (section 7, R3). A line written for a shell is refused by the
+# operator it holds, so there is no shell syntax to specify and nothing left to respecify later.
+
+OPERATORS = "|&;<>()`"      # the shell's own words; `$(` is the one of two characters, below
+A_SHELL_LINE = ("`{}` is a shell operator, and a command here is argv, not a shell line; quote it to pass it "
+                "as an argument, or use `-- sh -c '...'`")
+
+
+def words_of(line: str) -> tuple[list[str], int]:
+    """One line of a campaign file split the way a shell splits words, with single quotes, double quotes and
+    backslashes honoured and nothing else read.
+
+    A shell operator outside quotes is refused: inside quotes it is an ordinary character, so a command that
+    really wants a pipe is one argument of a shell it starts itself. A quote that is never closed and a line
+    that ends in a backslash are refused the same way, since neither says what the words are.
+    -> the words, and which of them is the first bare `--`, or len(words) where the line holds none. A `--`
+    that was quoted is a word of the command like any other, which is what "bare" says."""
+    out: list[str] = []
+    plain: list[bool] = []      # per word: none of it was quoted or escaped, so a `--` there is bare
+    word, whole, quote, i = None, True, "", 0
+    while i < len(line):
+        c, i = line[i], i + 1
+        if quote:
+            if c == quote:
+                quote = ""
+            elif quote == '"' and c == "\\" and line[i:i + 1] in ('"', "\\"):
+                word, i = (word or "") + line[i], i + 1
+            else:
+                word = (word or "") + c
+            continue
+        if c.isspace():
+            if word is not None:
+                out.append(word)
+                plain.append(whole)
+                word, whole = None, True
+            continue
+        if c in "'\"":
+            word, whole, quote = word or "", False, c
+            continue
+        if c == "\\":
+            if i == len(line):
+                raise ValueError("a line that ends in a backslash, which escapes nothing")
+            word, whole, i = (word or "") + line[i], False, i + 1
+            continue
+        if c == "$" and line[i:i + 1] == "(" or c in OPERATORS:
+            raise ValueError(A_SHELL_LINE.format("$(" if c == "$" else c))
+        word = (word or "") + c
+    if quote:
+        raise ValueError("a quote that is never closed")
+    if word is not None:
+        out.append(word)
+        plain.append(whole)
+    at = next((n for n, w in enumerate(out) if w == "--" and plain[n]), len(out))
+    return out, at
+
+
+def campaign(line: str) -> tuple[list[str], list[str]]:
+    """One line of a campaign file: its own flags, and the command after its first bare `--` word.
+
+    A line with no such word is the whole command, as 0.1.0 read it. A line with no `--` whose first word
+    begins with `-` reads as flags with no command: it is refused rather than queued as a command nobody
+    meant to run."""
+    out, at = words_of(line)
+    if at < len(out):
+        return out[:at], out[at + 1:]
+    if out and out[0].startswith("-"):
+        raise ValueError("flags with no command: put the command after --  (--tag t -- python x.py)")
+    return [], out
+
+
 # ---- what a setting is, how a value of it is read, and the one order of its sources -------------------
 #
 # Every setting a user can give is one row of one declaration (pp/lib/jobq.py, SETTINGS), and a row says its
@@ -796,6 +870,19 @@ def resolve(setting: Setting, flag=NOTSET, project=NOTSET, config=NOTSET):
         if v is not NOTSET:
             return v
     return setting.default
+
+
+def given(setting: Setting, line, flag):
+    """What one row's flag comes to for one line of a campaign file: the line's own word over the `add`'s,
+    which is one source of the row read in two places (section 7).
+
+    So a line's flag wins over the `add`'s, per flag, and `resolve` reads the one value that comes of them
+    as the flag like any other. A flag that may be repeated carries its words in a list, and the two lists
+    are read in order with the line's last, so a table a line adds a key to keeps the `add`'s other keys and
+    wins on the key it names. Everything else is replaced whole."""
+    if setting.repeat and isinstance(line, list) and isinstance(flag, list):
+        return flag + line
+    return line
 
 
 def value(setting: Setting, raw):

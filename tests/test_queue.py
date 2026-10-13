@@ -539,6 +539,58 @@ class TestStore(QueueCase):
         self.assertEqual(jobstore.find(2)["cmd"], ["echo", "two words"])
         self.assertEqual([j["id"] for j in jobq._resolve(["batch"])], [1, 2])
 
+    def plan(self, text: str, name: str = "plan.txt") -> str:
+        """A campaign file of this test's, and its path."""
+        path = self.sb.path(name)
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def test_a_campaign_files_lines_carry_their_own_flags(self):
+        """A line is the rest of an `add` command line: its own flags, then --, then the command. The flags
+        are read by add's own parser, so every per-job row works on a line. A flag on the `add` is the
+        default for every line and a line's own wins over it, per flag; a flag that carries a table merges
+        key by key. A line that is only a command is the whole command, as it always was."""
+        f = self.plan("# the lines this campaign covers\n\n"
+                      "--tag a --prio 1 --env K=line -- ./one.sh\n"
+                      "--timeout 90s -- ./two.sh\n"
+                      "./three.sh\n")
+        rc, out, err = self.call("add", "--no-start", "--cwd", self.work, "--from", f,
+                                 "--prio", "5", "--tag", "fam", "--env", "K=add", "--env", "J=add")
+        self.assertEqual(rc, 0, err)
+        ids = [int(x) for x in out.split()]
+        one, two, three = (jobstore.find(i) for i in ids)
+        self.assertEqual((one["tag"], one["prio"], one["env"]), ("a", 1, {"J": "add", "K": "line"}))
+        self.assertEqual((one["timeout"], one["cmd"]), (None, ["./one.sh"]))
+        self.assertEqual((two["tag"], two["prio"], two["timeout"]), ("fam", 5, 90.0))
+        self.assertEqual((two["env"], two["cmd"]), ({"K": "add", "J": "add"}, ["./two.sh"]))
+        self.assertEqual((three["tag"], three["prio"], three["cmd"]), ("fam", 5, ["./three.sh"]))
+
+    def test_a_file_one_line_of_which_is_refused_queues_nothing(self):
+        """Every refusal of every line names its line number and queues nothing, not even the lines before
+        it: a half-queued campaign is the one state a plan script cannot see. The arguments of the `add`
+        itself are the batch's and no line's, so a line that names one is refused too."""
+        before = sorted(j["id"] for j in jobstore.jobs())
+        bad = ("echo a\necho b > out.txt\n",                # a shell operator outside quotes
+               "echo a\n--timeout soon -- echo b\n",        # a value its row refuses
+               "echo a\n--tag ../x -- echo b\n",            # a name its row refuses
+               "echo a\n--bogus 1 -- echo b\n",             # a flag add does not take
+               "echo a\n--tag t --\n",                      # flags and no command after the --
+               "echo a\n-q other -- echo b\n",              # the queue is the add's
+               "echo a\n--hold -- echo b\n",                # and so is whether the batch is parked
+               "echo a\n--from more.txt -- echo b\n")       # and the file the lines came from
+        for text in bad:
+            with self.subTest(line=text.splitlines()[-1]):
+                rc, out, err = self.call("add", "--no-start", "--cwd", self.work, "--from", self.plan(text))
+                self.assertEqual(rc, 2, out)
+                self.assertIn("line 2", err)
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
+        rc, _out, err = self.call("add", "--no-start", "--cwd", self.work, "--from", self.plan("echo a\n"),
+                                  "--", "echo", "b")
+        self.assertEqual(rc, 2)
+        self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
+
     def test_an_interrupted_batch_names_every_job_it_stored(self):
         """A batch lands in one transaction, and that transaction holds the signals back for its whole length.
         A Ctrl-C in it is raised once it ends, and the ids are on stdout by then: one line per record the store
@@ -3990,6 +4042,69 @@ class TestThePolicyTables(unittest.TestCase):
         self.assertIn("[resources] slots = 3", jobpolicy.check({"slots": 4}, seen))
         self.assertIn("sees no GPU", jobpolicy.check({"gpu_gb": 1}, self.seen(pools, cards=None)))
 
+    # -- campaign: one line of a file, split the way a shell splits words ----------------------------------
+    LINES = (
+        # (the line, its flags, its command) for a line that is a job
+        ("python -m lab.run", [], ["python", "-m", "lab.run"]),
+        ("--tag s3_L00 --gpu-gb 36 -- python -m lab.run --layer 0",
+         ["--tag", "s3_L00", "--gpu-gb", "36"], ["python", "-m", "lab.run", "--layer", "0"]),
+        ("-- python x.py", [], ["python", "x.py"]),                 # a line that is only a command, after --
+        ("echo 'two words'", [], ["echo", "two words"]),
+        ('echo "two words"', [], ["echo", "two words"]),
+        ("echo one\\ word", [], ["echo", "one word"]),
+        ("-- sh -c 'python x.py | grep -v noise'",
+         [], ["sh", "-c", "python x.py | grep -v noise"]),          # a quoted operator is one word
+        ('-- sh -c "a; b"', [], ["sh", "-c", "a; b"]),
+        ("-- echo '--'", [], ["echo", "--"]),                       # a quoted -- is a word of the command
+        ("-- echo a#b", [], ["echo", "a#b"]),                       # a # that does not begin the line
+        ('-- echo "say \\"hi\\""', [], ["echo", 'say "hi"']),
+        ("-- echo ''", [], ["echo", ""]),
+        ("  --tag t  --  python  x.py  ", ["--tag", "t"], ["python", "x.py"]),
+    )
+    REFUSED = (
+        ("./run.sh > out.txt", "shell operator"),
+        ("./run.sh | tee out", "shell operator"),
+        ("./run.sh && ./next.sh", "shell operator"),
+        ("./run.sh; ./next.sh", "shell operator"),
+        ("./run.sh < in.txt", "shell operator"),
+        ("echo $(date)", "shell operator"),
+        ("echo `date`", "shell operator"),
+        ("echo (a)", "shell operator"),
+        ('echo "unclosed', "never closed"),
+        ("echo one\\", "backslash"),
+        ("--tag s3_L00 --gpu-gb 36", "no command"),                 # flags with no --, so no command
+    )
+
+    def test_what_one_line_of_a_campaign_file_is(self):
+        """A line is the rest of an `add` command line: its own flags, then the first bare `--`, then the
+        command. It is split the way a shell splits words, with single quotes, double quotes and backslashes
+        honoured and nothing else read, so a command is argv and pp expands no variable, no `~` and no glob.
+
+        A shell operator outside quotes is refused, because a line holding one was written for a shell;
+        inside quotes it is an ordinary character. A quote that is never closed, a line that ends in a
+        backslash, and a line with no `--` whose first word begins with `-` are refused the same way."""
+        for line, flags, cmd in self.LINES:
+            with self.subTest(line=line):
+                self.assertEqual(jobpolicy.campaign(line), (flags, cmd))
+        for line, word in self.REFUSED:
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError) as caught:
+                    jobpolicy.campaign(line)
+                self.assertIn(word, str(caught.exception))
+
+    def test_a_lines_own_flag_wins_over_the_adds(self):
+        """One source of a row read in two places: a line's own word over the `add`'s, per flag. A flag that
+        may be repeated carries a list, and the two are read in order with the line's last, so a table a
+        line adds a key to keeps the `add`'s other keys and wins on the key it names."""
+        prio = jobq.BY_SCOPE["job"]["prio"]
+        env = jobq.BY_SCOPE["job"]["env"]
+        self.assertEqual(jobpolicy.given(prio, 0, 1), 0)
+        self.assertEqual(jobpolicy.given(prio, 0, jobpolicy.NOTSET), 0)
+        self.assertEqual(jobpolicy.given(env, ["A=line"], ["A=add", "B=add"]), ["A=add", "B=add", "A=line"])
+        self.assertEqual(jobpolicy.pairs(jobpolicy.given(env, ["A=line"], ["A=add", "B=add"])),
+                         {"A": "line", "B": "add"})
+        self.assertEqual(jobpolicy.given(env, ["A=line"], None), ["A=line"])
+
     def test_every_rule_gives_the_same_answer_twice_and_changes_nothing(self):
         """Pure: the records and the readings a rule is handed come back as they were, and the same input
         twice gives the same value. So a table is the whole of the rule."""
@@ -4914,11 +5029,16 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         real, wrote = jobcore.Worker._stop, []
 
         def the_code_lands_as_the_command_starts(wk, job, cmd):
-            # a file's timestamp is coarser than the clock a stop is recorded with, so the code lands a
-            # moment into the window instead of at its first instant. What puts it inside is the step.
-            time.sleep(0.05)
-            with open(job["rcfile"], "w") as f:
-                f.write("137\n")
+            at = time.time()        # inside the window: the stop's own time was read before this call
+
+            def written():
+                """The code, under a timestamp the file system reports as at or past `at`. A file's
+                timestamp is coarser than the clock, so this is what makes the file say what the step
+                already decided: the code was written after the stop's own time was read."""
+                with open(job["rcfile"], "w") as f:
+                    f.write("137\n")
+                return os.stat(job["rcfile"]).st_mtime >= at
+            journey.until(written, timeout=10, every=0.01, what="an exit code timed inside the window")
             wrote.append(os.stat(job["rcfile"]).st_mtime)
             return real(wk, job, cmd)
         self.a_kill_asks(j, grace=60.0)

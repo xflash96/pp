@@ -1122,7 +1122,6 @@ class TestTheProjectUnderARealRunner(TestTheProject):
 class TestTheCampaign(Lab):
     """Steps 7 and 8: a grid through a campaign file, and a stage that waits for the stage before it."""
 
-    @unittest.expectedFailure
     def test_a_campaign_file_queues_every_line_or_none(self):
         """A campaign file queues one job per line, every line carrying its own flags. The ids come out on
         stdout in order, one per line. A flag on the `add` is the default for every line and a line's own flag
