@@ -273,13 +273,11 @@ def _main(argv: list[str]) -> int:
         print(help_text(cmds, show_all="--all" in argv))
         return 0
     if argv[0] == "--commands":      # for shell completion: name<TAB>summary, aliases included
-        for c in sorted(cmds.values(), key=lambda c: c.name):
-            if not c.error:
-                for n in (c.name, *c.aliases):
-                    print(f"{n}\t{c.summary}")
+        _for_a_shell([[n, c.summary] for c in sorted(cmds.values(), key=lambda c: c.name) if not c.error
+                      for n in (c.name, *c.aliases)])
         return 0
     if argv[0] == "--complete":      # for shell completion: candidates for the last of the words after `pp`
-        print("\n".join(complete(argv[1:], cmds)))
+        _for_a_shell([[cand] for cand in complete(argv[1:], cmds)])
         return 0
     if argv[0] in ("-V", "--version"):
         print(f"pp {__version__} ({paths.pp_root()})")
@@ -300,6 +298,20 @@ def _main(argv: list[str]) -> int:
 # argparse's option lines. No command carries completion code, and commands of every origin complete the same way. Only built-in
 # commands are run (with --help, output captured); a plugin's docstring is read without running anything, since
 # pressing TAB must never execute someone's half-written script.
+
+
+def _for_a_shell(rows: list[list[str]]) -> None:
+    """What `--commands` and `--complete` hand a completion script: one record a line, its fields separated by
+    a tab, each field escaped with tabs off. So a name is one field of one record whatever it holds, and a
+    name no terminal can print (a byte that is not valid UTF-8) is printed as the escape of that byte rather
+    than raising where a shell reads it with its errors hidden.
+
+    Nothing at all is printed for no records: a shell reads an empty line as one empty candidate, and
+    `pp queue add -- <TAB>` would complete that instead of the file names it falls back to. The script the
+    shell runs is in pp/commands/completion.py, and it reads these lines as data: it never lets the shell
+    expand a candidate, since a command's name is any file name."""
+    if rows:
+        print("\n".join("\t".join(ui.printable(f, tabs=False) for f in r) for r in rows))
 
 
 def _help_of(cmd: Command, argv: list[str]) -> str:

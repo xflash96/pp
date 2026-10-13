@@ -343,6 +343,41 @@ for line in "$@"; do
 done
 '''
 
+BASH_TAB_DRIVER = r'''source <(pp completion bash)
+# the same, and then what pressing Enter would do: readline leaves the candidate on the command line as the
+# shell's own source, so each one is read back here the way the shell reads a command line, word by word
+for line in "$@"; do
+  read -ra COMP_WORDS <<< "$line"
+  [[ $line == *" " ]] && COMP_WORDS+=("")
+  COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+  _pp
+  echo "REPLY|$line|${COMPREPLY[*]}"
+  for rep in "${COMPREPLY[@]}"; do eval "printf 'WORD|%s\n' $rep"; done
+done
+'''
+
+
+ZSH_TAB_DRIVER = r'''# types $2 + TAB into an interactive zsh with pp's completion, and waits for $1 on the screen.
+# The line is never run: what the candidates are is the whole point, and running the line would be the driver
+# doing the thing the test says nothing does.
+zmodload zsh/zpty
+zpty z "zsh -f -i"
+buf=""
+upto() {      # read until the screen holds $1; a driver that waited forever would fail no test
+  local chunk i=0
+  while [[ $buf != *"$1"* ]]; do
+    if zpty -r -t z chunk; then buf+=$chunk; i=0; else sleep 0.05; (( ++i > 300 )) && { print "TIMEOUT: $1"; exit 1 } fi
+  done
+}
+zpty -w z 'bindkey -e; PS1="RE""ADY> "; autoload -U compinit; compinit -u -D; source <(pp completion zsh)'
+upto "READY> "
+zpty -w -n z "$2"$'\t'
+upto "$1"
+zpty -d z
+print -r -- "SAW: $1"
+'''
+
+
 ZSH_DRIVER = r'''# types each argument + TAB into an interactive zsh with pp's completion, then prints "LINE: <the line>"
 zmodload zsh/zpty
 zpty z "zsh -f -i"
@@ -399,6 +434,64 @@ class TestCompletion(Journey):
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "imported")), "TAB ran a plugin")
         self.assertEqual(files_under(os.path.join(self.home, ".local")) if os.path.isdir(
             os.path.join(self.home, ".local")) else [], [], "completion created state")
+
+    # Names a shell reads as code if anything ever expands one, or as another name if anything reads one of
+    # their characters as its own: a command's name is any file name ending in .py, and a plugin brings the
+    # file. The last is not valid UTF-8, which is a file name too.
+    HOSTILE = ("zz$(touch pwned1)a", "zz`touch pwned2`b", "zz spaced", "zz*glob", "zzq\"uote", "zzbs\\lash")
+    SHOWN = list(HOSTILE) + ["zz\\udcffbyte"]       # each as pp offers it, escaped where it has to be
+
+    def plant_hostile_names(self) -> None:
+        for name in list(self.HOSTILE) + [os.fsdecode(b"zz\xffbyte")]:
+            self.write(f"home/.config/pp/commands/{name}.py",
+                       '"""Innocent looking"""\ndef main(argv):\n    return 0\n')
+
+    def test_what_bash_leaves_on_the_command_line_is_the_name_and_nothing_to_run(self):
+        """TAB must never run anyone's code, which is why a plugin's docstring is read without importing it.
+        A candidate is as much someone else's text, and the line TAB leaves behind is the shell's own source,
+        which Enter is what reads: each candidate goes onto it quoted, so a `$(...)` in a command file's name
+        is the name you completed rather than a command run as you on the next Enter, and a name holding a
+        space, a quote or a backslash still names the command it is."""
+        self.plant_hostile_names()
+        # errors="replace": what pp hands the shell is escaped, and a byte that got through unescaped is this
+        # test's answer to read, not an exception in the middle of reading it
+        r = subprocess.run(["bash", "--norc", "-c", BASH_TAB_DRIVER, "driver", "pp zz", "pp "],
+                           capture_output=True, text=True, errors="replace", cwd=self.work, env=self.env,
+                           timeout=60)
+        self.assertEqual(files_under(self.work), ["notes file.txt"], f"TAB ran a name: {r.stdout}{r.stderr}")
+        said = r.stdout.splitlines()
+        got = dict(ln.removeprefix("REPLY|").split("|", 1) for ln in said if ln.startswith("REPLY|"))
+        words = [ln.removeprefix("WORD|") for ln in said if ln.startswith("WORD|")]
+        for name in self.SHOWN:
+            self.assertIn(name, words, (name, r.stdout, r.stderr))      # one word, and the name it was
+        self.assertNotIn("$(", got["pp zz"], r.stdout)                  # nothing is left for Enter to expand
+        for cmd in BUILTINS:
+            self.assertIn(cmd, got["pp "].split())
+
+    @unittest.skipUnless(shutil.which("zsh"), "no zsh")
+    def test_zsh_expands_no_candidate_on_tab(self):
+        """The same TAB in the other shell's line editor, where the candidates go to compadd. The screen
+        showing the last of them is how the test knows they all reached it."""
+        self.plant_hostile_names()
+        env = {k: v for k, v in self.env.items() if k not in ("EDITOR", "VISUAL")}
+        r = subprocess.run(["zsh", "-f", "-c", ZSH_TAB_DRIVER, "driver", "zz*glob", "pp zz"], capture_output=True,
+                           text=True, cwd=self.work, env=env, timeout=60)
+        self.assertEqual(r.stdout.strip(), "SAW: zz*glob", (r.stdout, r.stderr))
+        self.assertEqual(files_under(self.work), ["notes file.txt"], f"TAB ran a name: {r.stdout}{r.stderr}")
+
+    @unittest.skipUnless(shutil.which("zsh"), "no zsh")
+    def test_what_zsh_leaves_on_the_command_line_is_the_name_itself(self):
+        """zsh quotes what it inserts, so nothing in a name is run there. What the first word's candidates go
+        through is _describe, whose spec reads a backslash in a name as the escape of the character after it,
+        so a name holding one is escaped for that spec. The driver reads the line back as the shell reads it,
+        which is the name the user would have run."""
+        self.plant_hostile_names()
+        env = {k: v for k, v in self.env.items() if k not in ("EDITOR", "VISUAL")}
+        r = subprocess.run(["zsh", "-f", "-c", ZSH_DRIVER, "driver", "pp zzbs"], capture_output=True, text=True,
+                           cwd=self.work, env=env, timeout=60)
+        self.assertEqual([ln.removeprefix("LINE: ").strip() for ln in r.stdout.splitlines()],
+                         ["pp zzbs\\lash"], (r.stdout, r.stderr))
+        self.assertEqual(files_under(self.work), ["notes file.txt"], f"TAB ran a name: {r.stdout}{r.stderr}")
 
     @unittest.skipUnless(shutil.which("zsh"), "no zsh")
     @needs("queue", "promote", "kill")

@@ -82,7 +82,7 @@ class TestCli(unittest.TestCase):
         esc = "zbad\x1b[31mRED"
         self.write(f"plug/{esc}.py", '"""Fine one"""\ndef main(argv):\n    pass\n')
         self.write(f"plug/{esc}2.py", '"""No main here"""\n')          # the broken table prints its own rows
-        for argv in ((), ("-h", "--all"), ("cmd", "ls")):
+        for argv in ((), ("-h", "--all"), ("cmd", "ls"), ("--commands",), ("--complete", "zbad")):
             out = self.pp(*argv).stdout
             self.assertNotIn("\x1b", out, argv)
             self.assertIn("zbad\\x1b[31mRED", out, argv)
@@ -114,10 +114,17 @@ class TestCli(unittest.TestCase):
         self.env["PYTHONIOENCODING"] = "utf-8"          # what a UTF-8 locale gives a child: errors strict
         name = os.fsdecode(b"ztool\xff")
         self.write(f"plug/{name}.py", '"""Odd name"""\ndef main(argv):\n    return 0\n')
-        for argv in ((), ("-h", "--all"), ("cmd", "ls")):
+        for argv in ((), ("-h", "--all"), ("cmd", "ls"), ("--commands",), ("--complete", ""),
+                     ("--complete", "z")):
             r = self.pp(*argv)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("ztool\\udcff", r.stdout, argv)
+
+    def test_no_candidate_is_no_line_at_all(self):
+        """A completion script reads these lines as data: with mapfile an empty line is one empty candidate,
+        which `pp queue add -- <TAB>` would complete instead of falling back to file names."""
+        self.assertEqual(self.pp("--complete", "kill", "--", "x").stdout, "")
+        self.assertEqual(self.pp("--complete", "nosuch", "x").stdout, "")
 
     def test_help_subcommand(self):
         r = self.pp("help", "kill")
