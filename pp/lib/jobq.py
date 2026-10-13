@@ -1046,6 +1046,8 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job, ap) -> int:
             got = ap.parse_args(["add", *flags])
         except SystemExit:
             refuse("a flag `add` does not take, or a value its row refuses")
+        if got.cmd:
+            refuse(f"'{_text(got.cmd[0], 40)}' is before the -- and is no flag; the command goes after it")
         out = argparse.Namespace(**vars(a))
         rows = {r.name: r for r in JOB_ROWS + PROJECT_ROWS}
         for k, v in vars(got).items():

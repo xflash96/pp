@@ -577,6 +577,7 @@ class TestStore(QueueCase):
                "echo a\n--tag ../x -- echo b\n",            # a name its row refuses
                "echo a\n--bogus 1 -- echo b\n",             # a flag add does not take
                "echo a\n--tag t --\n",                      # flags and no command after the --
+               "echo a\n--tag t oops -- echo b\n",          # a word before the -- that is no flag
                "echo a\n-q other -- echo b\n",              # the queue is the add's
                "echo a\n--hold -- echo b\n",                # and so is whether the batch is parked
                "echo a\n--from more.txt -- echo b\n")       # and the file the lines came from

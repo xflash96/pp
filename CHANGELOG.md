@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+`pp queue`: a campaign file carries one job's flags per line, and a job can
+wait for the jobs it names.
+
+- A line of a `--from` file is the rest of an `add` command line: its own
+  flags, then `--`, then the command. A flag on the `add` is the default for
+  every line and a line's own flag wins over it; `--env` and `--need` merge
+  key by key. A line that is only a command behaves as before.
+- A line is split into words the way a shell splits them, with quotes and
+  backslashes honoured. A line holding `|`, `&`, `;`, `<`, `>`, `(`, `)`,
+  `` ` `` or `$(` outside quotes is refused with its line number, and so is a
+  line with no `--` whose first word begins with `-`. A file one line of
+  which is refused queues nothing. A command that wants a shell operator
+  passes it quoted: `-- sh -c 'python x.py | grep -v noise'`.
+- `--from FILE` together with a command on the same command line is a usage
+  error, and so is a line that names the queue, the file, `--hold` or
+  `--no-start`, which are the batch's and no line's.
+- `--after SELECTION` on `add`: the job waits until every job that selection
+  named has ended, whatever the outcome. The value is one or more selections
+  separated by commas (`41,42`, `41-66`, `s1_eval,s1_report`), read as the
+  job is added and kept as ids on the record. An id no job has is a usage
+  error and nothing is queued. A job that is waiting is skipped rather than
+  waited for, so it never becomes the head of its queue, and a job whose
+  record is gone counts as ended.
+- `pp queue retry` over a range, a tag, a prefix or `--all` shows a plan and
+  asks, as `kill` and `drop` do; `-n` shows the plan and `-y` does not ask.
+  A job that succeeded has ended, so it suits `retry`. The new job is owned
+  by the session that asked for it, and a priority is set with
+  `pp queue reprio` on the job the retry queued.
+- A bare `pp queue wait` waits for every job that is queued or running
+  instead of returning at the first outcome. It names no held job; a
+  selection that names one waits for it and says so. `--timeout` is honoured
+  whatever `--poll` is.
+- `show --json` carries every promised field on a job in each of the five
+  states: a field the record does not hold yet is null, or an empty list.
+  `after` is there on a job that names the jobs it waits for.
+- A worker that adopts a running job takes the offset its output begins at
+  from the job's own run claim, so `--retry-if` reads that attempt's lines
+  and never pp's own line.
+- An exit code an attempt wrote while a stop of it was going out is that
+  stop's outcome, with the code kept as `rc`.
+
 `pp queue`: every setting has one declaration, one default and one order of
 its sources.
 
