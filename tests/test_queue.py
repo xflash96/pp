@@ -3589,7 +3589,7 @@ class TestThePolicyTables(unittest.TestCase):
                                     lines = [ln for ln in text.splitlines() if ln]
                                     want = [f"{k}={v}" for k, v in {**project, **own}.items()]
                                     want += [f"CUDA_VISIBLE_DEVICES={','.join(map(str, cards))}"] if cards else []
-                                    want += [f"PP_QUEUE=dl", "PP_QUEUE_JOB=5"]
+                                    want += ["PP_QUEUE=dl", "PP_QUEUE_JOB=5"]
                                     want += [f"PP_QUEUE_CONTAINER={container}"] if container else []
                                     self.assertEqual(lines, [ln for ln in want
                                                              if ln.split("=")[0] not in jobpolicy.NEVER_IN_ENVFILE])

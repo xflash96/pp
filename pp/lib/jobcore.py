@@ -35,7 +35,6 @@ import signal
 import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime
 
 from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, session
