@@ -718,6 +718,39 @@ class TestWorker(QueueCase):
                           new["on_fail"], new["attempt"], new["queue"]),
                          ("queued", ["sh", "-c", "exit 1"], 4, j, "flaky", 3600, "true", 1, "default"))
 
+    def test_a_retry_over_a_selection_shows_its_plan_and_asks(self):
+        """A selection naming more than one job is shown first and asked about, as a kill and a drop are. -n
+        only shows the plan, no terminal to ask at refuses, and -y goes ahead. A job that succeeded has
+        ended, so it suits retry and a family's finished runs are re-queued with its failed ones."""
+        ok, bad = self.add(cmd="true"), self.add(cmd="exit 1")
+        held = self.add("--hold", cmd="true")
+        w = jobq.worker_for("default")
+        self.run_until(w, lambda: self.state(ok) == "done" and self.state(bad) == "failed")
+        before = sorted(j["id"] for j in jobstore.jobs())
+        rc, out, _ = self.call("retry", f"{ok}-{held}", "-n", "--no-start")
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)      # only the plan
+        with mock.patch("sys.stdin", io.StringIO()):         # nothing to ask at, so nothing is re-queued
+            rc, _out, _err = self.call("retry", f"{ok}-{held}", "--no-start")
+        self.assertEqual(rc, 2)
+        self.assertEqual(sorted(j["id"] for j in jobstore.jobs()), before)
+        rc, _out, err = self.call("retry", f"{ok}-{held}", "-y", "--no-start")
+        self.assertEqual(rc, 0, err)
+        new = sorted(set(j["id"] for j in jobstore.jobs()) - set(before))
+        self.assertEqual([jobstore.find(i)["retry_of"] for i in new], [ok, bad])
+        self.assertEqual(self.state(held), "held")      # the one the verb does not suit is left as it is
+
+    def test_a_retry_is_owned_by_the_session_that_asked_for_it(self):
+        """The new job is this session's, not the session's that queued the job it repeats, so `wait --mine`
+        in the session that asked for the retry hears how it ends."""
+        j = self.add(cmd="exit 1")
+        self.run_until(jobq.worker_for("default"), lambda: self.state(j) == "failed")
+        self.assertIsNone(jobstore.find(j)["owner"])
+        self.sb.as_session("sess-retry")
+        rc, out, err = self.call("retry", str(j), "--no-start")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(jobstore.find(int(out.split()[0]))["owner"]["session"], "sess-retry")
+
     def test_drop_and_clean(self):
         q = self.add(cmd="true")
         self.assertEqual(self.call("drop", str(q))[0], 0)

@@ -1506,30 +1506,41 @@ def _reprio(a) -> int:
 
 
 # What a retry copies onto the new job: what names the work, and every per-job setting the record holds, from
-# the one declaration. So a row that lands on a record is carried over without a second list saying so.
-CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "stop_cmd", "shell_env", "owner") \
+# the one declaration. So a row that lands on a record is carried over without a second list saying so. The
+# owner is not carried: the session that asks for the retry owns the job it queues, so `wait --mine` covers it.
+CARRY = ("queue", "tag", "project", "cwd", "cmd", "runner", "stop_cmd", "shell_env") \
     + tuple(dict.fromkeys(r.on_record for r in JOB_ROWS))
 
 
 def cmd_retry(a) -> int:
-    started, rc, skipped = set(), 0, []
-    for j in _named(a, "retry"):
+    """Re-queue each ended job the selection named as a new job of the same work, with a new id.
+
+    A job that succeeded has ended, so it suits `retry` and a selection over a family re-queues the finished
+    runs with the failed ones. That is what the plan is for: a selection naming more than one job is shown
+    and asked about, as `kill` and `drop` are, and `-n` is the form to type first. There is no selection by
+    outcome; the recovery for the rest is to re-run the plan that writes the campaign file.
+
+    The new job carries everything but the outcome, and its owner is the session asking for it, so that
+    session hears how it ends."""
+    started, rc = set(), 0
+    jobs = _named(a, "retry")
+    go = _gate(a, jobs, "retry", jobstore.ENDED)
+    if go is not None:
+        return go
+    owner = session.caller()
+    for j in jobs:
         if j["state"] not in jobstore.ENDED and j["_bulk"]:
-            skipped.append(j)
-            continue
+            continue        # listed by _gate
         if j["state"] not in jobstore.ENDED:
             ui.warn(f"{_PROG}: job {j['id']} is {j['state']}; retry re-queues ended jobs")
             rc = 2
             continue
         new = {k: j[k] for k in CARRY if k in j}
-        new.update(retry_of=j["id"], attempt=1)
-        if a.prio is not None:
-            new["prio"] = a.prio
+        new.update(retry_of=j["id"], attempt=1, owner=owner)
         jid = jobcore.add_jobs([new], "queued")[0]
         print(jid)
         print(f"pp {_PROG}: retry of {j['id']} queued as {jid} ({j['queue']})", file=sys.stderr)
         started.add(j["queue"])
-    _left(skipped)
     if not a.no_start:
         for q in sorted(started):
             _worker_up(q, wake=True)
@@ -1882,7 +1893,8 @@ def _parser(prog: str, doc: str, add_args=None):
     p = sp("retry", help="re-queue ended jobs as new jobs")
     p.add_argument("ids", nargs="*", metavar="ID")
     _selectors(p)
-    p.add_argument("--prio", type=int)
+    p.add_argument("-n", "--dry-run", action="store_true", help="only show which jobs it would re-queue")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask about a range or a shared tag")
     p.add_argument("--no-start", action="store_true")
     p = sp("clean", help="remove ended job records, with the logs that belong to them")
     p.add_argument("ids", nargs="*", metavar="ID")
