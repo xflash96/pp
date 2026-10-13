@@ -1750,6 +1750,30 @@ class TestStatusWait(QueueCase):
         self.assertLess(time.time() - t, 3)
         self.assertIn("timeout", err)
 
+    def test_a_timeout_is_honoured_whatever_the_poll_is(self):
+        """A poll longer than the timeout is still a wait that gives up at its timeout: the look after the
+        deadline comes at the deadline and not a poll period later."""
+        q = self.add(cmd="true")
+        t = time.time()
+        rc, _, err = self.call("wait", str(q), "--no-start", "--timeout", "0.3", "--poll", "60")
+        self.assertEqual((rc, "timeout" in err), (3, True))
+        self.assertLess(time.time() - t, 20)
+
+    def test_a_bare_wait_covers_every_job_that_is_queued_or_running(self):
+        """A bare wait waits for all of them, so a script that waits for what it queued is not told the first
+        outcome with the rest still to come. It names no held job: a selection is what asks for a job, and a
+        bare wait names none, so a parked stage does not hold it forever."""
+        self.config("slots = 1")
+        first = self.add(cmd="true")
+        second = self.add(cmd="exit 5")
+        held = self.add("--hold", cmd="true")
+        self.sb.ticker(jobq.worker_for("default").tick)
+        rc, out, err = self.call("wait", "--no-start", "--poll", "0.05", "--timeout", "20")
+        self.assertEqual(rc, 1, out + err)                  # the second one failed, and it was waited for
+        self.assertEqual((self.state(first), self.state(second)), ("done", "failed"))
+        self.assertEqual(self.state(held), "held")          # never named, so never waited for
+        self.assertNotIn(str(held), out + err)
+
     def test_nothing_to_wait_for(self):
         self.assertEqual(self.call("wait", "--no-start")[0], 0)
         self.assertEqual(self.call("wait", "--idle", "--no-start")[0], 0)

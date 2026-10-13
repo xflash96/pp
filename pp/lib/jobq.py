@@ -1590,8 +1590,18 @@ def _event(prev: dict | None, j: dict | None, jid: int) -> str | None:
 
 
 def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
-    """wait: block until jobs end, then print their outcomes. watch (stream): a line per event as it happens.
-    Both hold a watcher lease while they run (`show` lists it) and stamp each outcome they print on the job."""
+    """wait: block until every job it named has ended, then print their outcomes. watch (stream): a line per
+    event as it happens. Both hold a watcher lease while they run (`show` lists it) and stamp each outcome
+    they print on the job.
+
+    Four forms, and what each one names: a selection; nothing, which is every job that is queued or running;
+    --idle, which is until nothing is queued or running; and --mine, which is this session's live jobs and
+    the outcomes it never heard. A selection together with --idle or --mine is a usage error, since those two
+    are the selection.
+
+    A held job is not ended, so a wait that named one waits for it and says so in one line. The two forms
+    that name no job name none held either: a bare wait takes the jobs that are queued or running, and
+    --idle counts those two states, so a parked stage leaves neither waiting forever."""
     verb = "watch" if stream else "wait"
     specs = _specs(a)
     if specs and (a.idle or a.mine):
@@ -1604,6 +1614,12 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
 
     def timed_out():
         return a.timeout is not None and time.time() - t0 >= a.timeout
+
+    def until_the_next_look():
+        """How long before the next pass: the poll, or what is left of the --timeout where that is less. So a
+        --timeout is honoured whatever the --poll is, and a long poll never waits a deadline out."""
+        left = a.poll if a.timeout is None else a.timeout - (time.time() - t0)
+        return max(min(a.poll, left), 0.0)
 
     def footer():
         here = jobcore.jobs(jobstore.LIVE, scope)       # one listing: the three counts are the same jobs
@@ -1640,14 +1656,14 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                 if timed_out():
                     print(f"[{_PROG} {verb}] timeout after {a.timeout:g}s", file=sys.stderr)
                     return 3
-                time.sleep(a.poll)
+                time.sleep(until_the_next_look())
             for j in sorted(ended, key=lambda j: j["id"]):
                 if j["id"] not in told:
                     tell(j, j["id"])
         footer()
         return 1 if any(j["state"] == "failed" for j in ended) else 0
     if specs:
-        targets, need_all = [j["id"] for j in _resolve(specs, scope)], True
+        targets = [j["id"] for j in _resolve(specs, scope)]
     elif a.mine:
         me = session.caller()
         if not me:
@@ -1663,12 +1679,14 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         here = jobcore.jobs(queue=scope)
         targets = [j["id"] for j in here if j["state"] in jobstore.LIVE and mine(j)] \
             + [j["id"] for j in here if j["state"] in jobstore.ENDED and mine(j) and unheard(j)]
-        need_all = True
         if not targets:
             say("nothing of this session's is queued, held or running, and every outcome was reported to it")
             return 0
     else:
-        targets, need_all = [j["id"] for j in jobcore.jobs(("queued", "running"), scope)], False
+        # a bare wait: every job that is queued or running, and all of them, so a script that waits for
+        # what it queued is not told the first outcome and left with the rest still to come. A held job is
+        # named by no selection here, so none is waited for: a parked stage is normal
+        targets = [j["id"] for j in jobcore.jobs(("queued", "running"), scope)]
         if not targets:
             say("nothing queued or running")
             return 0
@@ -1695,7 +1713,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                         tell(cur[t], t)
                 prev = {t: j for t, j in cur.items() if j}
             ended = {t: j for t, j in cur.items() if j is None or j["state"] in jobstore.ENDED}
-            if ended and (len(ended) == len(targets) or not need_all):
+            if len(ended) == len(targets):
                 for t in sorted(ended):
                     if t not in told:
                         tell(ended[t], t)
@@ -1716,7 +1734,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
                 print(f"[{_PROG} {verb}] timeout after {a.timeout:g}s: {len(targets) - len(ended)} of {len(targets)} not ended",
                       file=sys.stderr)
                 return 3
-            time.sleep(a.poll)
+            time.sleep(until_the_next_look())
 
 
 def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | None) -> int:
