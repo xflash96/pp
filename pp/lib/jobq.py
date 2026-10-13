@@ -1432,7 +1432,9 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
     stop = cur.get("stop") or {}
     if not stop.get("sent"):
         print(f"job {jid} had already ended: {_ended_line(cur, jid)}")
-    elif cur.get("rc") is not None:
+    elif not cur.get("reason"):
+        # the reason on the record says whose outcome this is: an exit code the attempt wrote after the stop
+        # went out is that stop's outcome, with the code kept as `rc`, so a code alone names nobody
         print(f"job {jid} ended on its own as it was being killed: {_ended_line(cur, jid)}")
     else:
         # the grace on the record, which is the shorter of every ask (`jobpolicy.merge_stop`) and the one the SIGKILL

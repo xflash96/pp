@@ -844,6 +844,28 @@ class TestWorker(QueueCase):
         self.assertEqual(jobstore.find(j)["reason"], "killed")
         journey.until(lambda: not any(proc.alive(k) for k in kids), timeout=5, what="its group to be clear")
 
+    def test_a_kill_whose_stop_command_ended_the_job_reports_that_stop(self):
+        """A kill reports the outcome recorded for the job. The project's stop command ends what the runner
+        started, and the attempt writes the code of the work that stop ended, so the code is kept as `rc`
+        and the stop is the reason: the job did not end on its own, and the kill says the stop it achieved."""
+        gate = os.path.join(self.work, "the-stop-command-ran")
+        j = self.add(cmd=f"while [ ! -f {gate} ]; do sleep 0.02; done; exit 137")
+        w = jobq.worker_for("default")
+        w.tick()
+        with jobstore.txn() as s:       # the project's command, which ends the work and leaves the code 137
+            cur = s.job(j, must_be=("running",))
+            # it asks the work to end a beat later, as a command that waits for a container to stop does, so
+            # the code the attempt writes lands after the stop went out by more than a file time can differ by
+            cur["stop_cmd"] = f"sleep 0.2; : > {gate}"
+            s.save(cur)
+        self.worker_beside(w)
+        rc, out, err = self.call("kill", str(j), "--grace", "60")
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["reason"], rec["rc"]), ("failed", "killed", 137))
+        self.assertIsNotNone(rec["stop"]["sent"])
+        self.assertIsNone(rec["stop"].get("kill9"))         # it ended inside its grace, on that stop
+        self.assertEqual((rc, out.split()[:2]), (0, ["killed", str(j)]), err)
+
     def test_a_run_is_live_until_its_worker_reaps_it(self):
         """A dying process closes its files, the run claim among them, before its parent can read how it
         ended. So a tick can find the claim free and the wrapper not yet reapable: the run is still live then,
