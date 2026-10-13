@@ -478,6 +478,23 @@ class TestSelections(QueueJourney):
         self.assertIn(f"dropped {b}", r.stdout)
         self.assertEqual(self.state(a), "held")
 
+    def test_clean_takes_a_selection_as_well_as_an_age(self):
+        """`clean` takes the same five forms as every other verb that takes jobs, beside `--older AGE`: it
+        removes the ended jobs the selection named, leaves the ones it does not suit as they are, and refuses
+        a job named by its own id that has not ended."""
+        a, b = self.add("--tag", "c3_a", "--", "true"), self.add("--tag", "c3_b", "--", "true")
+        live = self.add("--tag", "c3_live", "--", "sleep", "30")
+        self.wait(a, b)
+        self.until(lambda: self.state(live) == "running", what=f"job {live} running")
+        r = self.pp("queue", "clean", "--prefix", "c3_", "-n")
+        self.assertIn("2 ended job record(s)", r.stdout)
+        self.assertIn(f"job {live} is running", self.pp("queue", "clean", live, code=2).stderr)
+        self.pp("queue", "clean", "--prefix", "c3_", "-y")
+        for jid in (a, b):
+            self.pp("queue", "show", jid, code=2)
+        self.assertEqual(self.state(live), "running")
+        self.pp("queue", "kill", live)
+
     def test_release_over_a_selection_starts_one_worker(self):
         ids = [self.add("--hold", "--tag", "batch3", "--", "true") for _ in range(3)]
         r = self.pp("queue", "release", "batch3")

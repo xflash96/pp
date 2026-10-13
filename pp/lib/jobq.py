@@ -877,8 +877,8 @@ def _section(rows: list[list], tag: int, width: int) -> list[str]:
 
     That column holds the job's own name, or its command where it has none, so it is the column with
     something to give; the rest of a row is pp's own, and a row whose other columns alone are wider than the
-    terminal keeps eight characters of it and runs past the edge. Empty cells at the end of a row are left out, so no
-    row ends in the padding of a column nothing filled."""
+    terminal keeps eight characters of it and runs past the edge. Empty cells at the end of a row are left
+    out, so no row ends in the padding of a column nothing filled."""
     rows = [_without_empty_tail(r) for r in rows]
     keep = max((ui.width(str(r[tag])) for r in rows), default=0)
     while True:
@@ -1530,7 +1530,13 @@ def cmd_clean(a, scope: list[str] | None) -> int:
     cutoff = time.time() - a.older if a.older is not None else None
     specs = _specs(a)
     named = _resolve(specs, scope) if specs else jobcore.jobs(jobstore.ENDED, scope)
-    victims = [j for j in named if j["state"] in jobstore.ENDED and (cutoff is None or (j.get("ended") or 0) < cutoff)]
+    for j in named:     # a job named by its own id must suit the verb; any other form leaves it as it is
+        if j["state"] not in jobstore.ENDED and not j.get("_bulk"):
+            ui.die(f"{_PROG}: job {j['id']} is {j['state']}; clean removes ended jobs. "
+                   + (f"`pp {_PROG} kill {j['id']}` stops it" if j["state"] == "running"
+                      else f"`pp {_PROG} drop {j['id']}` removes it"), 2)
+    victims = [j for j in named
+               if j["state"] in jobstore.ENDED and (cutoff is None or (j.get("ended") or 0) < cutoff)]
     if not victims:
         print("nothing to clean")
         return 0
