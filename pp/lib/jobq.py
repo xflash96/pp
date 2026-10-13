@@ -136,14 +136,6 @@ def _format_of(q: str) -> int | None:
         return None
 
 
-def _write_format(q: str) -> None:
-    """Say what this queue's store looks like, where it does not say yet. Every writer that reaches a queue
-    does it (writing_queue), so a queue that exists names the format its records are in."""
-    path = _format_file(q, create=True)
-    if not os.path.exists(path):
-        paths.write_json(path, FORMAT)
-
-
 def open_queue(q: str) -> str:
     """Queue q's directory, with the format of its store checked. The one place a queue is opened, so the one
     place that refuses a queue this pp cannot read.
@@ -169,13 +161,17 @@ def open_queue(q: str) -> str:
            f"Drain that queue with the pp that wrote it, or remove {qdir}.", 2)
 
 
-def writing_queue(q: str) -> str:
-    """Queue q's directory, opened and ready to be written in: it exists, and it says what format its store is
-    in. Every writer that may be the one creating a queue's directory comes through here, so a queue that
-    exists says its format whether or not it holds a job."""
-    qdir = open_queue(q)
-    _write_format(q)
-    return qdir
+def writing_queue(q: str) -> None:
+    """Queue q, opened and ready to be written in: it exists, and it says what format its store is in. Every
+    writer that may be the one creating a queue's directory comes through here, so a queue that exists says
+    its format whether or not it holds a job.
+
+    The directory it opens is bound by no caller, so it hands back nothing, and the refusal open_queue raises
+    still comes first."""
+    open_queue(q)
+    path = _format_file(q, create=True)
+    if not os.path.exists(path):
+        paths.write_json(path, FORMAT)
 
 
 def _store_lock() -> str:
