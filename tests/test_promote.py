@@ -368,6 +368,36 @@ class TestPromote(Base):
         self.assertIsNone(promote._link_owner(os.path.join(self.repo, "bin", "tool"), renamed,
                                               promote._registry()))
 
+    def test_a_project_inside_another_tree_moves_its_own_link(self):
+        """Two promoted trees, one inside the other. The inner project's dev link points into the inner tree,
+        which is the inner project's own, so its next promote moves that link by itself. The path the inner
+        project registered is still not the outer project's to move."""
+        outer = os.path.join(self.tmp, "outer")
+        inner = os.path.join(outer, "inner")
+        x, y = os.path.join(self.tmp, "bin", "x"), os.path.join(self.tmp, "bin", "y")
+        self.write(".pp.toml", 'name = "pouter"\n[promote]\nsource = "tree"\nexclude = ["inner"]\n'
+                               f'dev_links = {{ "{x}" = "bin/x" }}\n', root=outer)
+        self.write("bin/x", "#!/bin/sh\necho x\n", exe=True, root=outer)
+        self.write(".pp.toml", 'name = "pinner"\n[promote]\nsource = "tree"\n'
+                               f'dev_links = {{ "{y}" = "bin/y" }}\n', root=inner)
+        self.write("bin/y", "#!/bin/sh\necho y\n", exe=True, root=inner)
+        self.assertEqual(self.pp(outer)[0], 0)
+        self.assertEqual(self.pp(inner)[0], 0)
+
+        self.write("bin/y2", "#!/bin/sh\necho y2\n", exe=True, root=inner)
+        self.write(".pp.toml", 'name = "pinner"\n[promote]\nsource = "tree"\n'
+                               f'dev_links = {{ "{y}" = "bin/y2" }}\n', root=inner)
+        rc, out, err = self.pp(inner)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(os.readlink(y), os.path.join(inner, "bin", "y2"))
+
+        self.write(".pp.toml", 'name = "pouter"\n[promote]\nsource = "tree"\nexclude = ["inner"]\n'
+                               f'dev_links = {{ "{x}" = "bin/x", "{y}" = "bin/x" }}\n', root=outer)
+        self.assertEqual(self.pp(outer)[0], 2)
+        self.assertEqual(os.readlink(y), os.path.join(inner, "bin", "y2"))
+        self.assertEqual(promote._link_owner(os.readlink(y), promote._project(outer), promote._registry()),
+                         "pinner")
+
     def test_link_into_source_is_replaced_without_force(self):
         self.make_repo()
         os.makedirs(os.path.dirname(self.link))

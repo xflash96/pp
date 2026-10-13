@@ -500,8 +500,10 @@ def _link_owner(target: str, t: Target, reg: dict) -> str | None:
         return name
     for other, row in reg.items():
         # a link into the tree this promote is of is this target's, whatever a registry row calls that tree:
-        # a project that changed its `name` is a new target, and its own dev link is still its own
-        if other != t.name and row.get("source") not in (None, t.source) and _inside(target, row["source"]):
+        # a project that changed its `name` is a new target, and a project in another project's tree holds
+        # the links into its own tree, so the innermost tree a link points into names the target
+        if other != t.name and row.get("source") not in (None, t.source) and _inside(target, row["source"]) \
+                and not (_inside(target, t.source) and _inside(t.source, row["source"])):
             return other
     return None
 
