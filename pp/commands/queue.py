@@ -104,7 +104,7 @@ Campaign files
     ` or $( is refused with its line number; quoted they are ordinary, so a pipe is one argument of a shell you
     start: `-- sh -c 'python x.py | grep -v noise'`. A blank line and a line whose first character is # are skipped.
     Any refusal of any line queues nothing, an unknown flag and a bad duration and an --after id no job has alike: a
-    campaign file is all or none.
+    campaign file is all or none. A line for a job that wants no card omits --gpu-gb; 0 is refused.
 
 Containers, and anything else a runner starts elsewhere
     A runner that starts the work in a container, on a batch system or on another host puts it outside the job's
