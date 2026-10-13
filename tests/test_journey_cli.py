@@ -39,7 +39,7 @@ class TestFirstRun(Journey):
             self.assertIn(summary(cmd), r.stdout)
         self.assertIn("Unique prefixes work", r.stdout)
         for cmd in BUILTINS:
-            for argv in (("help", cmd), (cmd, "-h"), (cmd, "--help")):
+            for argv in (("help", cmd), (cmd, "-h"), (cmd, "--help"), ("-h", cmd), ("--help", cmd)):
                 r = self.pp(*argv)
                 self.assertIn(summary(cmd), r.stdout, argv)
                 self.assertIn(f"pp {cmd}", r.stdout, argv)
@@ -49,6 +49,10 @@ class TestFirstRun(Journey):
     def test_help_of_a_verb_and_help_about_help(self):
         if has("queue"):
             self.assertIn("usage: pp queue add", self.pp("help", "queue", "add").stdout)
+            # the three spellings of one command's help are one reading of the words: `pp help NAME`, and the
+            # flag before the name, with a verb after it. A reader who typed the flag first is answered.
+            self.assertEqual(self.pp("-h", "queue").stdout, self.pp("help", "queue").stdout)
+            self.assertEqual(self.pp("--help", "queue", "add").stdout, self.pp("help", "queue", "add").stdout)
         for argv in (("help",), ("help", "help"), ("help", "-h"), ("-h", "--all"), ("--all", "-h")):
             self.assertIn("usage: pp <command>", self.pp(*argv).stdout, argv)
         self.assertIn(os.path.join(ROOT, "pp", "commands", f"{ANY}.py"), self.pp("-h", "--all").stdout)

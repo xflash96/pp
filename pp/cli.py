@@ -208,7 +208,8 @@ def run(cmd: Command, argv: list[str]) -> int:
 def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
     out = [f"{ui.c('pp', 'bold')} {__version__}: {TAGLINE}",
            "",
-           "usage: pp <command> [args...]     pp help <command> [verb]     pp -h --all (where each command lives)",
+           "usage: pp <command> [args...]     pp help <command> [verb] (also pp -h <command>)",
+           "                                  pp -h --all (where each command lives)",
            ""]
     heads = {"builtin": "commands:", "user": f"user commands ({os.path.join(paths.config_dir(), 'commands')}):",
              "plugin": f"plugins ({paths.data_dir('plugins', create=False)}):", "path": "PP_PATH commands:",
@@ -291,7 +292,9 @@ def _main(argv: list[str]) -> int:
     if argv[0] in ("-V", "--version"):
         print(f"pp {__version__} ({paths.pp_root()})")
         return 0
-    if argv[0] == "help":
+    # `pp -h NAME`, `pp --help NAME` and `pp -h NAME VERB` are `pp help NAME`: one reading of the words, so
+    # the three spellings of "the help of that command" cannot answer differently. `pp -h` alone is above.
+    if argv[0] in ("help", "-h", "--help"):
         rest = [w for w in argv[1:] if w not in ("-h", "--help", "--all", "help")]
         if not rest:
             print(help_text(cmds, show_all="--all" in argv))
