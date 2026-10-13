@@ -185,8 +185,11 @@ list of the parts:
 
 - `pp/cli.py`: finding commands, the order of their origins, help and
   completion.
-- `pp/lib/jobq.py`: queues, workers, resources, and the files a job lives
-  in; `pp help queue` is the user's view of the same.
+- `pp/lib/jobstore.py`: a job's record, the files it lives in, and the
+  transaction that changes one. `pp/lib/jobcore.py`: the worker, the claims
+  and the processes of a queue. `pp/lib/jobpolicy.py`: every rule of a queue
+  as a value, so each one is a table. `pp/lib/jobq.py`: the verbs, the views,
+  the resources and the CLI; `pp help queue` is the user's view of the same.
 - `pp/commands/promote.py`: releases. `pp/commands/cmd.py`: plugins.
   `pp/commands/http.py`: serving a folder to a browser, with its cache and
   its server. `pp/commands/batch.py`: bulk file changes, and the journal
@@ -248,13 +251,16 @@ the journeys in `tests/test_journey_cmd.py` the other two.
 
 ### Where a queue's jobs live, and how one says it is alive
 
-The docstring of `pp/lib/jobq.py` is the reference: the files a queue is made
-of, how a worker and a job say they are alive, and the one actor that ends a
-job. Each mechanism inside it has one owner, and these are they:
+The docstring of `pp/lib/jobstore.py` is the reference for the files a queue
+is made of, and `pp/lib/jobcore.py`'s for how a worker and a job say they are
+alive and which actor ends a job. Each mechanism has one owner, and these are
+they:
 
-- the store: `Txn`, `txn`, `listing` and `find`. `open_queue` is where a
-  queue's `FORMAT` is checked, and `Txn.add` is where an id and the record
-  that holds it land together.
+- the store: `Txn`, `txn`, `listing` and `find`, in `pp/lib/jobstore.py`.
+  `open_queue` is where a queue's `FORMAT` is checked, and `Txn.add` is where
+  an id and the record that holds it land together. The writes a verb hands
+  over are the four at the end of that file, each one a whole transaction of
+  its own that is told the states it may act on.
 - being alive: `lock.Claim`. A claim is held for as long as its holder lives,
   so nothing is cleaned up after a holder that was killed and no record is
   ever read as a live holder. A queue's worker holds one on `worker.lock`,
@@ -262,9 +268,13 @@ job. Each mechanism inside it has one owner, and these are they:
 - whether a queue's worker is up: the block comment above `worker_up`, for
   the two things that can be true of that claim and the first moment that is
   neither.
-- how a job ends: `decide` and `merge_stop`, which are pure, and
-  `Worker.carry_out`, the one pass that gathers the facts and carries the
-  action out.
+- how a job ends: `decide` and `merge_stop` in `pp/lib/jobpolicy.py`, which
+  are pure, as every rule in that module is, and `Worker.carry_out`, the one
+  pass that gathers the facts and carries the action out.
+- what a worker is handed: it reads no config file and takes no reading of
+  its own, so `read_settings` gives it the settings of one pass of its loop
+  and `admit_for` the readings of one launch pass. It writes no sentence
+  either: it tells a sink what it did, and `jobq` words every one of them.
 - what a stop carries: `public()`, where every field of a job record that
   others rely on is named.
 
@@ -281,7 +291,7 @@ the same place.
 A kill, pass by pass:
 
 ```
-kill:   txn(merge_stop) -> worker_up(wake=True) -> SIGUSR1 to the worker
+kill:   ask_stop(merge_stop) -> worker_up(wake=True) -> SIGUSR1 to the worker
 worker: carry_out: the facts -> decide = TERM -> signal the group,
         then txn marks `sent` -> (the grace) -> decide = KILL9 -> signal
      -> the wrapper ends, so the job's run claim is free

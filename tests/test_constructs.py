@@ -5,6 +5,7 @@ the run that adds it.
 KNOWN is the exceptions a rule allows, each with its reason beside it. An exception that no longer does the
 thing fails too, so it is taken off rather than left standing."""
 import ast
+import io
 import os
 import re
 import signal
@@ -13,6 +14,7 @@ import socketserver
 import subprocess
 import sys
 import threading
+import tokenize
 import unittest
 import warnings
 from unittest import mock
@@ -46,11 +48,10 @@ def _last(name: str) -> str:
     return name.rsplit(".", 1)[-1]
 
 
-def _walk(path: str):
-    """(qualname, node) for every node in the file, qualname being the enclosing class and function names."""
-    with open(os.path.join(ROOT, path)) as f:
-        tree = ast.parse(f.read(), path)
-
+def _quals(tree):
+    """(qualname, node) for every node under this tree, qualname being the enclosing class and function
+    names. A rule reads a file through `_walk`, and the test that the rule sees what it looks for reads one
+    line through this."""
     def visit(node, names):
         for child in ast.iter_child_nodes(node):
             inner = names + [child.name] if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -58,6 +59,12 @@ def _walk(path: str):
             yield ".".join(inner) or "<module>", child
             yield from visit(child, inner)
     yield from visit(tree, [])
+
+
+def _walk(path: str):
+    """(qualname, node) for every node in the file, qualname being the enclosing class and function names."""
+    with open(os.path.join(ROOT, path)) as f:
+        yield from _quals(ast.parse(f.read(), path))
 
 
 class Rule:
@@ -627,12 +634,143 @@ _SLOW_IN_A_TXN = ("spawn", "run", "git", "git_child", "signal_and_wait", "readin
                   "txn", "listing")
 _OPENS_A_TXN = (_STORE, _CORE)      # the two files that open a scope of the store's transaction
 
-# The decision about a job, and the helpers it is made of: pure, so the table that covers every combination
-# of the facts needs no process, no thread and no clock (pp/lib/jobpolicy.py, `decide`).
-_POLICY = "pp/lib/jobpolicy.py"
-_PURE = ("decide", "merge_stop", "_ends", "_or_again", "hook_due", "matches")
-_IMPURE_MODULES = ("time", "os", "proc", "lock", "paths", "signal", "sys", "subprocess", "shutil")
-_IMPURE_CALLS = ("txn", "listing", "find", "write_json", "sleep", "json_txn")
+_POLICY = "pp/lib/jobpolicy.py"     # every rule of the queue, as values: the facts in, one decision out
+# ---- the core, and the policy beside it (spec/INTERFACE.md, section 8) --------------------------------
+#
+# Three modules, and the line between them is mechanism against policy: the store holds a record and the
+# transaction that changes one, the core holds the worker, the claims and the processes, and the policy holds
+# every rule that can be written as values in and one value out. The rules below are what keeps that line
+# where it is, each one a reading of the source.
+
+_THE_CORE = (_STORE, _CORE)     # the core is the store and the worker, and the budget below is theirs
+_OUTSIDE = ("pp/lib/jobq.py", "pp/commands/queue.py")   # the queue's own verbs, views, readings and CLI
+
+# What a pure rule may not reach: a clock, a process, a signal, a lock, a file, or the store. A rule is handed
+# records, readings, settings and `now`, and gives back a value (I28).
+_IMPURE_MODULES = ("time", "os", "proc", "lock", "paths", "signal", "sys", "subprocess", "shutil", "select",
+                   "secrets", "fcntl", "jobstore", "jobcore", "jobq", "config", "session", "ui")
+_IMPURE_CALLS = ("txn", "listing", "find", "write_json", "sleep", "json_txn", "open")
+# ... and the modules it may import: its own words, and nothing of pp's (I29)
+_PURE_IMPORTS = {"__future__", "annotations", "re", "dataclass", "dataclasses"}
+
+# what the core may not say, since every sentence a user reads is the caller's (section 8, the wording)
+_SENTENCES = ("print", "warn", "die", "print_json", "input", "confirm")
+# ... and what it may not read: a config file, or a reading of its own (I27)
+_READINGS = ("_qcfg", "reading", "_cards", "pools", "parse_duration")
+
+# how a process is started, which outside the core happens at two sites and no others (section 8's boundary
+# rule, with its two exceptions)
+_STARTS = ("spawn", "run", "git", "git_child", "exec_replace")
+_THE_TWO = {"pp/lib/jobq.py:_cards", "pp/lib/jobq.py:reading"}
+
+# The budgets a test holds, in code lines: neither blank, comment nor docstring, counted as CI counts them.
+# Over any of the three is a change that has to be argued for by number (spec/INTERFACE.md, D4).
+_BUDGETS = {_STORE: 250, _CORE: 490}
+_CORE_BUDGET = 730
+
+# Where every name of the queue's engine lives, from section 8's four lists. A function of the core's that
+# appears in neither list fails the test below, so a new construct cannot arrive unplaced, and a name that
+# has gone comes off the list rather than standing.
+_STORE_NAMES = {
+    # the record, its directory and the transaction that changes one
+    "top", "qroot", "queues", "_format_file", "_format_of", "open_queue", "writing_queue", "_store_lock",
+    "_counter_file", "_counter", "_jpath", "_job_ids", "_read_job", "_job_json", "_write_job", "_stage_job",
+    "_remove_job", "Txn", "txn", "listing", "jobs", "find", "_forget_job", "run_claim",
+    # the two writes an outcome is made of, and the refusal of a queue another layout wrote, which the
+    # caller words
+    "_finish", "_requeue", "Foreign",
+    # the writes a verb hands over, and the one tail they end in
+    "add_jobs", "amend", "set_state", "forget", "_written",
+}
+_CORE_NAMES = {
+    # the claims and the handles
+    "_new_rcfile", "_worker_claim", "_watcher_claim", "_group_handle", "ended_on_its_own",
+    # the worker, its start, its loop and its wait
+    "Worker", "worker", "worker_now", "worker_up", "_no_worker_came_up", "_start_worker", "worker_log",
+    "Holder", "work", "_settings", "Wait", "waking",
+    # the watchers, and the two signals a verb hands over
+    "watching", "watchers", "ask_stop", "worker_stop",
+}
+
+
+def _counted(src: str) -> int:
+    """Lines of this source that are neither blank, comment nor docstring: the count the core's budget is
+    kept in, the same one CI reports, written here so the budget is a test and not a reading."""
+    doc: set[int] = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+                    and isinstance(first.value.value, str):
+                doc.update(range(first.lineno, first.end_lineno + 1))
+    code: set[int] = set()
+    skip = (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+            tokenize.ENDMARKER)
+    for t in tokenize.generate_tokens(io.StringIO(src).readline):
+        if t.type not in skip:
+            code.update(range(t.start[0], t.end[0] + 1))
+    return len(code - doc)
+
+
+def _code_lines(path: str) -> int:
+    """What `_counted` comes to for this file."""
+    with open(os.path.join(ROOT, path)) as f:
+        return _counted(f.read())
+
+
+def _imports(tree) -> set[str]:
+    """Every name this tree imports: a module, or a name out of one. `from pp.lib import jobstore` gives
+    `jobstore`, so the import graph is read in the names a rule is written about."""
+    out: set[str] = set()
+    for _qual, node in _quals(tree):
+        if isinstance(node, ast.Import):
+            out |= {_last(a.name) for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            out |= {a.name for a in node.names} if (node.module or "").startswith("pp") \
+                else {_last(node.module or "")} | {a.name for a in node.names}
+    return out
+
+
+def _calls_in(tree) -> list:
+    """(line, qualname, the dotted callee) for every call written inside a function of this tree."""
+    out = []
+    for qual, node in _quals(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out += [(line, qual, name) for line, name in _calls_under(node)]
+    return out
+
+
+def _impure(tree) -> list:
+    """The calls a pure rule may not make: a clock, a process, a signal, the store, a file (I28)."""
+    return [f"{line} ({qual}) {name}" for line, qual, name in _calls_in(tree)
+            if name.split(".")[0] in _IMPURE_MODULES or _last(name) in _IMPURE_CALLS]
+
+
+def _sentences(tree) -> list:
+    """The calls that write a sentence, which the core makes none of: it emits an event to a sink, and its
+    caller words it."""
+    return [f"{line} ({qual}) {name}" for line, qual, name in _calls_in(tree)
+            if name.split(".")[0] in ("ui", "logging") or _last(name) in _SENTENCES]
+
+
+def _reads_a_setting(tree) -> list:
+    """The calls that read a config file or take a reading, which the core makes none of: a worker's settings
+    arrive through `read_settings` and its admission through `admit_for` (I27)."""
+    return [f"{line} ({qual}) {name}" for line, qual, name in _calls_in(tree)
+            if name.split(".")[0] == "config" or _last(name) in _READINGS]
+
+
+def _starts_a_process(tree) -> list:
+    """Where this tree starts a process of its own, by qualname."""
+    return [qual for line, qual, name in _calls_in(tree)
+            if _last(name) in _STARTS and name.split(".")[0] in ("proc", "subprocess")]
+
+
+def _store_scopes(tree) -> list:
+    """Where this tree opens a scope of the store: the lock one writer holds, and the shared one a listing
+    holds. Only the core does."""
+    return [f"{qual} {name}" for _line, qual, name in _calls_in(tree)
+            if _last(name) in ("txn", "listing")]
 
 
 def _calls_under(node):
@@ -659,17 +797,15 @@ class TestContracts(unittest.TestCase):
                         for line, name in _calls_under(stmt) if _last(name) in _SLOW_IN_A_TXN]
         self.assertEqual(bad, [], "these can block, and a reader of any queue waits for the scope")
 
-    def test_the_decision_reaches_no_clock_store_or_process(self):
-        """`decide` and `merge_stop` are pure: the record and the facts in, one action out. So a reading of
-        the clock, of the store or of a process inside them, or inside the helpers they are made of, fails
-        here, and the facts stay the one thing a decision is made from."""
-        bad = []
-        for qual, node in _walk(_POLICY):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or _last(qual) not in _PURE:
-                continue
-            bad += [f"{_POLICY}:{line} ({qual}) {name}" for line, name in _calls_under(node)
-                    if name.split(".")[0] in _IMPURE_MODULES or _last(name) in _IMPURE_CALLS]
-        self.assertEqual(bad, [], "a pure decision reads the record and the facts, and nothing else")
+    def test_every_rule_of_the_policy_is_pure(self):
+        """I28. Every rule of pp/lib/jobpolicy.py is pure: records, readings, settings and `now` in, one
+        value out. So a reading of the clock, of the store or of a process in any function of that module
+        fails here, and the facts stay the one thing a decision is made from.
+
+        The rule is over the module and not over a list of its functions, so a rule written beside the others
+        is held to it without a builder remembering to add its name."""
+        bad = [f"{_POLICY}:{where}" for where in _impure(_source(_POLICY))]
+        self.assertEqual(bad, [], "a pure rule reads the values it is handed, and nothing else")
 
     def test_these_checks_see_what_they_look_for(self):
         """Each is tried on the call that breaks it, so neither can pass by matching nothing."""
@@ -678,9 +814,8 @@ class TestContracts(unittest.TestCase):
         found = [name for stmt in with_node.body for _line, name in _calls_under(stmt)
                  if _last(name) in _SLOW_IN_A_TXN]
         self.assertEqual(found, ["proc.spawn", "time.sleep"])
-        impure = ast.parse("def decide(job, facts):\n    return time.time()\n").body[0]
-        self.assertEqual([name for _line, name in _calls_under(impure)
-                          if name.split(".")[0] in _IMPURE_MODULES], ["time.time"])
+        impure = ast.parse("def decide(job, facts):\n    return time.time()\n")
+        self.assertEqual(len(_impure(impure)), 1, "the purity rule sees no clock in a rule")
 
 
 def _source(path: str) -> ast.Module:
@@ -741,17 +876,15 @@ class TestWhatAScopeAndADecisionReach(unittest.TestCase):
                     if _last(name) in _SLOW_IN_A_TXN]
         self.assertEqual(bad, [], "these can block, and a reader of every queue waits for the scope")
 
-    def test_the_decision_and_every_helper_it_reaches_are_pure(self):
-        """`decide` and `merge_stop` are handed the record and the facts and give back one action. No clock,
-        no store and no process is reached from inside them, in their own code or in the helpers they are
-        made of, so the facts stay the one thing a decision is made from."""
+    def test_every_rule_and_every_helper_it_reaches_are_pure(self):
+        """I28, read one step further in: a clock, a store or a process moved into a helper one rule calls is
+        one of these as well."""
         tree = _source(_POLICY)
-        fns = _functions(tree)
-        pure = [fns[name] for name in _PURE if name in fns]
-        self.assertEqual(len(pure), len(_PURE), f"a pure function of {_PURE} is not in the file")
-        bad = [f"{_POLICY}:{line} {name}" for line, name in _reached(tree, pure)
+        fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        self.assertGreater(len(fns), 20, "no rule was found to read")
+        bad = [f"{_POLICY}:{line} {name}" for line, name in _reached(tree, fns)
                if name.split(".")[0] in _IMPURE_MODULES or _last(name) in _IMPURE_CALLS]
-        self.assertEqual(bad, [], "a pure decision reads the record and the facts, and nothing else")
+        self.assertEqual(bad, [], "a pure rule reads the values it is handed, and nothing else")
 
     def test_these_checks_see_what_they_look_for(self):
         """Each is tried on the call that breaks it one step further in than the scope it is written in, so
@@ -764,6 +897,114 @@ class TestWhatAScopeAndADecisionReach(unittest.TestCase):
                            "def stamp(job):\n    return time.time()\n")
         self.assertEqual([name for _line, name in _reached(impure, [_functions(impure)["hook_due"]])
                           if name.split(".")[0] in _IMPURE_MODULES], ["time.time"])
+
+
+class TestTheCoreAndThePolicyBesideIt(unittest.TestCase):
+    """What keeps the line between mechanism and policy where section 8 of the interface puts it: the store
+    and the worker hold the mechanism and nothing else, the module beside them holds every rule as a value,
+    and the core is small enough to be read.
+
+    Each of these is a reading of the source, and each is tried on what breaks it in
+    `test_these_rules_see_what_they_look_for`, so none can pass by matching nothing."""
+
+    def test_the_policy_imports_nothing_of_pps_own(self):
+        """I29. The core calls the policy and the policy never calls the core: nothing jobpolicy imports
+        imports jobpolicy, which holds because it imports nothing of pp's at all. So no rule can be made to
+        depend on the state a mechanism happens to be in, and the import graph says so rather than a
+        reader."""
+        self.assertEqual(_imports(_source(_POLICY)) - _PURE_IMPORTS, set())
+        for path in _THE_CORE:          # and the direction above it: the store and the worker call the rules
+            self.assertIn("jobpolicy", _imports(_source(path)))
+
+    def test_the_core_imports_nothing_that_imports_it(self):
+        """I29, the rest of the direction: the store knows nothing of the worker, and neither knows the verbs
+        and the views above them. So the three modules are a line, and a cycle cannot hide a rule that reads
+        a mechanism."""
+        self.assertEqual(_imports(_source(_STORE)) & {"jobcore", "jobq"}, set())
+        self.assertEqual(_imports(_source(_CORE)) & {"jobq"}, set())
+        self.assertIn("jobstore", _imports(_source(_CORE)))
+
+    def test_the_core_reads_no_config_and_takes_no_reading_of_its_own(self):
+        """I27. A worker's settings arrive through `read_settings`, called once per loop, and its admission
+        through `admit_for`, called once per launch pass before that pass's transaction. So a queue's limits
+        change under its running jobs with no restart, and the core holds no knob of its own."""
+        for path in _THE_CORE:
+            self.assertEqual([f"{path}:{where}" for where in _reads_a_setting(_source(path))], [])
+
+    def test_the_core_writes_no_sentence(self):
+        """Every sentence a user reads is free to change in a patch, so none of them lives in the module
+        whose correctness has to be held still. The core emits an event to the sink its caller gave it, with
+        the fields that sentence is made of, and the caller words it."""
+        for path in _THE_CORE:
+            self.assertEqual([f"{path}:{where}" for where in _sentences(_source(path))], [])
+            self.assertNotIn("ui", _imports(_source(path)))
+
+    def test_nothing_outside_the_core_opens_a_scope_of_the_store(self):
+        """The boundary rule, its first half: no function outside the core takes the store lock. A verb reads
+        and writes through the core's own API, where every write is one call and one whole transaction, so no
+        caller holds a scope open across its own work."""
+        for path in _sources("pp"):
+            if path not in _THE_CORE:
+                self.assertEqual([f"{path}:{where}" for where in _store_scopes(_source(path))], [])
+
+    def test_two_sites_outside_the_core_start_a_process_and_no_others(self):
+        """The boundary rule, its second half, with the two exceptions named: outside the core no function of
+        the queue starts a job, a runner, a hook or a worker, and the two sites that run a process of their
+        own are these two.
+
+        `_cards` runs nvidia-smi and takes no claim at all: two of them at once read twice, and neither
+        writes a record, names a job or signals anything. `reading` runs a user's probe under that probe's own
+        claim, whose whole job is one run of this probe at a time: it names a probe, never a job and never a
+        queue, nobody waits for it, and losing that race costs a cached reading. So neither can lose a job,
+        double a limit, end a job twice or signal the wrong process, which is what the core's budget is for."""
+        ran = {f"{path}:{qual}" for path in _OUTSIDE for qual in _starts_a_process(_source(path))}
+        self.assertEqual(ran, _THE_TWO)
+        # and the only claim either of them takes is the probe's own
+        for path in _OUTSIDE:
+            for qual, node in _quals(_source(path)):
+                if isinstance(node, ast.Call) and _dotted(node.func).split(".")[-2:-1] == ["Claim"]:
+                    args = list(node.args) + [k.value for k in node.keywords]
+                    named = [_last(_dotted(a.func)) for a in args if isinstance(a, ast.Call)]
+                    self.assertEqual((f"{path}:{qual}", named), ("pp/lib/jobq.py:reading", ["_probe_claim"]))
+
+    def test_every_function_of_the_core_is_placed(self):
+        """A function of the core's that appears in neither list of section 8 fails here, so a new construct
+        cannot arrive unplaced: it is argued about, and then it is written down. A name that has gone comes
+        off the list in the same change, so the list is never a description of an older tree."""
+        for path, named in ((_STORE, _STORE_NAMES), (_CORE, _CORE_NAMES)):
+            got = {qual for qual, node in _quals(_source(path))
+                   if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and "." not in qual}
+            self.assertEqual(got - named, set(), f"{path}: these are in no list of section 8")
+            self.assertEqual(named - got, set(), f"{path}: these are listed and gone")
+
+    def test_the_core_is_inside_its_budget(self):
+        """The three numbers section 8 holds the core to, in code lines: neither blank, comment nor
+        docstring, counted as CI counts them. The part two actors can reach at once stays small enough to be
+        read, and a feature that cannot be built without growing it waits until something leaves it."""
+        sizes = {path: _code_lines(path) for path in _THE_CORE}
+        for path, n in sizes.items():
+            self.assertLessEqual(n, _BUDGETS[path], f"{path} is {n} code lines, over its budget")
+        self.assertLessEqual(sum(sizes.values()), _CORE_BUDGET,
+                             f"the core is {sum(sizes.values())} code lines, over the budget they share")
+
+    def test_these_rules_see_what_they_look_for(self):
+        """A rule that matched nothing would pass forever, so each is tried on the line that breaks it."""
+        self.assertEqual(len(_impure(ast.parse("def r(j):\n    return os.stat(j)\n"))), 1)
+        self.assertEqual(len(_impure(ast.parse("def r(j):\n    return find(j)\n"))), 1)
+        self.assertEqual(len(_sentences(ast.parse("def f(j):\n    ui.warn('x')\n"))), 1)
+        self.assertEqual(len(_sentences(ast.parse("def f(j):\n    print('x')\n"))), 1)
+        self.assertEqual(len(_reads_a_setting(ast.parse("def f(q):\n    return _qcfg(q)\n"))), 1)
+        self.assertEqual(len(_reads_a_setting(ast.parse("def f(q):\n    return config.load('queue')\n"))), 1)
+        self.assertEqual(len(_store_scopes(ast.parse("def f():\n    with txn() as s:\n        pass\n"))), 1)
+        self.assertEqual(len(_store_scopes(ast.parse("def f():\n    with listing() as s:\n        pass\n"))), 1)
+        self.assertEqual(_starts_a_process(ast.parse("def f():\n    proc.spawn(argv, group='own')\n")), ["f"])
+        self.assertEqual(_starts_a_process(ast.parse("def f():\n    proc.run(argv)\n")), ["f"])
+        self.assertEqual(_imports(ast.parse("from pp.lib import jobstore as q\nimport os\n")),
+                         {"jobstore", "os"})
+        # and the count the budget is kept in: a blank line, a comment and a docstring line are none of
+        # the three code lines here
+        self.assertEqual(_counted('"""A module.\n\nIts own words.\n"""\nimport os\n\n# a comment\n'
+                                  'def f():\n    """One line."""\n    return os.sep\n'), 3)
 
 
 class TestConstructs(unittest.TestCase):
