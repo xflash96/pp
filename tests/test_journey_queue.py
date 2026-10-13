@@ -634,5 +634,725 @@ class TestProjectRunner(QueueJourney):
         self.assertIn("cuda=0", self.pp("queue", "log", a).stdout)
 
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# The journey of a lab: one machine, one card shared with another tenant, two projects, work that runs in a
+# container, campaigns of tens of jobs in families, lanes, and an agent session operating it between runs. One
+# test per step, each typing what `pp help queue` prints, in the order the help prints it.
+# ---------------------------------------------------------------------------------------------------------------
+import shutil  # noqa: E402
+import signal  # noqa: E402
+
+from journey import kill_pid, needs  # noqa: E402
+
+from pp.lib import proc  # noqa: E402
+
+# The machine, described once: the card pool every queue draws from, a queue of three slots, and a lane of one.
+MACHINE = ('[resources]\ngpu_gb = "auto"\n'
+           '[queue.default]\npoll = 0.2\nidle_exit = 30\n'
+           '[queue.lab]\npoll = 0.2\nidle_exit = 30\n'
+           '[queue.lab.resources]\nslots = 3\n'
+           '[queue.r1]\npoll = 0.2\nidle_exit = 30\n'
+           '[queue.r1.resources]\nslots = 1\n')
+
+# A machine that may run a journey under a real runtime says so by naming the image to run it in: a real
+# container is handed a real card and a mount of a real directory.
+REAL_IMAGE = os.environ.get("PP_JOURNEY_IMAGE")
+
+# The headings the help contract names, each a line of its own.
+HELP_SECTIONS = ("A first project whose work runs in a container, in four steps", "Naming jobs",
+                 "Selecting jobs", "Order, and a stage after another", "Campaign files",
+                 "Containers, and anything else a runner starts elsewhere",
+                 "Settings: one default, one key, one flag, one order", "Where a job's output goes",
+                 "Timeouts and retries", "Hooks, on the FINAL outcome of a job", "Workers, and after a reboot",
+                 "Agents", "What pp queue leaves to you, on purpose")
+
+# Every field `show --json` promises, off one record. A reader ignores a field it does not know, so a field
+# beside these is no failure.
+PROMISED = ("id", "state", "queue", "tag", "project", "cwd", "cmd", "runner", "needs", "prio", "owner",
+            "timeout", "grace", "retries", "attempt", "rc", "reason", "not_retried", "added", "started",
+            "ended", "seconds", "log", "log_at", "container", "envfile", "rcfile", "cards", "history", "notes",
+            "reported", "hooks", "env", "shell_env", "watchers")
+
+# A runner of the shape a container runner has, and the fault a stop command closes: the work it starts is in a
+# session of its own, outside the job's process group, so no signal pp sends reaches it, and the runner itself
+# ignores SIGTERM the way a container's first process with no handler does. The work is recorded under the name
+# in PP_QUEUE_CONTAINER, which is the only way to reach it. Every expansion is guarded, so a caller that sets no
+# PP_QUEUE_ variable runs the same script under `set -u`.
+FAKE_RUNNER = """#!/bin/bash
+set -uo pipefail
+trap '' TERM
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+GPUS=${CUDA_VISIBLE_DEVICES:+device=$CUDA_VISIBLE_DEVICES}
+NAME=${PP_QUEUE_CONTAINER:-plain}
+CELLS=$ROOT/cells
+mkdir -p "$CELLS"
+{ echo "root=$ROOT"; echo "cwd=$PWD"; echo "gpus=${GPUS:-all}"; echo "job=${PP_QUEUE_JOB:-unset}"
+  echo "envfile=${PP_QUEUE_ENVFILE:-unset}"; } > "$CELLS/$NAME.run.part"
+mv "$CELLS/$NAME.run.part" "$CELLS/$NAME.run"
+if [ -n "${PP_QUEUE_ENVFILE:-}" ]; then
+  cp "$PP_QUEUE_ENVFILE" "$CELLS/$NAME.env.part" && mv "$CELLS/$NAME.env.part" "$CELLS/$NAME.env"
+fi
+setsid "$ROOT/docker/cell.sh" "$CELLS/$NAME.pid" "$@" &
+wait $!
+"""
+
+# The same runner with a real runtime, which is the same journey: the two guarded arguments, the card request
+# narrowed rather than added to, the project root worked out from the script's own place, and no -e line for a
+# variable the environment file carries.
+REAL_RUNNER = """#!/bin/bash
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+GPUS=${CUDA_VISIBLE_DEVICES:+device=$CUDA_VISIBLE_DEVICES}
+NAME=${PP_QUEUE_CONTAINER:-plain}
+CELLS=$ROOT/cells
+mkdir -p "$CELLS"
+{ echo "root=$ROOT"; echo "cwd=$PWD"; echo "gpus=${GPUS:-all}"; echo "job=${PP_QUEUE_JOB:-unset}"
+  echo "envfile=${PP_QUEUE_ENVFILE:-unset}"; } > "$CELLS/$NAME.run.part"
+mv "$CELLS/$NAME.run.part" "$CELLS/$NAME.run"
+if [ -n "${PP_QUEUE_ENVFILE:-}" ]; then
+  cp "$PP_QUEUE_ENVFILE" "$CELLS/$NAME.env.part" && mv "$CELLS/$NAME.env.part" "$CELLS/$NAME.env"
+fi
+exec docker run --rm \\
+  ${PP_QUEUE_CONTAINER:+--name "$PP_QUEUE_CONTAINER"} \\
+  ${PP_QUEUE_ENVFILE:+--env-file "$PP_QUEUE_ENVFILE"} \\
+  --gpus "${GPUS:-all}" ${CUDA_VISIBLE_DEVICES:+-e CUDA_VISIBLE_DEVICES=0} \\
+  -v "$ROOT:/work" -w /work "${PP_IMAGE:-busybox}" "$@"
+"""
+
+# One cell of work, in a session of its own, as a container's work runs in a namespace of its own. It records
+# the session's pid under the container's name in one step, and then becomes the work.
+CELL = """#!/bin/sh
+set -u
+pidfile=$1
+shift
+printf '%s\\n' "$$" > "$pidfile.part"
+mv "$pidfile.part" "$pidfile"
+exec "$@"
+"""
+
+# The project's stop command: it ends the work recorded under one name and exits with the code it is given. A
+# name is the key, and the pid it recorded is what is signalled, so nothing is ever matched by a substring of a
+# command line.
+STOP = """#!/bin/sh
+set -u
+rc=0
+real=0
+while :; do
+  case ${1:-} in
+    --rc) rc=$2; shift 2 ;;
+    --real) real=1; shift ;;
+    *) break ;;
+  esac
+done
+name=${1:-}
+cells=$(cd "$(dirname "$0")/.." && pwd)/cells
+mkdir -p "$cells"
+printf '%s %s\\n' "$name" "${PP_QUEUE_CONTAINER:-unset}" >> "$cells/stopped"
+if [ "$rc" = 0 ]; then
+  if [ "$real" = 1 ]; then
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  else
+    pid=$(cat "$cells/$name.pid" 2>/dev/null) || pid=
+    if [ -n "$pid" ]; then kill -9 "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true; fi
+  fi
+fi
+exit "$rc"
+"""
+
+# The lab's own work: one cell; a cell that runs until a file appears; a cell that fails saying the words a
+# retry filter looks for, on its first attempt alone; and a cell that holds until a file named after this
+# attempt's container appears and then fails, so a test reaches one attempt at a time.
+WORK = {
+    "lab/run.sh": '#!/bin/sh\necho "cell $*"\n',
+    "lab/hold.sh": '#!/bin/sh\nwhile [ ! -f "$1" ]; do sleep 0.05; done\necho "cell held $1"\n',
+    "lab/fail.sh": ('#!/bin/sh\nif [ -f "$1" ]; then echo quiet; else echo "CUDA out of memory"; : > "$1"; fi\n'
+                    'exit 1\n'),
+    "lab/once.sh": ('#!/bin/sh\nset -u\nname=${PP_QUEUE_CONTAINER:-plain}\n'
+                    'while [ ! -f "$1/$name.go" ]; do sleep 0.05; done\necho "CUDA out of memory"\nexit 1\n'),
+}
+HOLD = WORK["lab/hold.sh"]
+RUN = WORK["lab/run.sh"]
+
+
+class Lab(QueueJourney):
+    """The lab every step below runs in: the machine of step 2, the project of step 3 and the container of
+    step 4.
+
+    The container is a fake one, so a journey needs no container runtime and still meets the fault a stop
+    command closes: pp's SIGTERM reaches the wrapper, the work is somewhere else, and only the project's own
+    stop command reaches it. `TestTheProjectUnderARealRunner` is the same journey with a real runtime, skipped
+    where there is none."""
+
+    RUNNER = FAKE_RUNNER
+    STOP_ARGS = ""              # what the stop script needs to reach a fake cell, and a real container
+
+    def setUp(self):
+        super().setUp()
+        self.setcfg(MACHINE)
+
+    # -- the project, its runner and its stop ----------------------------------------------------------------
+    def stop_cmd(self, root: str) -> str:
+        return f"{root}/docker/stop.sh {self.STOP_ARGS}$PP_QUEUE_CONTAINER"
+
+    def failing_stop_cmd(self, root: str) -> str:
+        return f"{root}/docker/stop.sh --rc 1 {self.STOP_ARGS}$PP_QUEUE_CONTAINER"
+
+    def lab(self, where: str = "lab", *, name: str = "lab", runner: str | None = "docker/run.sh",
+            stop: str | None = "ok", log: str | None = "logs/{tag}.log",
+            env: str | None = '{ OFFLINE = "1", PKGS = "/work/pkgs" }') -> str:
+        """A project root: its .pp.toml, its runner, its stop command and its work. -> the root."""
+        root = os.path.join(self.work, where)
+        self.write(os.path.join(root, "docker/run.sh"), self.RUNNER, 0o755)
+        self.write(os.path.join(root, "docker/cell.sh"), CELL, 0o755)
+        self.write(os.path.join(root, "docker/stop.sh"), STOP, 0o755)
+        for rel, text in WORK.items():
+            self.write(os.path.join(root, rel), text, 0o755)
+        cmd = {"ok": self.stop_cmd(root), "fail": self.failing_stop_cmd(root)}.get(stop, stop)
+        lines = [f'name = "{name}"', "[queue]"]
+        lines += [f'{k} = "{v}"' for k, v in (("runner", runner), ("stop", cmd), ("log", log)) if v]
+        if env:
+            lines.append(f"env = {env}")
+        self.write(os.path.join(root, ".pp.toml"), "\n".join(lines) + "\n")
+        return root
+
+    # -- reading what the runner and the stop command were given ---------------------------------------------
+    def cell_pid(self, root: str, name: str) -> int | None:
+        """The pid of the session the runner started under that name, or None where it has not started yet."""
+        try:
+            return int(self.read(os.path.join(root, "cells", f"{name}.pid")).split()[0])
+        except (OSError, IndexError, ValueError):
+            return None
+
+    def cell_up(self, root: str, name: str) -> bool:
+        """Whether the work started under that name is still running."""
+        pid = self.cell_pid(root, name)
+        return pid is not None and proc.alive(pid)
+
+    def started_cell(self, root: str, jid: str) -> str:
+        """Wait for the job to run and its work to be up, bounded. -> the attempt's container name."""
+        self.until(lambda: self.state(jid) == "running", what=f"job {jid} running")
+        name = self.field(self.show(jid), "container")
+        self.until(lambda: self.cell_up(root, name), what=f"the work under {name}")
+        return name
+
+    def asked_to_stop(self, root: str) -> list:
+        """One entry per run of the project's stop command: the name it was given, and the name in its own
+        environment."""
+        path = os.path.join(root, "cells", "stopped")
+        return [ln.split() for ln in self.read(path).splitlines()] if os.path.exists(path) else []
+
+    def run_file(self, root: str, name: str) -> dict:
+        """What the runner was given, as the runner recorded it."""
+        return self.kv(os.path.join(root, "cells", f"{name}.run"))
+
+    def end_cell(self, root: str, name: str) -> None:
+        """End by hand the work left under that name, which is the one command `show` prints for the case where
+        everything else failed."""
+        self.sh(f"{root}/docker/stop.sh {self.STOP_ARGS}{shlex.quote(name)}")
+
+    @staticmethod
+    def kv(path: str) -> dict:
+        """A file of KEY=VALUE lines, as a map."""
+        with open(path) as f:
+            return dict(ln.split("=", 1) for ln in f.read().splitlines() if "=" in ln)
+
+    # -- reading a record, a queue and a worker --------------------------------------------------------------
+    def field(self, job: dict, name: str):
+        """One field of a record, with a failure naming the field where the record does not carry it."""
+        self.assertIn(name, job, sorted(job))
+        return job[name]
+
+    def stop_of(self, job: dict) -> str | None:
+        """The stop command the job carries, wherever the record keeps it: a field of its own, or `cmd` on the
+        stop the job was asked for."""
+        stop = self.field(job, "stop")
+        return stop.get("cmd") if isinstance(stop, dict) else stop
+
+    def ended(self, jid) -> bool:
+        return self.state(jid) in ("done", "failed")
+
+    def all_ids(self) -> list:
+        """Every job the machine holds, in every state."""
+        d = json.loads(self.status("--json", "-n", "500"))
+        return sorted(j["id"] for k in ("running", "queued", "held", "recent") for j in d[k])
+
+    def worker(self, q: str = "default") -> dict:
+        for w in json.loads(self.pp("queue", "worker", "status", "--json").stdout):
+            if w["queue"] == q:
+                return w
+        return {"queue": q, "up": False, "pid": None}
+
+
+class TestTheFirstLook(Lab):
+    """Steps 0 to 2: read one page, install and look, and describe the machine once."""
+
+    @unittest.expectedFailure
+    def test_the_help_is_one_page_and_names_every_section(self):
+        """`pp help queue` is the page this journey follows. Its three spellings each exit 0. The page holds
+        every section heading the contract names, each a line of its own. Every line fits in 118 columns."""
+        page = self.pp("help", "queue").stdout
+        self.pp("-h", "queue")
+        self.pp("--help", "queue", "add")
+        heads = {ln.rstrip() for ln in page.splitlines() if ln[:1] not in (" ", "\t", "")}
+        self.assertEqual([], [h for h in HELP_SECTIONS if h not in heads])
+        self.assertEqual([], [n for n, ln in enumerate(page.splitlines(), 1) if len(ln) > 118])
+
+    def test_a_fresh_machine_has_no_queues_and_still_says_what_a_card_holds(self):
+        """A fresh machine has no queue and no configuration of its own. `pp queue` exits 0 there and names no
+        queue. The card it prints counts the memory another tenant holds."""
+        os.remove(f"{self.env['PP_CONFIG_DIR']}/config.toml")       # nothing is configured yet
+        self.gpus((24, 4))                              # another tenant holds 4 GB of this card's 24
+        self.pp("--version")
+        d = json.loads(self.pp("queue", "--json").stdout)
+        self.assertEqual(d["queues"], [])
+        self.assertEqual([(c["index"], c["total_gb"], c["used_gb"], c["free_gb"]) for c in d["cards"]],
+                         [(0, 24.0, 4.0, 20.0)])
+        self.pp("queue")
+
+    def test_the_machine_and_its_lanes_are_described_in_one_file(self):
+        """One config file gives each queue its own pools. A lane is a queue of one slot. A job declaring more
+        GPU memory than a pool provides is refused when it is added, and nothing is queued for it."""
+        self.gpus((24, 4))
+        self.add("-q", "lab", "--hold", "--no-start", "--", "true")
+        self.add("-q", "r1", "--hold", "--no-start", "--", "true")
+        pools = {q: {p["name"]: p["max"] for p in ps}
+                 for q, ps in json.loads(self.status("--json"))["pools"].items()}
+        self.assertEqual(pools["lab"]["slots"], 3)
+        self.assertEqual(pools["r1"]["slots"], 1)
+        before = self.all_ids()
+        self.pp("queue", "add", "-q", "lab", "--gpu-gb", "200", "--no-start", "--", "true", code=2)
+        self.assertEqual(self.all_ids(), before)
+
+
+class TestTheProject(Lab):
+    """Steps 3 to 6: a project declares how its work is launched and stopped, its runner keeps working for its
+    other callers, a kill and a timeout both end what the runner started, and one job by hand prints its id."""
+
+    @unittest.expectedFailure
+    def test_a_project_declares_its_runner_stop_log_and_env_once(self):
+        """A job added from the project carries its runner, its stop command, its log path and its environment
+        on the record. A project with a runner and no stop refuses the add. A job with no tag is queued under a
+        {tag} pattern filled in with its id."""
+        root = self.lab()
+        jid = self.add("-q", "lab", "--tag", "c3_recall.s0", "--no-start", "--", "./lab/run.sh", cwd=root)
+        j = self.show(jid)
+        self.assertEqual(self.field(j, "runner"), [f"{root}/docker/run.sh"])
+        self.assertEqual(self.stop_of(j), self.stop_cmd(root))
+        self.assertEqual(self.field(j, "log"), f"{root}/logs/c3_recall.s0.log")
+        self.assertEqual(self.field(j, "env"), {"OFFLINE": "***", "PKGS": "***"})
+        nostop = self.lab("nostop", stop=None, log=None, env=None)
+        self.pp("queue", "add", "-q", "lab", "--no-start", "--", "./lab/run.sh", cwd=nostop, code=2)
+        plain = self.add("-q", "lab", "--no-start", "--", "./lab/run.sh", cwd=root)
+        p = self.show(plain)
+        self.assertEqual((p["state"], self.field(p, "log")), ("queued", f"{root}/logs/{plain}.log"))
+
+    @unittest.expectedFailure
+    def test_the_runner_runs_the_same_for_a_caller_that_is_not_pp(self):
+        """The runner's other callers set no PP_QUEUE variable, and the script runs for them under `set -u`.
+        Under pp the environment file the runner is handed holds the project's env, the job's own env and the
+        card it reserved, and none of the four host variables that would name a python outside the container.
+        It is readable by its owner alone. A job queued from a subdirectory gets the project root. One card
+        reserved is one card asked for, so the runner narrowed its request instead of adding a second one."""
+        root = self.lab()
+        self.sh(f"{root}/docker/run.sh ./lab/run.sh --cell c3", cwd=root)
+        self.assertEqual(self.run_file(root, "plain")["gpus"], "all")        # no card, so no card is asked for
+        self.gpus((24, 4))
+        sub = os.path.join(root, "lab")
+        jid = self.add("-q", "lab", "--tag", "c3_recall.s0", "--gpu-gb", "10", "--env", "SEED=0",
+                       "--", "./lab/hold.sh", f"{self.work}/go", cwd=sub)
+        name = self.started_cell(root, jid)
+        j = self.show(jid)
+        envfile = self.field(j, "envfile")
+        self.assertEqual(os.stat(envfile).st_mode & 0o777, 0o600)
+        env = self.kv(envfile)
+        self.assertEqual((env.get("OFFLINE"), env.get("PKGS"), env.get("SEED")), ("1", "/work/pkgs", "0"))
+        self.assertEqual(env.get("CUDA_VISIBLE_DEVICES"), "0")
+        self.assertEqual((env.get("PP_QUEUE"), env.get("PP_QUEUE_JOB"), env.get("PP_QUEUE_CONTAINER")),
+                         ("lab", jid, name))
+        self.assertEqual([k for k in ("PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+                                      "PP_QUEUE_RCFILE", "PP_QUEUE_ENVFILE") if k in env], [])
+        run = self.run_file(root, name)
+        self.assertEqual((run["root"], run["cwd"], run["envfile"]), (root, sub, envfile))
+        self.assertEqual(run["gpus"], "device=0")
+        self.assertEqual(self.field(j, "cards"), [0])
+        self.write("work/go", "")
+        self.wait(jid)
+
+    @unittest.expectedFailure
+    def test_a_kill_and_a_timeout_both_end_what_the_runner_started(self):
+        """A kill runs the project's stop command once, with this attempt's container name in its environment,
+        and what the runner started is gone. A timeout does the same. The stop command's exit code is on the
+        record. A stop command that exits 1 leaves the kill at exit 0, and the record still names the
+        container. A job that skips the runner has its work in its own group, so its stop is the group: SIGTERM
+        first, and SIGKILL once the grace is up."""
+        root = self.lab()
+        jid = self.add("-q", "lab", "--tag", "stop_probe", "--", "sleep", "600", cwd=root)
+        name = self.started_cell(root, jid)
+        self.pp("queue", "kill", jid)
+        self.until(lambda: not self.cell_up(root, name), what="the work the runner started to be gone")
+        self.until(lambda: self.ended(jid), what=f"job {jid} ended")
+        j = self.show(jid)
+        self.assertEqual(self.asked_to_stop(root), [[name, name]])
+        self.assertEqual((j["state"], self.field(j, "stop").get("rc")), ("failed", 0))
+        self.assertIsNone(self.field(j, "stop").get("kill9"))       # it ended inside its grace
+        self.assertEqual(self.field(j, "container"), name)
+
+        timed = self.add("-q", "lab", "--tag", "stop_probe", "--timeout", "2s", "--", "sleep", "600", cwd=root)
+        tname = self.started_cell(root, timed)
+        self.until(lambda: not self.cell_up(root, tname), timeout=25,
+                   what="the work a timeout's stop reached to be gone")
+        self.until(lambda: self.ended(timed), what=f"job {timed} ended")
+        t = self.show(timed)
+        self.assertEqual([e[0] for e in self.asked_to_stop(root)], [name, tname])
+        self.assertEqual((t["state"], self.field(t, "stop").get("rc")), ("failed", 0))
+        self.assertIn("timeout", self.field(t, "stop"))             # a timeout's stop, not a kill's
+
+        unhappy = self.lab("unhappy", stop="fail")
+        bad = self.add("-q", "lab", "--tag", "stop_probe", "--", "sleep", "600", cwd=unhappy)
+        badname = self.started_cell(unhappy, bad)
+        self.pp("queue", "kill", bad, "--grace", "1")
+        self.until(lambda: self.ended(bad), timeout=25, what=f"job {bad} ended")
+        b = self.show(bad)
+        self.assertEqual(self.field(b, "stop").get("rc"), 1)
+        self.assertEqual(self.field(b, "container"), badname)       # so one command by hand is always printed
+        self.end_cell(unhappy, badname)
+        self.until(lambda: not self.cell_up(unhappy, badname), what="the work a failed stop left")
+
+        group = self.add("-q", "lab", "--no-runner", "--tag", "stop_probe", "--",
+                         "sh", "-c", 'trap "" TERM; while :; do sleep 0.2; done', cwd=root)
+        self.until(lambda: self.state(group) == "running", what=f"job {group} running")
+        asks = len(self.asked_to_stop(root))
+        self.pp("queue", "kill", group, "--grace", "1")
+        self.until(lambda: self.ended(group), timeout=25, what=f"job {group} ended")
+        g = self.show(group)
+        self.assertEqual(self.stop_of(g), "group")
+        self.assertIsNotNone(self.field(g, "stop").get("sent"))
+        self.assertIsNotNone(self.field(g, "stop").get("kill9"))
+        self.assertEqual(len(self.asked_to_stop(root)), asks)       # no command ran for a job of the group
+
+    @unittest.expectedFailure
+    def test_one_job_by_hand_prints_its_id_on_stdout(self):
+        """`add` prints one id on stdout and nothing else there, so a driver reads the id from it. The job's
+        whole output goes to the path the project's pattern names, and the record names that path."""
+        root = self.lab()
+        self.gpus((80, 4))
+        r = self.pp("queue", "add", "-q", "lab", "--tag", "c3_recall.s0", "--gpu-gb", "36",
+                    "--", "./lab/run.sh", "--cell", "c3", "--seed", "0", cwd=root, env=self.as_agent())
+        jid = r.stdout.strip()
+        self.assertEqual(r.stdout.split(), [jid])
+        self.assertTrue(jid.isdigit(), r.stdout)
+        self.wait(jid)
+        j = self.show(jid)
+        self.assertEqual(self.field(j, "log"), f"{root}/logs/c3_recall.s0.log")
+        self.assertTrue(os.path.exists(j["log"]), j["log"])
+
+
+@needs("queue")
+@unittest.skipUnless(REAL_IMAGE and shutil.which("docker"), "no container runtime set aside for a journey")
+class TestTheProjectUnderARealRunner(TestTheProject):
+    """Steps 3 to 6 again, with a runner that starts a real container.
+
+    It is the same journey: the same tests, over a runner whose work is in a container instead of a session of
+    its own. A real container is handed a real card and a mount of the project root, so this needs a runtime on
+    PATH and a machine that set an image aside for it (PP_JOURNEY_IMAGE); the stories keep the machine's own
+    cards and directories out of a journey otherwise."""
+
+    RUNNER = REAL_RUNNER
+    STOP_ARGS = "--real "
+
+    def setUp(self):
+        super().setUp()
+        self.env["PP_IMAGE"] = REAL_IMAGE               # what the runner's `docker run` line runs
+
+    def cell_up(self, root: str, name: str) -> bool:
+        """Whether the container of that name is running, which the runtime answers by name."""
+        said = self.sh("docker inspect -f '{{.State.Running}}' " + shlex.quote(name), check=False)
+        return said.strip() == "true"
+
+
+class TestTheCampaign(Lab):
+    """Steps 7 and 8: a grid through a campaign file, and a stage that waits for the stage before it."""
+
+    @unittest.expectedFailure
+    def test_a_campaign_file_queues_every_line_or_none(self):
+        """A campaign file queues one job per line, every line carrying its own flags. The ids come out on
+        stdout in order, one per line. A flag on the `add` is the default for every line and a line's own flag
+        wins over it. A line holding an unquoted shell operator is refused and nothing is queued. A quoted pipe
+        is one word of the command. Blank lines and lines beginning with # are skipped."""
+        self.gpus((80, 4))
+        self.write("work/run.sh", RUN, 0o755)
+        plan = ["# the cells this campaign covers", ""]
+        plan += [f"--tag s3_L{n:02d} --gpu-gb 2 -- ./run.sh --layer {n}" for n in range(24)]
+        plan.append("--tag s3_eval --gpu-gb 12 --prio 0 -- ./run.sh --eval")
+        plan.append("-- sh -c 'echo a | grep a'")
+        ids = self.pp("queue", "add", "-q", "lab", "--from", "-", "--prio", "1", "--no-start",
+                      input="\n".join(plan) + "\n").stdout.split()
+        self.assertEqual(len(ids), 26)
+        self.assertEqual([int(i) for i in ids], sorted(int(i) for i in ids))
+        first, graded, piped = self.show(ids[0]), self.show(ids[24]), self.show(ids[25])
+        self.assertEqual((first["tag"], first["prio"], first["needs"].get("gpu_gb")), ("s3_L00", 1, 2))
+        self.assertEqual((graded["tag"], graded["prio"]), ("s3_eval", 0))
+        self.assertEqual(piped["cmd"], ["sh", "-c", "echo a | grep a"])
+        self.assertIsNone(piped["tag"])                          # a job added without --tag has no name
+        before = self.all_ids()
+        bad = list(plan)
+        bad[13] = "-- ./run.sh --layer 11 > out.txt"
+        self.pp("queue", "add", "-q", "lab", "--from", "-", "--no-start", input="\n".join(bad) + "\n", code=2)
+        self.assertEqual(self.all_ids(), before)
+
+    @unittest.expectedFailure
+    def test_a_stage_waits_for_the_stage_before_it(self):
+        """A job added with --after is queued until every job that selection named has ended. It is skipped
+        rather than waited for, so it never becomes the head of its queue and a job behind it still starts. A
+        dropped job counts as ended. The ids are read across every queue. An id no job has is refused, and
+        nothing is queued for it."""
+        self.write("work/hold.sh", HOLD, 0o755)
+        one = self.pp("queue", "add", "-q", "lab", "--from", "-",
+                      input="".join(f"./hold.sh go{n}\n" for n in range(1, 5))).stdout.split()
+        self.assertEqual(len(one), 4)
+        two = self.pp("queue", "add", "-q", "r1", "--from", "-", "--prio", "1", "--after", ",".join(one),
+                      input="./hold.sh go5\n./hold.sh go6\n").stdout.split()
+        for t in two:
+            j = self.show(t)
+            self.assertEqual(j["state"], "queued")
+            self.assertEqual(self.field(j, "after"), [int(i) for i in one])
+        self.until(lambda: self.state(one[0]) == "running", what=f"job {one[0]} running")
+        self.assertEqual([self.state(t) for t in two], ["queued", "queued"])
+        late = self.add("-q", "r1", "--prio", "5", "--", "true")          # one slot, and a worse priority
+        self.wait(late)
+        self.assertEqual([self.state(t) for t in two], ["queued", "queued"])
+        parked = self.until(lambda: next((j for j in one if self.state(j) == "queued"), None),
+                            what="the fourth job of stage one waiting for a slot")
+        self.pp("queue", "drop", parked, "-y")                            # a dropped job counts as ended
+        for n in range(1, 7):
+            self.write(f"work/go{n}", "")
+        self.wait(*[j for j in one if j != parked])
+        self.wait(*two)
+        before = self.all_ids()
+        self.pp("queue", "add", "-q", "lab", "--after", "999999", "--", "true", code=2)
+        self.assertEqual(self.all_ids(), before)
+
+
+class TestTheLanesAndTheFamilies(Lab):
+    """Steps 9 and 10: a lane is a single-slot queue that --all names on its own, and a family is steered by
+    the start of its name."""
+
+    @unittest.expectedFailure
+    def test_a_single_slot_queue_is_a_lane_and_all_names_only_it(self):
+        """--all with -q names every job of that queue whatever its tag, and no job of another queue. Without
+        -q it is a usage error. A hold before a kill keeps the lane from starting anything between the kill and
+        the drop. A tag that spans two queues is a usage error."""
+        self.write("work/hold.sh", HOLD, 0o755)
+        running = self.add("-q", "r1", "--tag", "recall_A10", "--", "./hold.sh", "go")
+        self.until(lambda: self.state(running) == "running", what=f"job {running} running")
+        parked = self.add("-q", "r1", "--tag", "recall_A11", "--", "true")
+        other = self.add("-q", "lab", "--tag", "recall_A10", "--hold", "--", "true")
+        self.pp("queue", "hold", "-q", "r1", "--all")
+        self.assertEqual(self.state(parked), "held")
+        self.assertEqual(self.state(running), "running")
+        self.pp("queue", "kill", "-y", "-q", "r1", "--all")
+        self.until(lambda: self.ended(running), what=f"job {running} ended")
+        self.assertEqual(self.state(parked), "held")             # the hold is what keeps it from starting
+        self.pp("queue", "drop", "-y", "-q", "r1", "--all")
+        self.pp("queue", "show", parked, code=2)                 # it is gone, with its own files
+        self.assertEqual(self.state(other), "held")              # another queue's job is untouched
+        self.pp("queue", "hold", "--all", code=2)
+        self.pp("queue", "drop", "recall_A10", "-n", code=2)     # a tag over two queues names the ids
+
+    @unittest.expectedFailure
+    def test_a_family_is_steered_by_prefix(self):
+        """--prefix matches from the first character of a tag and is repeatable, and the union of two that
+        overlap is taken once. A release over a family that is already queued exits 0 and leaves those jobs as
+        they are, so a driver that runs twice is no error the second time. A note takes one job, and the record
+        carries it."""
+        shift = [self.add("-q", "lab", "--no-start", "--tag", f"c3_shift.s{n}", "--", "true") for n in range(2)]
+        family = [self.add("-q", "lab", "--no-start", "--tag", t, "--", "true")
+                  for t in ("s3_a", "s3_b", "s3_eval")]
+        self.pp("queue", "reprio", "--prefix", "c3_shift", "0")
+        self.assertEqual([self.show(j)["prio"] for j in shift], [0, 0])
+        self.pp("queue", "hold", "--prefix", "s3_")
+        self.assertEqual([self.state(j) for j in family], ["held"] * 3)
+        self.pp("queue", "release", "--prefix", "s3_", "--no-start")
+        self.pp("queue", "release", "--prefix", "s3_", "--no-start")          # twice: exit 0 both times
+        self.assertEqual([self.state(j) for j in family], ["queued"] * 3)
+        self.pp("queue", "reprio", "--prefix", "s3_", "--prefix", "s3_e", "7")
+        self.assertEqual([self.show(j)["prio"] for j in family], [7, 7, 7])
+        self.pp("queue", "note", "s3_a", "formed at 3500; seen 0.954")
+        self.assertEqual([n["text"] for n in self.field(self.show(family[0]), "notes")],
+                         ["formed at 3500; seen 0.954"])
+        self.add("-q", "lab", "--no-start", "--tag", "s3_a", "--", "true")   # a second job of that one name
+        self.pp("queue", "note", "s3_a", "which one", code=2)                # a note takes one job
+        self.pp("queue", "drop", "--prefix", "c3_", "--prefix", "s3_", "-n")  # only the plan
+        self.assertEqual([self.state(j) for j in family], ["queued"] * 3)
+        self.pp("queue", "drop", "--prefix", "s3_", "--prefix", "s3_e", "-y")
+        for j in family:
+            self.pp("queue", "show", j, code=2)
+
+
+class TestTheRetriesAndTheRecovery(Lab):
+    """Steps 11 to 13: the retries are pp's, a worker that goes away is replaced, and a machine that went down
+    leaves work the next worker reaps."""
+
+    @unittest.expectedFailure
+    def test_a_retry_keeps_the_id_and_reads_only_its_own_attempt(self):
+        """An automatic retry keeps the job's id. A retry filter matches the failed attempt's own lines, from
+        the offset where that attempt began, so a pattern an earlier attempt matched matches no more. A job
+        waiting out its delay never becomes the head of its queue. An attempt's container is gone before the
+        next attempt starts."""
+        self.write("work/fail.sh", WORK["lab/fail.sh"], 0o755)
+        jid = self.add("--retries", "2", "--retry-if", "CUDA out of memory", "--retry-delay", "0.2",
+                       "--", "./fail.sh", f"{self.work}/tried")
+        self.wait(jid, code=1)
+        j = self.show(jid)
+        self.assertEqual((j["id"], j["state"]), (int(jid), "failed"))
+        self.assertEqual(j["attempt"], 2)                        # the second attempt said nothing to match
+        self.assertIsNotNone(self.field(j, "not_retried"))
+        self.assertGreater(self.field(j, "log_at"), 0)
+        self.assertEqual(self.field(self.field(j, "history")[0], "log_at"), 0)
+
+        slow = self.add("-q", "r1", "--retries", "1", "--retry-delay", "60", "--", "sh", "-c", "exit 1")
+        self.until(lambda: self.show(slow)["attempt"] == 2 and self.state(slow) == "queued",
+                   what=f"job {slow} waiting out its delay")
+        behind = self.add("-q", "r1", "--", "true")              # one slot, and the delay is not its head
+        self.wait(behind)
+        self.assertEqual(self.state(slow), "queued")
+        self.pp("queue", "drop", slow, "-y")
+
+        root = self.lab()
+        held = self.add("-q", "lab", "--retries", "1", "--retry-delay", "0.2", "--", "./lab/once.sh",
+                        self.work, cwd=root)
+        first = self.started_cell(root, held)
+        self.write(f"work/{first}.go", "")
+        second = self.until(lambda: (self.state(held) == "running"
+                                     and (self.show(held).get("container") or first) != first
+                                     and self.show(held)["container"]),
+                            what="the attempt after the one that failed")
+        self.assertFalse(self.cell_up(root, first))              # gone before the next attempt starts
+        self.write(f"work/{second}.go", "")
+        self.wait(held, code=1)
+        self.assertEqual(self.field(self.show(held), "container"), second)
+
+    @unittest.expectedFailure
+    def test_the_next_worker_adopts_a_running_job(self):
+        """A job keeps running when its worker stops, and nothing records how it ends until a worker is back.
+        The next worker adopts it under the pid the job's claim names. The exit code the job wrote is its own,
+        and so is its duration. One worker of a queue runs, so its limits are never doubled. A worker that was
+        killed leaves its claim free at once. A kill after the restart runs the same stop command on the same
+        container."""
+        jid = self.add("--", "sh", "-c", f"while [ ! -f {self.work}/go ]; do sleep 0.05; done; exit 7")
+        self.until(lambda: self.state(jid) == "running", what=f"job {jid} running")
+        pid = self.field(self.show(jid), "pid")
+        self.pp("queue", "worker", "stop")
+        self.until(lambda: not self.worker()["up"], what="the worker to be down")
+        self.assertEqual(self.state(jid), "running")
+        self.assertIsNone(self.show(jid).get("ended"))           # nothing is recording how it ends
+        self.pp("queue", "worker", "start")
+        self.until(lambda: self.worker()["up"], what="a worker to be up")
+        self.assertEqual(self.field(self.show(jid), "pid"), pid)      # adopted, and not started again
+        up = self.worker()["pid"]
+        self.pp("queue", "work", "-q", "default")                # a second worker of one queue: it holds none
+        self.assertEqual(self.worker()["pid"], up)
+        kill_pid(up)                                             # killed outright, so its claim is free at once
+        self.until(lambda: not self.worker()["up"], what="the killed worker's claim to be free")
+        self.write("work/go", "")
+        self.until(lambda: os.path.exists(self.field(self.show(jid), "rcfile")),
+                   what="the exit code the job wrote itself")
+        self.assertEqual(self.state(jid), "running")             # its own last act, with nothing watching
+        self.wait(jid, code=1)                                   # a wait starts a worker, which reaps it
+        j = self.show(jid)
+        self.assertEqual((j["state"], j["rc"]), ("failed", 7))
+        self.assertAlmostEqual(j["seconds"], j["ended"] - j["started"], places=3)
+
+        root = self.lab()
+        c = self.add("-q", "lab", "--", "sleep", "600", cwd=root)
+        name = self.started_cell(root, c)
+        kill_pid(self.until(lambda: self.worker("lab")["pid"], what="the lab worker's pid"))
+        self.until(lambda: not self.worker("lab")["up"], what="the lab worker's claim to be free")
+        self.pp("queue", "kill", c)                              # the worker this starts carries out the stop
+        self.until(lambda: not self.cell_up(root, name), what="the work the runner started to be gone")
+        self.assertEqual([e[0] for e in self.asked_to_stop(root)], [name])
+
+    def test_after_a_reboot_a_running_job_is_reaped_as_lost(self):
+        """A machine that went down leaves a job that was running with no live run and no exit code of its own.
+        The first worker that comes up records that attempt as lost and retries it where the retry filter
+        matches lost. No worker is up until something needs one. Every queue that exists is named. A campaign
+        file run again makes new jobs with new ids, because a tag is a name and never a key."""
+        self.write("work/hold.sh", HOLD, 0o755)
+        jid = self.add("--retries", "1", "--retry-if", "^lost$", "--retry-delay", "0.2",
+                       "--", "./hold.sh", f"{self.work}/go")
+        self.until(lambda: self.state(jid) == "running", what=f"job {jid} running")
+        j = self.show(jid)
+        kill_pid(self.until(lambda: self.worker()["pid"], what="the worker's pid"))   # the machine goes down ...
+        group = proc.Handle.recorded(j["pgid"], j["pstart"], group=True)
+        self.assertIsNotNone(group)
+        proc.signal_group(group, signal.SIGKILL)                 # ... and the run, which writes no exit code
+        self.until(lambda: not proc.alive(j["pid"]), what="the run to be gone")
+        self.assertFalse(self.worker()["up"])                    # nothing needs a worker, so none is up
+        self.write("work/go", "")                                # what the attempt after it waits for
+        self.wait(jid)
+        after = self.show(jid)
+        self.assertEqual((after["state"], after["attempt"]), ("done", 2))
+        self.assertEqual(self.field(self.field(after, "history")[0], "reason"), "lost")
+        self.add("-q", "r1", "--no-start", "--hold", "--", "true")
+        self.assertEqual(sorted(json.loads(self.status("--json"))["queues"]), ["default", "r1"])
+        self.write("work/plan.txt", "./hold.sh go\n./hold.sh go\n")
+        once = self.pp("queue", "add", "-q", "lab", "--from", "plan.txt", "--no-start").stdout.split()
+        again = self.pp("queue", "add", "-q", "lab", "--from", "plan.txt", "--no-start").stdout.split()
+        self.assertEqual(len(set(once) | set(again)), 4)
+
+
+class TestTheSecondProjectAndTheSession(Lab):
+    """Steps 14 and 15: a second project joins the queue, and an agent session hears how its own jobs ended."""
+
+    @unittest.expectedFailure
+    def test_two_projects_share_one_queue(self):
+        """One queue holds jobs of both projects, and each job carries its own project's name. A job added with
+        --cwd into the second project takes that project's runner, stop, log and env, not the first project's.
+        Neither project's tree holds the other's records."""
+        lab = self.lab("lab")
+        bench = self.lab("bench", name="bench", env='{ OFFLINE = "0", CELLS = "/work/cells" }')
+        a = self.add("-q", "lab", "--tag", "cellA", "--", "./lab/run.sh", cwd=lab)
+        b = self.add("-q", "lab", "--tag", "cellB", "--cwd", bench, "--", "./lab/run.sh", cwd=lab)
+        ja, jb = self.show(a), self.show(b)
+        self.assertEqual((ja["project"], jb["project"]), ("lab", "bench"))
+        self.assertEqual((ja["queue"], jb["queue"]), ("lab", "lab"))
+        self.assertEqual(self.field(jb, "runner"), [f"{bench}/docker/run.sh"])
+        self.assertEqual(self.stop_of(jb), self.stop_cmd(bench))
+        self.assertEqual(self.field(jb, "log"), f"{bench}/logs/cellB.log")
+        self.assertEqual(self.field(jb, "env"), {"OFFLINE": "***", "CELLS": "***"})
+        self.wait(a, b)
+        self.assertTrue(os.path.exists(f"{lab}/logs/cellA.log"))
+        self.assertTrue(os.path.exists(f"{bench}/logs/cellB.log"))
+        self.assertFalse(os.path.exists(f"{lab}/logs/cellB.log"))
+        self.assertFalse(os.path.exists(f"{bench}/logs/cellA.log"))
+        for j in (ja, jb):                                       # the records are the store's, not a tree's
+            self.assertTrue(self.field(j, "rcfile").startswith(self.env["PP_STATE_DIR"]), j["rcfile"])
+
+    @unittest.expectedFailure
+    def test_a_session_hears_how_its_own_jobs_ended(self):
+        """`wait --mine` covers every job this session queued that is live, and every one that ended without
+        the session hearing it. It exits 0 when all ended well, 1 when any failed, and 3 when it gives up at
+        its timeout. `show --json` holds every field the machine surface promises. A wait over a held job does
+        not return while the job is held."""
+        agent = self.as_agent("sess-a")
+        bad = self.add("--", "sh", "-c", "exit 3", env=agent)
+        self.until(lambda: self.ended(bad), what=f"job {bad} ended")
+        self.pp("queue", "wait", "--mine", "--poll", "0.2", code=1, env=agent)      # an outcome it never heard
+        self.pp("queue", "wait", "--mine", "--poll", "0.2", code=0, env=agent)      # and every one reported
+        live = self.add("--", "sh", "-c", f"while [ ! -f {self.work}/go ]; do sleep 0.05; done", env=agent)
+        self.pp("queue", "wait", "--mine", "--timeout", "1", "--poll", "0.2", code=3, env=agent)
+        self.write("work/go", "")
+        self.pp("queue", "wait", "--mine", "--poll", "0.2", code=0, env=agent)
+        j = self.show(live)
+        self.assertEqual([f for f in PROMISED if f not in j], [])
+        parked = self.add("--hold", "--tag", "s1_eval", "--", "true", env=agent)
+        waiter = self.spawn("queue", "wait", "s1_eval", "--poll", "0.2")
+        self.until(lambda: self.show(parked)["watchers"], what="the wait to be watching the held job")
+        self.assertIsNone(waiter.poll())                         # held, so it is not ended and does not return
+        self.pp("queue", "release", "s1_eval")
+        self.assertEqual(waiter.wait(timeout=30), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
