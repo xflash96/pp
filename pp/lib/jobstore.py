@@ -456,35 +456,33 @@ def amend(jid: int, changes: dict, must_be: tuple = ()) -> dict | None:
         return j
 
 
-def set_state(selection: list[dict], src: tuple, dst: str) -> tuple[list[dict], list[dict]]:
-    """hold and release: each job of the selection that the store holds in one of src becomes dst, in a
-    transaction of its own. -> the records it moved, and for each one it did not, the record as the store
-    holds it now (or the one handed in, as `gone`, where the store holds none)."""
-    done, left = [], []
-    for j in selection:
-        with txn() as s:
-            cur = s.job(j["id"], must_be=src)
-            if cur is None:
-                left.append(s.job(j["id"]) or {**j, "state": "gone"})
-                continue
-            cur["state"] = dst
-            s.save(cur)
-            done.append(dict(cur))
-    return done, left
+def _written(selection: list[dict], must_be: tuple, write, batch: int = 1) -> tuple[list[dict], list[dict]]:
+    """Each job of the selection that the store holds in one of must_be, written by `write` inside a scope
+    that holds `batch` of them at most, since a reader waits for the scope.
 
-
-def forget(selection: list[dict], must_be: tuple = ()) -> tuple[list[dict], list[dict]]:
-    """drop and clean: each job's record, and with it every file that belongs to that job alone. -> as
-    set_state. CLEAN_BATCH records at a time, since a reader waits for the scope."""
+    -> the records it wrote, and for each one it did not, the record as the store holds it now (or the one
+    handed in, as `gone`, where the store holds none). So the caller words what happened and reads no record
+    outside the scope that wrote it."""
     done, left = [], []
-    for i in range(0, len(selection), CLEAN_BATCH):
+    for i in range(0, len(selection), batch):
         with txn() as s:
-            for j in selection[i:i + CLEAN_BATCH]:
+            for j in selection[i:i + batch]:
                 cur = s.job(j["id"], must_be=must_be)
                 if cur is None:
                     left.append(s.job(j["id"]) or {**j, "state": "gone"})
                     continue
-                record = dict(cur)
-                _forget_job(s, cur)
-                done.append(record)
+                write(s, cur)
+                done.append(dict(cur))
     return done, left
+
+
+def set_state(selection: list[dict], src: tuple, dst: str) -> tuple[list[dict], list[dict]]:
+    """hold and release: each job of the selection that the store holds in one of src becomes dst, in a
+    transaction of its own. -> as `_written`."""
+    return _written(selection, src, lambda s, cur: (cur.update(state=dst), s.save(cur)))
+
+
+def forget(selection: list[dict], must_be: tuple = ()) -> tuple[list[dict], list[dict]]:
+    """drop and clean: each job's record, and with it every file that belongs to that job alone. -> as
+    `_written`, CLEAN_BATCH records to a scope."""
+    return _written(selection, must_be, _forget_job, CLEAN_BATCH)

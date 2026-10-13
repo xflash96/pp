@@ -69,7 +69,7 @@ def _by() -> str:
 def add_note(jid: int, text: str, by: str | None = None) -> dict | None:
     """Append a note to a job in any state; the updated job, or None when there is no such job."""
     note = {"t": time.time(), "text": text, "by": _by() if by is None else by}
-    return jobstore.amend(jid, {"notes": [note]})
+    return jobcore.amend(jid, {"notes": [note]})
 
 
 # ---- the worker, as this command wires it up -----------------------------------------------------------
@@ -531,7 +531,7 @@ def _append_log(job: dict, line: str):
 def _stamp_reported(jid: int, verb: str):
     who = session.caller()
     stamp = {"t": time.time(), "by": f"{verb} pid {os.getpid()}", "session": who["session"] if who else None}
-    jobstore.amend(jid, {"reported": [stamp]}, must_be=jobstore.ENDED)
+    jobcore.amend(jid, {"reported": [stamp]}, must_be=jobstore.ENDED)
 
 
 # ---- helpers for verbs ----------------------------------------------------------------------------
@@ -540,26 +540,22 @@ def _resolve(specs: list[str], scope: list[str] | None = None) -> list[dict]:
     """Jobs named by ids, ranges (12-15) or exact tags, in the order given, without duplicates. Ids are global.
     Each carries _bulk: it came from a range or a tag naming several jobs, so a verb skips it when it is in a state
     the verb does not apply to, where a job named on its own is an error."""
-    by_id = {j["id"]: j for j in jobstore.jobs(queue=scope)}
+    records = jobcore.jobs(queue=scope)
+    by_id = {j["id"]: j for j in records}
     out, seen = [], set()
-    for s in specs:
-        m = re.fullmatch(r"(\d+)-(\d+)", s)
-        if m:
-            hits = [by_id[i] for i in range(int(m[1]), int(m[2]) + 1) if i in by_id]
-        elif s.isdigit():
-            hits = [by_id[int(s)]] if int(s) in by_id else []
-        else:
-            hits = sorted((j for j in by_id.values() if j.get("tag") == s), key=lambda j: j["id"])
+    for spec in specs:
+        hits = [by_id[i] for i in policy.select(records, spec)]      # the five forms, over these records
+        if policy.kind(spec) == "tag":
             qs = sorted({j["queue"] for j in hits})
             if len(qs) > 1:
-                ui.die(f"{_PROG}: tag '{s}' names jobs in queues {', '.join(qs)}: "
+                ui.die(f"{_PROG}: tag '{spec}' names jobs in queues {', '.join(qs)}: "
                        + ", ".join(f"{j['id']} ({j['queue']})" for j in hits) + "; use ids, or -q", 2)
         if not hits:
-            ui.die(f"{_PROG}: no job matches '{s}'", 2)
+            ui.die(f"{_PROG}: no job matches '{spec}'", 2)
         for j in hits:
             if j["id"] not in seen:
                 seen.add(j["id"])
-                out.append({**j, "_bulk": bool(m) or len(hits) > 1})
+                out.append({**j, "_bulk": policy.kind(spec) == "range" or len(hits) > 1})
     return out
 
 
@@ -837,7 +833,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
 def _scope_list(scope: list[str] | None) -> list[str]:
     """The queues a verb works on: every one there is, which `queues` opens as it finds it, or the one it was
     given by name, which run_cli opened before any verb ran."""
-    return jobstore.queues() if scope is None else scope
+    return jobcore.queues() if scope is None else scope
 
 
 def cmd_status(a, scope: list[str] | None) -> int:
@@ -864,7 +860,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
     now = time.time()
     # one listing: the counts, the rows and what the shared pools hold are the same jobs, so no job is shown
     # twice or in two states. Every queue is listed, since a shared pool counts every queue's running jobs.
-    all_jobs = jobstore.jobs()
+    all_jobs = jobcore.jobs()
     # what each queue's worker is, through the one construct, so the hints that nothing launches or records
     # this queue's jobs come back from the one answer it gave
     workers = {q: jobcore.worker_now(q) for q in _scope_list(scope)}
@@ -919,8 +915,8 @@ def cmd_status(a, scope: list[str] | None) -> int:
     if not qs:
         print(f"no queues yet: `pp {_PROG} add -- CMD` starts one")
         return 1 if bad else 0
-    if scope and scope[0] not in jobstore.queues() and not _configured(scope[0]):
-        known = [q for q in jobstore.queues() if q != scope[0]]
+    if scope and scope[0] not in jobcore.queues() and not _configured(scope[0]):
+        known = [q for q in jobcore.queues() if q != scope[0]]
         print(f"no queue '{scope[0]}' yet" + (f" (there are: {', '.join(known)})" if known else ""))
     if (a.here or a.project) and not any(per[q]["data"][st] for q in qs for st in jobstore.STATES):
         print(f"no jobs of project '{want}'")
@@ -1093,7 +1089,7 @@ def cmd_log(a) -> int:
               f"`pp {_PROG} release {j['id']}` releases it", file=sys.stderr)
     if a.follow:
         while not (path and os.path.exists(path)):     # queued: the log appears when it starts
-            cur = jobstore.find(j["id"])
+            cur = jobcore.find(j["id"])
             if not cur or cur["state"] not in jobstore.LIVE:
                 break
             time.sleep(0.5)
@@ -1114,7 +1110,7 @@ def cmd_log(a) -> int:
                 sys.stdout.write(chunk.decode(errors="replace"))
                 sys.stdout.flush()
                 continue
-            cur = jobstore.find(j["id"])
+            cur = jobcore.find(j["id"])
             if not cur or cur["state"] in jobstore.ENDED:     # a pending retry is queued, not ended: keep following
                 sys.stdout.write(f.read().decode(errors="replace"))
                 print(_ended_line(cur, j["id"]), file=sys.stderr)
@@ -1181,7 +1177,7 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
     jid, started_at = j["id"], time.time()
     deadline = started_at + grace + KILL_WAIT
     while True:
-        cur = jobstore.find(jid)
+        cur = jobcore.find(jid)
         if cur is None:
             print(f"dropped {jid}")
             return 1
@@ -1313,7 +1309,7 @@ def cmd_retry(a) -> int:
 
 def cmd_clean(a, scope: list[str] | None) -> int:
     cutoff = time.time() - _dur_arg(a.older, "--older", "d") if a.older is not None else None
-    victims = [j for j in jobstore.jobs(jobstore.ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
+    victims = [j for j in jobcore.jobs(jobstore.ENDED, scope) if cutoff is None or (j.get("ended") or 0) < cutoff]
     if not victims:
         print("nothing to clean")
         return 0
@@ -1370,8 +1366,8 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         return a.timeout is not None and time.time() - t0 >= a.timeout
 
     def footer():
-        with jobstore.listing() as s:
-            live = {st: len(s.jobs(st, scope)) for st in jobstore.LIVE}
+        here = jobcore.jobs(jobstore.LIVE, scope)       # one listing: the three counts are the same jobs
+        live = {st: len([j for j in here if j["state"] == st]) for st in jobstore.LIVE}
         say(f"[{_PROG} {verb}] {datetime.now():%H:%M:%S}: running {live['running']}, queued {live['queued']}, held {live['held']}")
 
     def tell(j, jid):
@@ -1380,16 +1376,16 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
             _stamp_reported(jid, verb)
 
     if a.idle:
-        before = {j["id"] for j in jobstore.jobs(jobstore.ENDED, scope)}
+        before = {j["id"] for j in jobcore.jobs(jobstore.ENDED, scope)}
         told: set = set()
         asked: set = set()      # the queues this loop has asked for a worker: it says what holds a claim once
         with jobcore.watching(None, scope, verb):
             while True:
                 # one listing: the jobs still to come and the ones that ended are read together, so the last
                 # look, the one that finds none live, holds every outcome there is to report
-                with jobstore.listing() as s:
-                    live = s.jobs(("queued", "running"), scope)
-                    ended = [j for j in s.jobs(jobstore.ENDED, scope) if j["id"] not in before]
+                here = jobcore.jobs(queue=scope)
+                live = [j for j in here if j["state"] in ("queued", "running")]
+                ended = [j for j in here if j["state"] in jobstore.ENDED and j["id"] not in before]
                 if not live:
                     break
                 if stream:
@@ -1424,19 +1420,19 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
             return not any(isinstance(r, dict) and r.get("session") == me["session"] for r in j.get("reported") or [])
 
         # one listing of both halves: a job is listed once, in one state, so a target is named once
-        with jobstore.listing() as s:
-            targets = [j["id"] for j in s.jobs(jobstore.LIVE, scope) if mine(j)] \
-                + [j["id"] for j in s.jobs(jobstore.ENDED, scope) if mine(j) and unheard(j)]
+        here = jobcore.jobs(queue=scope)
+        targets = [j["id"] for j in here if j["state"] in jobstore.LIVE and mine(j)] \
+            + [j["id"] for j in here if j["state"] in jobstore.ENDED and mine(j) and unheard(j)]
         need_all = True
         if not targets:
             say("nothing of this session's is queued, held or running, and every outcome was reported to it")
             return 0
     else:
-        targets, need_all = [j["id"] for j in jobstore.jobs(("queued", "running"), scope)], False
+        targets, need_all = [j["id"] for j in jobcore.jobs(("queued", "running"), scope)], False
         if not targets:
             say("nothing queued or running")
             return 0
-    held = [j["id"] for j in (jobstore.find(t) for t in targets) if j and j["state"] == "held"]
+    held = [j["id"] for j in (jobcore.find(t) for t in targets) if j and j["state"] == "held"]
     if held:
         print(f"[{_PROG} {verb}] note: {', '.join(map(str, held))} held, so this waits forever. "
               f"`pp {_PROG} release` them", file=sys.stderr)
@@ -1446,7 +1442,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
         asked = set()           # as above: a loop says what holds a queue's claim on its first pass only
         blamed: set = set()     # the queues this loop has said no worker came up for, which it says once
         while True:
-            cur = {t: jobstore.find(t) for t in targets}
+            cur = {t: jobcore.find(t) for t in targets}
             if stream:
                 if not prev:
                     say(f"[{_PROG} watch] " + ", ".join(f"{t} {cur[t]['state'] if cur[t] else 'gone'}" for t in targets))
@@ -1512,7 +1508,7 @@ def cmd_worker(a, q_given: str | None, default_queue: str, scope: list[str] | No
             print(f"{r['queue']}: {state}   log {r['log']}")
         return 0
     q = q_given or default_queue
-    jobstore.writing_queue(q)    # `worker start -q NAME` opens that queue, so it goes through the same refusal
+    jobcore.writing_queue(q)    # `worker start -q NAME` opens that queue, so it goes through the same refusal
     logf = jobcore.worker_log(q)
     if a.action == "start":
         # one answer, from the scope that acted on it: nothing looks at the claim again, so a worker that came
@@ -1683,7 +1679,7 @@ def _verb(argv: list[str], prog: str, default_queue: str, doc: str, prepare_job,
         ui.die(f"{prog}: '{q}' is not a queue name (lowercase letters, digits, - and _; not {' or '.join(jobstore.RESERVED)})", 2)
     scope = a.scope = [q] if q else None
     if q is not None:
-        jobstore.open_queue(q)       # a queue named with -q is opened once here, whatever the verb does with it
+        jobcore.open_queue(q)       # a queue named with -q is opened once here, whatever the verb does with it
     if a.verb == "add" and cmd and a.cmd:
         ui.die(f"{prog} add: put the whole command after --", 2)
     # one row per verb: what it is called with is in the row, and nothing else is keyed on a verb's name. The

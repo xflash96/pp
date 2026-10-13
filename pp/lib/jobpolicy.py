@@ -361,6 +361,97 @@ def admit(state: dict, seen: dict, settings: dict) -> Pass:
         running.append({**job, "started": settings["now"], "gpu": card})
     return Pass(tuple(starts), blocked)
 
+# ---- the worker's own two numbers, and one look at its claim -------------------------------------------
+
+UP = "up"               # a worker holds the claim and has recorded itself
+STARTED = "started"     # the claim was free, and the worker this start brought up holds it
+DOWN = "down"           # nobody holds the claim
+STARTING = "starting"   # a worker holds the claim and has not recorded itself yet
+
+STOP_PERIOD = 0.1       # how long a woken worker waits between ticks while a stop of its queue is in flight
+POLL = 2.0              # how long between ticks, and how long a worker waits idle before it exits, where
+IDLE_EXIT = 600.0       # ... the settings it was handed say neither
+
+
+def look(rec: dict | None, alive: bool) -> str:
+    """What one look at a queue's worker claim says: `down` where nobody holds it, `up` where the record in
+    it names a process of its own that is alive, and `starting` while the holder has not recorded itself yet.
+
+    rec is the record the claim holds, or None where nobody holds it; alive is whether the process that
+    record names is running, which only a look at a process can say."""
+    if rec is None:
+        return DOWN
+    return UP if alive else STARTING
+
+
+def next_tick(settings: dict, serving: int, woken: bool, idle_since: float | None, now: float):
+    """How long the worker waits before its next tick, and whether its idle time is spent.
+
+    The short period goes with the wake: a verb waiting for a stop wakes the worker on every pass of its own
+    wait, so the tick after that wake is the worker's next one. A stop nobody waits for, a timeout's, is
+    carried out at the queue's poll, and the store lock is not taken ten times a second for a job the kernel
+    is slow to end.
+
+    idle_since is when the queue last held a job that is queued or running, and None while it holds one, so
+    an idle time that is spent is a worker with nothing left to do."""
+    period = float(settings.get("poll", POLL))
+    if serving and woken:
+        period = min(period, STOP_PERIOD)
+    return period, idle_since is not None and now - idle_since >= float(settings.get("idle_exit", IDLE_EXIT))
+
+
+# ---- what a job and a hook run with -------------------------------------------------------------------
+
+def job_env(job: dict, card: int | None) -> dict:
+    """The environment one attempt of a job runs in, in the order it is merged: what the shell that queued it
+    was in, the project's env and the job's own, pp's own names for this queue and this job, and the card it
+    was given."""
+    env = {**(job.get("shell_env") or {}), **(job.get("env") or {}),
+           "PP_QUEUE": job["queue"], "PP_QUEUE_JOB": str(job["id"]), "PP_QUEUE_RCFILE": job["rcfile"]}
+    if card is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(card)
+    return env
+
+
+def hook_env(job: dict, event: str) -> dict:
+    """What this job's on_fail / on_done hook runs with: the queue and the job, the event, and how the job
+    ended, so a hook needs to read no record. A field the record does not hold is empty, never absent: a hook
+    under `set -u` reads every one of them."""
+    reason = job.get("reason") or (f"exit {job['rc']}" if event == "failed" and job.get("rc") is not None else "")
+    return {"PP_QUEUE": job["queue"], "PP_QUEUE_JOB": str(job["id"]), "PP_QUEUE_EVENT": event,
+            "PP_QUEUE_RC": "" if job.get("rc") is None else str(job["rc"]), "PP_QUEUE_REASON": reason,
+            "PP_QUEUE_LOG": job.get("log") or "", "PP_QUEUE_CWD": job.get("cwd") or "",
+            "PP_QUEUE_TAG": job.get("tag") or ""}
+
+
+# ---- which jobs a selection names ----------------------------------------------------------------------
+
+def kind(spec: str) -> str:
+    """Which form of the selection grammar this is: an id, a range (12-15), or a tag matched whole."""
+    if re.fullmatch(r"\d+-\d+", spec):
+        return "range"
+    return "id" if spec.isdigit() else "tag"
+
+
+def select(records: list[dict], selection) -> list[int]:
+    """The ids these specs name, over the records they are read against: in the order the specs were given,
+    each id once, and the ids of one spec in id order.
+
+    One spec, or several. A form that names no record gives back nothing, and the caller refuses: nothing
+    here reads the store or writes a sentence."""
+    out: list[int] = []
+    for spec in ([selection] if isinstance(selection, str) else selection):
+        form = kind(spec)
+        if form == "range":
+            lo, hi = (int(x) for x in spec.split("-"))
+            hits = [j["id"] for j in records if lo <= j["id"] <= hi]
+        elif form == "id":
+            hits = [j["id"] for j in records if j["id"] == int(spec)]
+        else:
+            hits = [j["id"] for j in records if j.get("tag") == spec]
+        out += [jid for jid in sorted(hits) if jid not in out]
+    return out
+
 # ---- the settings a rule is handed ------------------------------------------------------------------
 
 def num(v) -> int | float:

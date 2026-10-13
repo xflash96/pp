@@ -48,7 +48,6 @@ from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, ses
 WRAP = ('printf \'{"pid": %d}\' "$$" >&0; "$@" 0</dev/null; r=$?; '
         'echo "$r" > "$PP_QUEUE_RCFILE.part" && mv "$PP_QUEUE_RCFILE.part" "$PP_QUEUE_RCFILE"')
 WAKE = signal.SIGUSR1       # what a verb sends a worker to end its wait between ticks, so a stop is served now
-STOP_PERIOD = 0.1           # how long a woken worker waits between ticks while a stop of its queue is in flight
 START_EVERY = 5.0           # how often one process starts a worker again for a queue whose last round brought none up
 STOP_WAIT = 300.0           # how long `worker_stop` waits for a worker inside a slow tick
 SLOW_TICK = 10.0            # ... and how long before it says it is waiting on one
@@ -339,9 +338,7 @@ class Worker:
         hlog = os.path.join(jobstore.qroot(q, "hooks"), f"{jid}-{event}.log")
         ran = False
         if argv:
-            env = {"PP_QUEUE": q, "PP_QUEUE_JOB": str(jid), "PP_QUEUE_EVENT": event,
-                   "PP_QUEUE_RC": "" if job.get("rc") is None else str(job["rc"]), "PP_QUEUE_REASON": job.get("reason") or (f"exit {job['rc']}" if event == "failed" and job.get("rc") is not None else ""),
-                   "PP_QUEUE_LOG": job.get("log") or "", "PP_QUEUE_CWD": job.get("cwd") or "", "PP_QUEUE_TAG": job.get("tag") or ""}
+            env = policy.hook_env(job, event)
             cwd = job.get("cwd") if job.get("cwd") and os.path.isdir(job["cwd"]) else "/"
             try:
                 with open(hlog, "a") as f:
@@ -459,10 +456,7 @@ class Worker:
         for the others: they would be left with no process, and read as lost."""
         jid, q = j["id"], self.queue
         argv = list(j.get("runner") or []) + list(j["cmd"])
-        env = {**(j.get("shell_env") or {}), **(j.get("env") or {}),
-               "PP_QUEUE": q, "PP_QUEUE_JOB": str(jid), "PP_QUEUE_RCFILE": j["rcfile"]}
-        if gpu is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env = policy.job_env(j, gpu)
         retries = int(j.get("retries") or 0)
         attempt = f" attempt {j.get('attempt', 1)}/{retries + 1}" if retries else ""
         try:
@@ -562,10 +556,8 @@ def _start_worker(q: str) -> proc.Child:
 # A verb asks `worker_now`, which reports, or `worker_up`, which makes sure a worker is up, and prints from the
 # one answer it gets back. So no verb acts on a look it took outside the scope that acted.
 
-UP = "up"               # a worker holds the claim and has recorded itself
-STARTED = "started"     # the claim was free, and the worker this start brought up holds it
-DOWN = "down"           # nobody holds the claim
-STARTING = "starting"   # a worker holds the claim and has not recorded itself yet
+# what one look at the claim says, which is `policy.look`'s answer and the one word every verb prints from
+UP, STARTED, DOWN, STARTING = policy.UP, policy.STARTED, policy.DOWN, policy.STARTING
 
 WORKER_STARTS = 3       # workers `worker_up` starts at most, each one asked about after it
 STARTING_LOOKS = 25     # looks it takes at a claim whose holder has not recorded itself ...
@@ -625,10 +617,9 @@ def worker_now(q: str) -> Holder:
     moment."""
     for _ in range(STARTING_LOOKS):
         rec = worker(q)
-        if rec is None:
-            return Holder(DOWN)
-        if proc.Handle.running(rec.get("pid"), rec.get("pstart")) is not None:
-            return Holder(UP, rec=rec)
+        how = policy.look(rec, proc.Handle.running((rec or {}).get("pid"), (rec or {}).get("pstart")) is not None)
+        if how != STARTING:
+            return Holder(how, rec=rec)
         time.sleep(STARTING_PAUSE)      # its first moment: look again rather than decide from it
     return Holder(STARTING, rec=rec)
 
@@ -701,7 +692,7 @@ def work(q: str, read_settings, admit_for, sink, tail=None) -> int:
 
     So the core reads no config file and takes no reading of its own, and it writes no sentence."""
     jobstore.writing_queue(q)    # a queue this pp cannot read is refused here too; the worker's own queue says its format
-    st = _settings(read_settings, sink)
+    st = _settings(read_settings)
     w = Worker(q, bool(st.get("backfill")), sink, tail, admit_for)
     # the wake is held for the whole of this worker's life, before it claims the queue: a wake can only ever
     # reach a worker that takes it from its own wakeup pipe
@@ -716,13 +707,15 @@ def work(q: str, read_settings, admit_for, sink, tail=None) -> int:
         signal.signal(signal.SIGTERM, lambda *_: stop.append(1))    # a flag, never an exception mid-move
         proc.say_ready()    # it holds its claim, it is recorded, a stop is handled and a wake is taken
         w.stopping = lambda: bool(stop)
-        adopted = jobstore.jobs("running", q)
-        sink("up", None, {"pid": os.getpid(), "backfill": w.backfill, "adopting": len(adopted)})
+        # the running jobs this worker adopts: it says how many, and its first pass reaps them like its own
+        sink("up", None, {"pid": os.getpid(), "backfill": w.backfill,
+                          "adopting": len(jobstore.jobs("running", q))})
         idle_since = None
         bad_cfg = None
         woken = False
         try:
             while not stop:
+                st = _settings(read_settings)   # once per loop, so a limit changes under a running job
                 bad = st.get("error")
                 if st.get("backfill") is not None and bool(st["backfill"]) != w.backfill:
                     w.backfill = bool(st["backfill"])
@@ -736,21 +729,17 @@ def work(q: str, read_settings, admit_for, sink, tail=None) -> int:
                 if bad != bad_cfg:
                     sink("config", None, {"error": bad})
                     bad_cfg = bad
-                period, idle_exit = float(st.get("poll", 2)), float(st.get("idle_exit", 600))
                 with jobstore.listing() as s:
-                    if s.jobs(("queued", "running"), q):
-                        idle_since, spent = None, False
-                    else:
-                        idle_since = idle_since or time.time()
-                        spent = time.time() - idle_since >= idle_exit
-                        if spent:
-                            # let the claim go inside the scope that read the store, which is the one order
-                            # that leaves no job behind: a job stored after this finds the claim free and
-                            # starts the next worker, and one stored before it was read here, so this worker
-                            # stays
-                            claim.release()
+                    busy = bool(s.jobs(("queued", "running"), q))
+                    idle_since = None if busy else (idle_since or time.time())
+                    period, spent = policy.next_tick(st, w.serving, woken, idle_since, time.time())
+                    if spent:
+                        # let the claim go inside the scope that read the store, which is the one order that
+                        # leaves no job behind: a job stored after this finds the claim free and starts the
+                        # next worker, and one stored before it was read here, so this worker stays
+                        claim.release()
                 if spent:
-                    sink("idle", None, {"idle_exit": idle_exit})
+                    sink("idle", None, {"idle_exit": st.get("idle_exit", policy.IDLE_EXIT)})
                     break
                 # one wait, ended by the period or by a signal: a stop in flight is carried out in the next
                 # tick, and a wake or a SIGTERM is acted on as it arrives. The short period goes with the
@@ -758,8 +747,7 @@ def work(q: str, read_settings, admit_for, sink, tail=None) -> int:
                 # tick after that wake is this worker's next one. A stop nobody waits for, a timeout's, is
                 # carried out at the queue's poll, and the store lock is not taken ten times a second for a
                 # job the kernel is slow to end
-                woken = waits.wait(min(period, STOP_PERIOD) if w.serving and woken else period)
-                st = _settings(read_settings, sink)      # once per loop, so a limit changes under a running job
+                woken = waits.wait(period)
         except KeyboardInterrupt:
             stop.append(1)
         finally:
@@ -769,10 +757,10 @@ def work(q: str, read_settings, admit_for, sink, tail=None) -> int:
     return 0
 
 
-def _settings(read_settings, sink) -> dict:
+def _settings(read_settings) -> dict:
     """The settings one pass of the loop runs under, as its caller reads them. A caller that raises is a
-    caller whose settings cannot be read: the error goes to the sink on the settings themselves, which is
-    what stops the pass launching anything."""
+    caller whose settings cannot be read: the error comes back on the settings themselves, which is what
+    stops that pass launching anything."""
     try:
         return read_settings()
     except Exception as e:
@@ -872,35 +860,29 @@ def worker_stop(q: str, sink=None) -> dict:
     until that holder lets the claim go.
 
     -> what it did (`did`: "down", "stopped", "denied", "starting" or "timeout") and the pid it signalled,
-    which three of those five sentences name. The caller words them, and hears through `sink` that the wait
-    is in a slow tick.
+    which three of those five sentences name. The caller words them, and hears through `sink`, once, that the
+    wait is in a slow tick.
 
     What this waits for is that worker, not a free claim: an `add` or a background `wait` starts the next
     worker as soon as the claim is free, and this stop is over when the one it signalled has let it go. It
     stops between ticks, and one tick can wait on a probe or on nvidia-smi; it is down when the claim is no
     longer its own, which the kernel sees to even if it never reaches the end of its own stop."""
-    say = sink or (lambda kind, job, fields: None)
     w = worker_now(q)           # one look, and this stop signals the worker that look found
-    if w.how == STARTING:       # there is nothing to signal yet: it has not recorded itself
-        return {"did": "starting", "pid": None}
-    if not w.up:                # nothing holds the claim: there is no worker, whatever is written in it
-        return {"did": "down", "pid": None}
+    if not w.up:                # nothing holds the claim, or a holder that has not recorded itself yet
+        return {"did": "starting" if w.how == STARTING else "down", "pid": None}
     h = w.handle                # the handle this one look gave: no second look decides what is signalled
     outcome = proc.signal_pid(h, signal.SIGTERM)
-    if outcome == "gone":       # it exited since we looked, or that pid is another process now
-        return {"did": "down", "pid": h.id}
-    if outcome == "denied":
-        return {"did": "denied", "pid": h.id}
-    start, said = time.time(), False
+    if outcome in ("gone", "denied"):   # it exited since we looked, or it is another user's
+        return {"did": "down" if outcome == "gone" else "denied", "pid": h.id}
+    start, told = time.time(), False
     while True:
         # whether the worker this stop signalled still holds the claim, asked through the one construct. A
         # record naming another worker, and nothing holding the claim, are both that worker gone
-        held = worker_now(q).rec or {}
+        held, waited = worker_now(q).rec or {}, time.time() - start
         if (held.get("pid"), held.get("pstart")) != (h.id, h.start):
             return {"did": "stopped", "pid": h.id}
-        if not said and time.time() - start > SLOW_TICK:
-            say("slow-stop", None, {"pid": h.id})
-            said = True
-        if time.time() - start > STOP_WAIT:
+        if waited > STOP_WAIT:
             return {"did": "timeout", "pid": h.id}
+        if sink is not None and waited > SLOW_TICK and not told:
+            told = sink("slow-stop", None, {"pid": h.id}) is None
         time.sleep(0.1)

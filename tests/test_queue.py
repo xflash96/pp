@@ -1812,9 +1812,10 @@ class TestPull(QueueCase):
         with mock.patch.object(jobstore.Txn, "__init__", init), mock.patch.object(jobstore.Txn, "jobs", jobs):
             rc, _, err = self.call("wait", "--mine", "--no-start", "--poll", "0.05", "--timeout", "0.3")
         self.assertEqual(rc, 3, err)
-        halves = [t for t in seen if t[1] in (tuple(jobstore.LIVE), tuple(jobstore.ENDED))]
-        self.assertEqual([t[1] for t in halves], [tuple(jobstore.LIVE), tuple(jobstore.ENDED)])
-        self.assertEqual(halves[0][0], halves[1][0], "the two halves came from two listings")
+        # one pass over the store, asked for every state and read in both halves: a job that ends between
+        # them cannot be named twice, and none falls between two passes
+        passes = [t for t in seen if t[1] in ((), tuple(jobstore.LIVE), tuple(jobstore.ENDED))]
+        self.assertEqual([t[1] for t in passes], [()])
 
     def test_a_job_that_starts_while_wait_lists_is_waited_on_once(self):
         """wait names each target once: a job is one record in one state, and one listing reads both halves of
@@ -1830,7 +1831,7 @@ class TestPull(QueueCase):
             j = self.add("--on-fail", "none", cmd=f"while [ ! -f {go} ]; do sleep 0.02; done")
             ticker = self.sb.ticker(jobq.worker_for("default").tick)
             journey.until(lambda: self.state(j) == "running", timeout=10, what=f"job {j} to start")
-            with mock.patch.object(jobstore, "find", find):
+            with mock.patch.object(jobcore, "find", find):
                 rc, out, _ = self.call("wait", *argv, "--no-start", "--poll", "0.05", "--timeout", "10")
             self.assertEqual(rc, 0, out)
             self.assertEqual(out.count(f"done {j}"), 1, out)
@@ -2910,7 +2911,7 @@ class TestTheWorkersWait(QueueCase):
             self.assertIsNotNone(claim, "something else holds the default worker claim")
 
             def loop():         # work()'s own loop: a wait of ten seconds that only a wake or a stop shortens
-                woke.append(waits.wait(jobcore.STOP_PERIOD if w.serving else 10))
+                woke.append(waits.wait(jobpolicy.STOP_PERIOD if w.serving else 10))
                 w.tick()
             t = self.sb.ticker(loop, period=0, name="worker")
             start = time.monotonic()
@@ -2938,7 +2939,7 @@ class TestTheWorkersWait(QueueCase):
             s.save(cur)
         w.carry_out()
         self.assertEqual(w.serving, 1)              # work() then waits STOP_PERIOD, not the queue's poll
-        self.assertLess(jobcore.STOP_PERIOD, 2.0)
+        self.assertLess(jobpolicy.STOP_PERIOD, 2.0)
         self.run_until(w, lambda: self.state(j) == "failed")
         self.assertEqual(w.serving, 0)
 
@@ -3001,7 +3002,7 @@ class TestTheWorkersWait(QueueCase):
             self.assertEqual(jobq.cmd_work("default", poll=5.0), 0)
         self.assertEqual(asked, [5.0, 5.0])             # the queue's poll, never STOP_PERIOD
         self.assertEqual((jobstore.find(j)["stop"] or {}).get("by"), "timeout")
-        self.assertLess(jobcore.STOP_PERIOD, 5.0)
+        self.assertLess(jobpolicy.STOP_PERIOD, 5.0)
 
     def test_a_stop_whose_sigkill_is_out_is_not_in_flight(self):
         """Once the SIGKILL is out there is nothing left to carry out for that stop, only a reap. So the
