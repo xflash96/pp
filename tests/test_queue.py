@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import journey  # noqa: E402
 import sandbox  # noqa: E402
 from pp.commands import queue as queue_cmd  # noqa: E402     the help text, which states the rules jobq keeps
-from pp.lib import config, jobq, proc  # noqa: E402
+from pp.lib import config, jobpolicy, jobq, proc  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -66,7 +66,7 @@ LEFT_A_RECORD = """
 import json
 import os
 import sys
-from pp.lib import jobq, lock
+from pp.lib import jobpolicy, jobq, lock
 lock.Claim.take(jobq._worker_claim(sys.argv[1]), json.loads(sys.argv[2]))
 os._exit(0)     # as a worker that was killed goes: no way out of its own runs, so its record stays behind
 """
@@ -1484,9 +1484,9 @@ class TestHooks(QueueCase):
         self.assertEqual(self.state(j), "failed")
 
     def test_hook_argv(self):
-        self.assertEqual(jobq.hook_argv("echo hi"), ["/bin/sh", "-c", "echo hi"])
-        self.assertIsNone(jobq.hook_argv("none"))
-        self.assertIsNone(jobq.hook_argv(None))
+        self.assertEqual(jobpolicy.hook_argv("echo hi"), ["/bin/sh", "-c", "echo hi"])
+        self.assertIsNone(jobpolicy.hook_argv("none"))
+        self.assertIsNone(jobpolicy.hook_argv(None))
 
     def test_owner_captured_and_no_default_hook(self):
         human = jobq.find(self.add())
@@ -3036,7 +3036,7 @@ STOPS = ("none",) + tuple(f"{by}-{out}" for by in ("kill", "timeout") for out in
 
 
 class TestTheDecision(unittest.TestCase):
-    """`jobq.decide` is the one place that says what is to be done about a running job, and `jobq.merge_stop`
+    """`jobpolicy.decide` is the one place that says what is to be done about a running job, and `jobpolicy.merge_stop`
     the one place that says what a second stop on it comes to. Both are pure, so this table needs no process,
     no thread and no clock.
 
@@ -3116,7 +3116,7 @@ class TestTheDecision(unittest.TestCase):
         st = self.stop(r["stop"], r["grace_up"])
         if st is not None:
             job["stop"] = st
-        return job, jobq.Facts(held=r["held"], rc=r["rc"], rc_at=self.rc_at(r), sig=r["sig"], now=self.NOW)
+        return job, jobpolicy.Facts(held=r["held"], rc=r["rc"], rc_at=self.rc_at(r), sig=r["sig"], now=self.NOW)
 
     # -- what each row's action is -------------------------------------------------------------------------
     @staticmethod
@@ -3133,17 +3133,17 @@ class TestTheDecision(unittest.TestCase):
         """How the job's own run ended where it wrote no exit code: the signal it died of, or lost."""
         return None if r["rc"] is not None else (f"signal {r['sig']}" if r["sig"] else "lost")
 
-    def ends(self, rc, reason, ended, sweep, hook, not_retried=None) -> jobq.Action:
-        return jobq.Action(jobq.ENDED_AS, state="done" if rc == 0 and not reason else "failed", rc=rc,
+    def ends(self, rc, reason, ended, sweep, hook, not_retried=None) -> jobpolicy.Action:
+        return jobpolicy.Action(jobpolicy.ENDED_AS, state="done" if rc == 0 and not reason else "failed", rc=rc,
                            reason=reason, hook=hook, ended=ended, sweep=sweep, not_retried=not_retried)
 
-    def failure(self, r, rc, reason, ended, sweep) -> jobq.Action:
+    def failure(self, r, rc, reason, ended, sweep) -> jobpolicy.Action:
         """A failure of the job's own: another attempt where it has one left and --retry-if matches, else the
         end of it, which says why it was not retried. The delay doubles per attempt, up to RETRY_DELAY_CAP."""
         if r["left"] and r["retry_if"] is None:
             at = self.NOW if ended is None else ended
-            delay = min(self.DELAY * 2 ** (r["attempt"] - 1), jobq.RETRY_DELAY_CAP)
-            return jobq.Action(jobq.AGAIN, rc=rc, reason=reason, ended=at, sweep=sweep,
+            delay = min(self.DELAY * 2 ** (r["attempt"] - 1), jobpolicy.RETRY_DELAY_CAP)
+            return jobpolicy.Action(jobpolicy.AGAIN, rc=rc, reason=reason, ended=at, sweep=sweep,
                                attempt=r["attempt"] + 1, not_before=at + delay)
         why = reason or f"exit {rc}"
         nr = f"neither the reason ({why}) nor the log tail matches /{r['retry_if']}/" if r["left"] else None
@@ -3158,22 +3158,22 @@ class TestTheDecision(unittest.TestCase):
             # file, so what is done about the job is whatever its stop asks for
             ("A signal pp was refused is recorded as denied, and nothing more goes out for that stop.",
              lambda r: r["held"] and r["denied"],
-             lambda r: jobq.Action(jobq.NOTHING)),
+             lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             ("A stop nobody has signalled yet goes out as SIGTERM to the job's process group.",
              lambda r: r["held"] and r["any"] and not r["sent"],
-             lambda r: jobq.Action(jobq.TERM)),
+             lambda r: jobpolicy.Action(jobpolicy.TERM)),
             ("A stop whose grace is up is escalated to SIGKILL, once.",
              lambda r: r["held"] and r["sent"] and not r["kill9"] and r["grace_up"],
-             lambda r: jobq.Action(jobq.KILL9)),
+             lambda r: jobpolicy.Action(jobpolicy.KILL9)),
             ("A stop inside its grace, or SIGKILLed already, is waited for.",
              lambda r: r["held"] and r["any"],
-             lambda r: jobq.Action(jobq.NOTHING)),
+             lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             ("A job with no stop whose own timeout has run out gets a timeout's stop.",
              lambda r: r["held"] and not r["any"] and r["due"],
-             lambda r: jobq.Action(jobq.TIME_UP, t=self.NOW, grace=jobq.TIMEOUT_GRACE)),
+             lambda r: jobpolicy.Action(jobpolicy.TIME_UP, t=self.NOW, grace=jobpolicy.TIMEOUT_GRACE)),
             ("A job with no stop whose time is not up is left as it is.",
              lambda r: r["held"] and not r["any"],
-             lambda r: jobq.Action(jobq.NOTHING)),
+             lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             # its run is over, so its exit code is the command's last word and this is where it ends
             ('A job a kill\'s signal stopped is recorded "killed" and fires no hook, unless it wrote its own '
              "exit code as the kill arrived, and then it keeps that code and fires the hook for it.",
@@ -3210,12 +3210,12 @@ class TestTheDecision(unittest.TestCase):
             what, then = said[0]
             seen.add(what)
             job, facts = self.case(r)
-            self.assertEqual(jobq.decide(job, facts), then(r), f"{what}: {r}")
+            self.assertEqual(jobpolicy.decide(job, facts), then(r), f"{what}: {r}")
         self.assertEqual(n, 4224)                                   # 2*3*11*2*2*2*2*2*2 rows
         self.assertEqual(seen, {what for what, _w, _t in rules})    # and every rule is a row of its own
         # both sides of the delay's cap are a row here, so neither arm can go quiet under a later constant
-        self.assertGreater(self.DELAY * 2 ** (max(self.ATTEMPTS) - 1), jobq.RETRY_DELAY_CAP)
-        self.assertLess(self.DELAY * 2 ** (min(self.ATTEMPTS) - 1), jobq.RETRY_DELAY_CAP)
+        self.assertGreater(self.DELAY * 2 ** (max(self.ATTEMPTS) - 1), jobpolicy.RETRY_DELAY_CAP)
+        self.assertLess(self.DELAY * 2 ** (min(self.ATTEMPTS) - 1), jobpolicy.RETRY_DELAY_CAP)
 
     def test_every_rule_is_a_sentence_of_the_help(self):
         """`pp help queue` is the one statement of how a job ends, and this table is the same rules in the
@@ -3234,21 +3234,21 @@ class TestTheDecision(unittest.TestCase):
         for r in self.rows():
             job, facts = self.case(r)
             before = json.dumps(job, sort_keys=True)
-            first = jobq.decide(job, facts)
+            first = jobpolicy.decide(job, facts)
             self.assertEqual(json.dumps(job, sort_keys=True), before, r)
-            self.assertEqual(jobq.decide(job, facts), first, r)
+            self.assertEqual(jobpolicy.decide(job, facts), first, r)
 
     def test_a_job_with_no_hook_owes_none(self):
         """The hook a row names is the job's own: a job that carries no on_fail owes nothing when it fails,
         and nothing has to be cleared from its record."""
         bare = {"id": 1, "queue": "default", "state": "running", "attempt": 1, "retries": 0}
-        over = jobq.Facts(held=False, rc=7, rc_at=self.RC_AT, now=self.NOW)
-        self.assertIsNone(jobq.decide(bare, over).hook)
-        self.assertEqual(jobq.decide({**bare, "on_fail": "echo x"}, over).hook, "failed")
-        self.assertEqual(jobq.decide({**bare, "on_fail": "none"}, over).hook, None)     # `none` is no hook
-        ok = jobq.Facts(held=False, rc=0, rc_at=self.RC_AT, now=self.NOW)
-        self.assertIsNone(jobq.decide(bare, ok).hook)
-        self.assertEqual(jobq.decide({**bare, "on_done": "echo x"}, ok).hook, "done")
+        over = jobpolicy.Facts(held=False, rc=7, rc_at=self.RC_AT, now=self.NOW)
+        self.assertIsNone(jobpolicy.decide(bare, over).hook)
+        self.assertEqual(jobpolicy.decide({**bare, "on_fail": "echo x"}, over).hook, "failed")
+        self.assertEqual(jobpolicy.decide({**bare, "on_fail": "none"}, over).hook, None)     # `none` is no hook
+        ok = jobpolicy.Facts(held=False, rc=0, rc_at=self.RC_AT, now=self.NOW)
+        self.assertIsNone(jobpolicy.decide(bare, ok).hook)
+        self.assertEqual(jobpolicy.decide({**bare, "on_done": "echo x"}, ok).hook, "done")
 
     def test_an_asker_called_timeout_is_still_a_kill(self):
         """A worker's own stop carries `timeout`, so what a stop is never rests on the name of whoever asked:
@@ -3256,11 +3256,11 @@ class TestTheDecision(unittest.TestCase):
         job = {"id": 1, "queue": "default", "state": "running", "attempt": 1, "retries": 3,
                "retry_delay": self.DELAY, "on_fail": "echo failed",
                "stop": {"by": "timeout", "t": self.NOW - 60, "grace": self.GRACE, "sent": self.NOW - 60}}
-        over = jobq.Facts(held=False, rc=None, sig=9, now=self.NOW)
-        a = jobq.decide(job, over)
-        self.assertEqual((a.do, a.reason, a.hook), (jobq.ENDED_AS, "killed", None))      # never retried
+        over = jobpolicy.Facts(held=False, rc=None, sig=9, now=self.NOW)
+        a = jobpolicy.decide(job, over)
+        self.assertEqual((a.do, a.reason, a.hook), (jobpolicy.ENDED_AS, "killed", None))      # never retried
         worker_wrote_it = {**job, "stop": {**job["stop"], "timeout": True}}
-        self.assertEqual(jobq.decide(worker_wrote_it, over).do, jobq.AGAIN)      # a timeout may be retried
+        self.assertEqual(jobpolicy.decide(worker_wrote_it, over).do, jobpolicy.AGAIN)      # a timeout may be retried
 
     def test_a_code_the_attempt_wrote_at_its_timeout_is_its_own_outcome(self):
         """The rule the help, CONTRIBUTING and `decide` all state: an attempt that wrote its own exit code as
@@ -3272,14 +3272,14 @@ class TestTheDecision(unittest.TestCase):
                "on_done": "echo done",
                "stop": {"by": "timeout", "timeout": True, "t": self.NOW - 60, "grace": self.GRACE,
                         "sent": self.NOW - 50}}
-        wrote_0 = jobq.decide(job, jobq.Facts(held=False, rc=0, rc_at=self.RC_AT, now=self.NOW))
+        wrote_0 = jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=0, rc_at=self.RC_AT, now=self.NOW))
         self.assertEqual((wrote_0.do, wrote_0.state, wrote_0.reason, wrote_0.hook),
-                         (jobq.ENDED_AS, "done", None, "done"))
-        wrote_7 = jobq.decide(job, jobq.Facts(held=False, rc=7, rc_at=self.RC_AT, now=self.NOW))
-        self.assertEqual((wrote_7.do, wrote_7.rc, wrote_7.reason), (jobq.ENDED_AS, 7, None))
+                         (jobpolicy.ENDED_AS, "done", None, "done"))
+        wrote_7 = jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=7, rc_at=self.RC_AT, now=self.NOW))
+        self.assertEqual((wrote_7.do, wrote_7.rc, wrote_7.reason), (jobpolicy.ENDED_AS, 7, None))
         self.assertIn("exit 7", wrote_7.not_retried)        # and /^timeout$/ is not what that failure is
-        wrote_none = jobq.decide(job, jobq.Facts(held=False, rc=None, now=self.NOW))
-        self.assertEqual((wrote_none.do, wrote_none.reason), (jobq.AGAIN, "timeout"))
+        wrote_none = jobpolicy.decide(job, jobpolicy.Facts(held=False, rc=None, now=self.NOW))
+        self.assertEqual((wrote_none.do, wrote_none.reason), (jobpolicy.AGAIN, "timeout"))
 
     def test_a_second_stop_merges_into_the_one_on_the_record(self):
         """One stop per run of a job: what went out is all the decision and the waiting verb have to go on, so
@@ -3305,7 +3305,7 @@ class TestTheDecision(unittest.TestCase):
         for what, existing, ask, want in rows:
             with self.subTest(what):
                 was, asked = None if existing is None else dict(existing), dict(ask)
-                self.assertEqual(jobq.merge_stop(existing, ask), want)
+                self.assertEqual(jobpolicy.merge_stop(existing, ask), want)
                 self.assertEqual(existing, was, "it changed the stop it was given")
                 self.assertEqual(ask, asked, "it changed the ask it was given")
 
@@ -3429,7 +3429,7 @@ import os
 import sys
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobq, proc
+from pp.lib import jobpolicy, jobq, proc
 
 STEP, Q, NOTES, PASSES = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
 AT_THE_STEP = 97            # the same number the test that started this worker reads
@@ -3514,7 +3514,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobq
+from pp.lib import jobpolicy, jobq
 
 OUT, JID, DEADLINE = sys.argv[2], int(sys.argv[3]), time.monotonic() + 60
 with jobq.listing() as s:               # one look before it says it is up, so the test writes after it
@@ -3537,7 +3537,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobq
+from pp.lib import jobpolicy, jobq
 
 GATE, CWD, DEADLINE = sys.argv[2], sys.argv[3], time.monotonic() + 60
 print("ready", flush=True)
@@ -3556,7 +3556,7 @@ import sys
 import time
 
 sys.path.insert(0, sys.argv[1])
-from pp.lib import jobq
+from pp.lib import jobpolicy, jobq
 
 GATE, Q, DEADLINE = sys.argv[2], sys.argv[3], time.monotonic() + 60
 print("ready", flush=True)
@@ -3600,7 +3600,7 @@ class InjectedCase(QueueCase):
         with jobq.txn() as s:
             cur = s.job(jid, must_be=("running",))
             self.assertIsNotNone(cur, f"job {jid} is not running")
-            cur["stop"] = jobq.merge_stop(cur.get("stop"), {"by": by, "t": time.time(), "grace": grace})
+            cur["stop"] = jobpolicy.merge_stop(cur.get("stop"), {"by": by, "t": time.time(), "grace": grace})
             s.save(cur)
             return dict(cur["stop"])
 

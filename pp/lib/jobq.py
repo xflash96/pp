@@ -27,7 +27,7 @@ One construct makes sure a queue has a worker and says what that worker is (`wor
 verb that only reports). It is the one place that reads the claim's holder. Every verb prints from the one
 answer it gets back, so no verb acts on a look it took outside the scope that acted.
 
-One function says what is to be done about a running job: `decide(job, facts)`, from the job's record and the
+One function says what is to be done about a running job: `jobpolicy.decide(job, facts)`, from the job's record and the
 facts read with it, giving back the one action to carry out. It is pure. `Worker.carry_out` is the one pass
 over the queue's running jobs that gathers those facts, asks it, and carries the action out. So a timeout, a
 kill and a reap are facts about one job and one decision made from all of them.
@@ -57,7 +57,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
-from pp.lib import config, lock, paths, proc, session, ui
+from pp.lib import config, jobpolicy as policy, lock, paths, proc, session, ui
 
 STATES = ("queued", "held", "running", "done", "failed")
 LIVE = ("queued", "held", "running")
@@ -76,7 +76,6 @@ NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 RECORD = re.compile(r"\d+\.json")     # what a job record is called: jobs/<id>.json, and nothing else is one
 RESERVED = ("probes", "watchers")     # directories beside the queues
 FORMAT = 1                  # what a queue's FORMAT file holds: the layout of everything under queue/<name>/
-TIMEOUT_GRACE = 10.0        # seconds between a timeout's SIGTERM and its SIGKILL
 WAKE = signal.SIGUSR1       # what a verb sends a worker to end its wait between ticks, so a stop is served now
 STOP_PERIOD = 0.1           # how long a woken worker waits between ticks while a stop of its queue is in flight
 KILL_POLL = 0.1             # how often `kill` looks for the outcome that is recorded
@@ -88,8 +87,6 @@ KILL_POLL = 0.1             # how often `kill` looks for the outcome that is rec
 KILL_WAIT = 120.0
 # how often one process starts a worker again for a queue whose last round of starts brought none up
 START_EVERY = 5.0
-RETRY_DELAY = 30.0
-RETRY_DELAY_CAP = 3600.0
 STOP_WAIT = 300.0           # how long `worker stop` waits for a worker inside a slow tick
 CLEAN_BATCH = 100           # job records `clean` removes in one transaction, so a reader never waits long
 
@@ -481,7 +478,7 @@ def _finish(s: Txn, job: dict, state: str, rc: int | None, reason: str | None = 
     s.save(job)
 
 
-def _requeue(s: Txn, job: dict, a: Action) -> str:
+def _requeue(s: Txn, job: dict, a: policy.Action) -> str:
     """In a transaction: the job goes back to its queue for the attempt the action names, with the same id.
     -> the line for its log, which the caller appends after the scope."""
     attempt, retries = int(job.get("attempt", 1)), int(job.get("retries") or 0)
@@ -548,22 +545,6 @@ def _dur_arg(v, what: str, default_unit: str = "s") -> float:
     if secs is None:
         ui.die(f"{_PROG}: {what}: say how long, like 90s, 30m, 2h or 1d", 2)
     return secs
-
-
-def _num(v) -> int | float:
-    f = float(v)
-    return int(f) if f.is_integer() else f
-
-
-def _hook_spec(v) -> str | None:
-    v = (v or "").strip() if isinstance(v, str) else v
-    return None if not v or v == "none" else str(v)
-
-
-def hook_argv(spec: str | None) -> list[str] | None:
-    """argv a hook runs as: a shell command."""
-    spec = _hook_spec(spec)
-    return None if spec is None else ["/bin/sh", "-c", spec]
 
 
 # ---- resources ------------------------------------------------------------------------------------
@@ -672,7 +653,7 @@ def _pool(name: str, v, scope: str | None) -> dict | None:
         mx = {"cpu": os.cpu_count() or 1, "mem_gb": round(_mem_total_gb()), "gpu_gb": None}[name]   # gpu: per card
     elif mx is not None:
         try:
-            mx = _num(mx)
+            mx = policy.num(mx)
         except (TypeError, ValueError):
             raise config.ConfigError(f"{where} = {mx!r}: not a number") from None
     p = {"name": name, "scope": scope, "where": where, "max": mx, "probe": None, "every": PROBE_EVERY,
@@ -750,7 +731,7 @@ def reading(p: dict, run: bool = True) -> dict | None:
             if out.timed_out:
                 r = {"t": t, "value": None, "error": f"it did not answer in {PROBE_WAIT:g}s"}
             elif out.returncode == 0 and (m := re.search(r"-?\d+(?:\.\d+)?", out.stdout)):
-                r = {"t": t, "value": _num(m[0]), "error": None}
+                r = {"t": t, "value": policy.num(m[0]), "error": None}
             else:
                 said = (out.stderr.strip() or out.stdout.strip()).splitlines()
                 r = {"t": t, "value": None, "error": (f"exit {out.returncode}" if out.returncode else "printed no number")
@@ -870,199 +851,6 @@ class Resources:
             out.append({"name": p["name"], "max": p["max"], "used": sum(_need(j, p["name"]) for j in self._in(p, running)),
                         "probe": p["probe"], "reading": r})
         return out
-
-
-# ---- how a job ends: one decision ------------------------------------------------------------------
-#
-# Five things can be true of a running job at once: a run of it is live or over, it wrote an exit code or it
-# did not, a stop is on its record or there is none, the grace that stop was given is up or it is not, and its
-# own time has run out or it has not. `decide` is the one place that says what is to be done about it, from all
-# of them together. It reads facts and the job's record, and writes nothing: no clock, no store, no process,
-# which `TestContracts` in tests/test_constructs.py reads the source to keep.
-#
-# Around it, `Worker.carry_out` gathers the facts about each running job, calls this once, and carries the one
-# action out: the signal through the job's Handle, the record in one transaction, the hook after it. So a
-# timeout, a kill and a reap are not three actors with three views of one job; they are facts about it, and one
-# decision made from all of them.
-
-NOTHING = "nothing"         # leave it as it is
-TIME_UP = "time-up"         # write a timeout's stop on it; from there it is a stop like any other
-TERM = "term"               # SIGTERM to its group, recorded as the stop's `sent`
-KILL9 = "kill9"             # SIGKILL to its group, recorded as the stop's `kill9`
-ENDED_AS = "ended-as"       # record how it ended, and the hook that is owed for it
-AGAIN = "again"             # back to its queue for another attempt
-
-
-@dataclass(frozen=True)
-class Facts:
-    """What is true of one running job apart from its record, read before the decision and never inside it.
-
-    held    a run of this attempt is live: its own wrapper holds the job's run claim, or this worker started
-            that wrapper and has not reaped it yet. While it is held the
-            attempt's exit code counts for nothing, since the command itself can write that file ($PP_QUEUE_RCFILE
-            is in its environment); a code is the command's last word only once the run is over.
-    rc, rc_at   the exit code this attempt wrote and when it wrote it (`ended_on_its_own`), or None for both.
-    sig     the signal the attempt's process died of, where this worker started it and so holds the child.
-    now     the time the facts were read at, which is the only clock the decision has.
-    tail    the job's log as --retry-if matches against it, read where the job asks for one.
-    """
-
-    held: bool
-    rc: int | None = None
-    rc_at: float | None = None
-    sig: int | None = None
-    now: float = 0.0
-    tail: str = ""
-
-
-@dataclass(frozen=True)
-class Action:
-    """The one thing to be done about a job. `do` is which, and a field a kind does not use is None.
-
-        nothing                                                      leave it alone
-        time-up   t, grace                                  write {by: timeout, timeout: True, t, grace} on it
-        term                                                         SIGTERM to its group
-        kill9                                                        SIGKILL to its group
-        ended-as  state, rc, reason, hook, ended, sweep, not_retried  record how it ended
-        again     attempt, not_before, rc, reason, ended, sweep       back to its queue for another attempt
-
-    hook is the event whose hook is owed ("failed", "done"), or None where the outcome owes none or the job
-    carries no such hook. sweep says anything left in the job's process group goes with it.
-    """
-
-    do: str
-    state: str | None = None
-    rc: int | None = None
-    reason: str | None = None
-    hook: str | None = None
-    ended: float | None = None
-    sweep: bool = False
-    attempt: int | None = None
-    not_before: float | None = None
-    not_retried: str | None = None
-    t: float | None = None
-    grace: float | None = None
-
-    @property
-    def why(self) -> str:
-        """The failure as the job's log names it and --retry-if matches it: a reason, or the exit code."""
-        return self.reason or f"exit {self.rc}"
-
-
-def matches_retry_if(job: dict, why: str, tail: str) -> bool:
-    """Whether --retry-if matches this failure: its reason, or the tail of the job's log."""
-    pat = job.get("retry_if")
-    if not pat:
-        return True
-    try:
-        return re.search(pat, why + "\n" + tail, re.M) is not None   # ^ $ per line
-    except re.error:
-        return False
-
-
-def decide(job: dict, facts: Facts) -> Action:
-    """What is to be done about this running job: one action, from its record and the facts read with it.
-
-    The rules are the ones `pp help queue` states under "How a job ends", in the order they are tried here.
-    That help is their one statement; `TestTheDecision` in tests/test_queue.py is the table over every
-    combination of the facts, and it checks each of its rules against that help.
-
-    What a stop is does not rest on who asked for it: a timeout's carries `timeout`, so an asker called
-    `timeout` writes a kill's stop like anyone else.
-    """
-    stop = job.get("stop") or {}
-    asked = bool(stop) and not stop.get("timeout")      # a kill: someone asked for this job to stop
-    out = bool(stop.get("sent")) or bool(stop.get("kill9"))     # a signal of pp's went out for this stop
-    if facts.held:
-        # a run of it is live, so nothing is recorded about how it ended and its exit code says nothing yet:
-        # the one thing to do about it is to carry out the stop it carries, or to write a timeout's
-        if stop.get("denied"):
-            return Action(NOTHING)      # pp was refused this job's group: nothing more goes out for it
-        if not stop:
-            due = (job.get("timeout") and job.get("started")
-                   and facts.now - float(job["started"]) >= float(job["timeout"]))
-            return Action(TIME_UP, t=facts.now, grace=TIMEOUT_GRACE) if due else Action(NOTHING)
-        if stop.get("sent") is None:
-            return Action(TERM)
-        if not stop.get("kill9") and facts.now - float(stop["sent"]) >= float(stop.get("grace") or 0):
-            return Action(KILL9)
-        return Action(NOTHING)      # signalled, and inside the grace it was given
-    # its run is over: how it ended is recorded here, and nothing of it is signalled again. A stop that was
-    # asked of it takes its group with it, so a command that held the signal back does not outlive the job.
-    sweep = bool(stop) and not stop.get("denied")
-    own = None if facts.rc is not None else (f"signal {facts.sig}" if facts.sig else "lost")
-    if asked and out:
-        # a kill's signal stopped it: "killed", and no hook, unless it wrote its own code as the kill arrived
-        return _ends(job, facts.rc, None if facts.rc is not None else "killed", facts.rc_at, sweep,
-                     None if facts.rc is None else ("done" if facts.rc == 0 else "failed"))
-    if asked:
-        # a kill wrote the stop and no signal of pp's ever went out, so the job ended as it ended: that
-        # outcome, and the hook it owes. A job a kill has touched is never retried, whatever it had left
-        return _ends(job, facts.rc, own, facts.rc_at, sweep, "done" if facts.rc == 0 else "failed")
-    if facts.rc == 0:
-        return _ends(job, 0, None, facts.rc_at, sweep, "done")
-    if facts.rc is None and (out or stop.get("denied")):
-        # a timeout's stop: pp's signal ended it, or pp was refused it and the attempt is over at its timeout
-        return _or_again(job, facts, None, "timeout", None, sweep)
-    # it ended on its own: the code it wrote, the signal it died of, or nothing at all
-    return _or_again(job, facts, facts.rc, own, facts.rc_at, sweep)
-
-
-def _hook_due(job: dict, event: str | None) -> str | None:
-    """The hook event this outcome owes, or None: the outcome owes none, or the job carries no such hook."""
-    if event is None:
-        return None
-    return event if _hook_spec(job.get("on_fail" if event == "failed" else "on_done")) else None
-
-
-def _ends(job: dict, rc: int | None, reason: str | None, ended: float | None, sweep: bool, event: str | None,
-          not_retried: str | None = None) -> Action:
-    """The job is over: its state follows its exit code, and the hook that outcome owes is the job's own."""
-    return Action(ENDED_AS, state="done" if rc == 0 and not reason else "failed", rc=rc, reason=reason,
-                  hook=_hook_due(job, event), ended=ended, sweep=sweep, not_retried=not_retried)
-
-
-def _or_again(job: dict, facts: Facts, rc: int | None, reason: str | None, ended: float | None,
-              sweep: bool) -> Action:
-    """A failure of the job's own: another attempt where it has one left and --retry-if matches it, else the
-    end of it. A delay doubles per attempt, up to RETRY_DELAY_CAP."""
-    attempt, retries = int(job.get("attempt", 1)), int(job.get("retries") or 0)
-    why = reason or f"exit {rc}"
-    left = attempt <= retries
-    if left and matches_retry_if(job, why, facts.tail):
-        now = ended or facts.now
-        base = job.get("retry_delay")
-        delay = min(float(RETRY_DELAY if base is None else base) * 2 ** (attempt - 1), RETRY_DELAY_CAP)
-        return Action(AGAIN, rc=rc, reason=reason, ended=now, sweep=sweep, attempt=attempt + 1,
-                      not_before=now + delay)
-    # attempts were left, but retry_if says this failure is not worth one
-    nr = f"neither the reason ({why}) nor the log tail matches /{job.get('retry_if')}/" if left else None
-    return _ends(job, rc, reason, ended, sweep, "failed", nr)
-
-
-def merge_stop(existing: dict | None, ask: dict) -> dict:
-    """The one stop this run of the job carries, once this ask has landed on it. Pure: the caller names who
-    asked and when.
-
-    One stop per run: what went out is all the decision and the waiting verb have to go on, so a second ask
-    never writes over `t`, `sent` or `kill9`, and keeps only the shorter of the two graces, since a second ask
-    hastens the SIGKILL and never delays it. It clears `denied`, so a signal pp was refused is asked for again.
-
-    A kill's ask on the stop a worker wrote for a timeout becomes the kill's: `by` is the asker, `timeout`
-    goes, and the timeout stays in `was`. So a job a kill has touched is ended as a kill, never retried,
-    however its stop began. A timeout landing on a kill's stop changes nothing: a kill stays a kill.
-
-    Which of the two an ask is comes from its `timeout` field and never from who asked, so an asker called
-    `timeout` asks as a kill."""
-    if not existing:
-        return dict(ask)
-    out = dict(existing)
-    out["grace"] = min(float(existing.get("grace") or 0), float(ask.get("grace") or 0))
-    out.pop("denied", None)
-    if existing.get("timeout") and not ask.get("timeout"):
-        out["was"], out["by"] = existing["by"], ask["by"]
-        out.pop("timeout")
-    return out
 
 
 # ---- worker ---------------------------------------------------------------------------------------
@@ -1232,7 +1020,7 @@ class Worker:
         for j in [x for x in jobs if x["state"] == "running"]:
             stop = j.get("stop") or {}
             action = self._step(j, self._facts(j, now))
-            if action.do in (TERM, KILL9, TIME_UP) or (action.do == NOTHING and stop
+            if action.do in (policy.TERM, policy.KILL9, policy.TIME_UP) or (action.do == policy.NOTHING and stop
                                                        and not stop.get("denied") and not stop.get("kill9")):
                 in_flight += 1          # a stop with something still to go out for it
         # while a stop is in flight, and a verb is waking this worker for it, the loop's wait is STOP_PERIOD
@@ -1248,7 +1036,7 @@ class Worker:
             if p.poll() is not None and (find(jid) or {}).get("state") != "running":
                 del self.children[jid]
 
-    def _facts(self, j: dict, now: float) -> Facts:
+    def _facts(self, j: dict, now: float) -> policy.Facts:
         """What is true of this running job besides its record, all of it read here and nothing decided:
         whether a run of it is live, the exit code that run wrote and when, the signal its own child died of,
         and the log tail --retry-if matches against.
@@ -1263,15 +1051,15 @@ class Worker:
             # them, before its parent can read how it ended.
             if held is not None:
                 self._adopt(j, held)
-            return Facts(held=True, now=now)
+            return policy.Facts(held=True, now=now)
         self.children.pop(j["id"], None)
         code = p.poll() if p is not None else None
         rc, ended = ended_on_its_own(j) or (None, None)
         tail = "\n".join(log_tail(j, 200)) if rc != 0 and j.get("retry_if") else ""
-        return Facts(held=False, rc=rc, rc_at=ended, sig=-code if code is not None and code < 0 else None,
+        return policy.Facts(held=False, rc=rc, rc_at=ended, sig=-code if code is not None and code < 0 else None,
                      now=now, tail=tail)
 
-    def _step(self, j: dict, facts: Facts) -> Action:
+    def _step(self, j: dict, facts: policy.Facts) -> policy.Action:
         """The one decision about one job, and the action it names, carried out: what is store state in one
         transaction, the signal through the job's Handle, the log line and the hook after the scope.
         -> the action, which says whether a stop of this job is still in flight.
@@ -1283,30 +1071,30 @@ class Worker:
         with txn() as s:
             cur = s.job(jid, must_be=("running",))
             if cur is None:
-                return Action(NOTHING)      # nothing else records a running job: there is nothing to record
-            a = decide(cur, facts)
+                return policy.Action(policy.NOTHING)      # nothing else records a running job: there is nothing to record
+            a = policy.decide(cur, facts)
             if a.sweep:
                 # the leader of this job's group is gone and its run is over, so anything left in that group
                 # goes too: a command that held the signal back does not outlive the job
                 self._signal_group(cur, signal.SIGKILL)
-            if a.do == TIME_UP:
+            if a.do == policy.TIME_UP:
                 cur["stop"] = {"by": "timeout", "timeout": True, "t": a.t, "grace": a.grace}
                 s.save(cur)
-            elif a.do == AGAIN:
+            elif a.do == policy.AGAIN:
                 line = _requeue(s, cur, a)
-            elif a.do == ENDED_AS:
+            elif a.do == policy.ENDED_AS:
                 _finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
-        if a.do in (TERM, KILL9):
+        if a.do in (policy.TERM, policy.KILL9):
             self._send(cur, a)
             return a
-        if a.do == TIME_UP:
+        if a.do == policy.TIME_UP:
             self.log(f"timeout {jid} {cur.get('tag')} after {ui.human_duration(float(cur['timeout']))}: "
                      "stopping it")
-        elif a.do == AGAIN:
+        elif a.do == policy.AGAIN:
             _append_log(cur, line)          # after the scope: a job's log is not the store
             self.log(f"retry {jid} {cur.get('tag')}: attempt {cur['attempt']}/{int(cur.get('retries') or 0) + 1} "
                      f"in {_in_delay(cur['not_before'])}")
-        elif a.do == ENDED_AS:
+        elif a.do == policy.ENDED_AS:
             why = f" ({cur['reason']})" if cur.get("reason") else ""
             self.log(f"{'done' if cur['state'] == 'done' else 'FAILED'} {jid} {cur.get('tag')} "
                      f"rc={cur.get('rc')}{why} {ui.human_duration(cur.get('seconds'))}")
@@ -1314,7 +1102,7 @@ class Worker:
                 self.fire(cur, a.hook)
         return a
 
-    def _send(self, job: dict, a: Action) -> None:
+    def _send(self, job: dict, a: policy.Action) -> None:
         """The signal one stop asks for next, and what it did on the record: a SIGTERM marked `sent`, a
         SIGKILL marked `kill9`, a refusal marked `denied`. The queue's worker is the one actor that signals a
         job's processes, so a kill, a timeout and a reap never cross.
@@ -1322,7 +1110,7 @@ class Worker:
         The signal goes out first and is recorded after, so a record that says a signal went out is one that
         did, which is all the decision about this job has to go on."""
         stop = job.get("stop") or {}
-        sig, mark, word = ((signal.SIGTERM, "sent", "SIGTERM to its group") if a.do == TERM else
+        sig, mark, word = ((signal.SIGTERM, "sent", "SIGTERM to its group") if a.do == policy.TERM else
                            (signal.SIGKILL, "kill9",
                             f"SIGKILL after {ui.human_duration(float(stop.get('grace') or 0))}"))
         outcome = self._signal_group(job, sig)
@@ -1362,8 +1150,8 @@ class Worker:
         The outcome and the hook owed for it are written in one transaction (`_finish`); `hook_due` is cleared
         here, once the hook has run. A hook that could not start is reported and cleared too, so a queue is
         never left trying to start it again every tick."""
-        spec = _hook_spec(job.get("on_fail" if event == "failed" else "on_done"))
-        argv = hook_argv(spec)
+        spec = policy.hook_spec(job.get("on_fail" if event == "failed" else "on_done"))
+        argv = policy.hook_argv(spec)
         q, jid = job["queue"], job["id"]
         hlog = os.path.join(_qroot(q, "hooks"), f"{jid}-{event}.log")
         ran = False
@@ -1515,7 +1303,7 @@ class Worker:
             with txn() as s:
                 cur = s.job(jid, must_be=("running",))
                 if cur:
-                    _finish(s, cur, "failed", None, f"launch failed: {e}", hook=_hook_due(cur, "failed"))
+                    _finish(s, cur, "failed", None, f"launch failed: {e}", hook=policy.hook_due(cur, "failed"))
             claim.release()     # after the record says it ended, so no reader sees it running with a free claim
             self.log(f"FAILED {jid} {j.get('tag')}: launch failed: {e}")
             if cur:
@@ -2141,8 +1929,8 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     needs: dict = {"slots": 1}
     for k, v in (("gpu_gb", a.gpu_gb), ("cpu", a.cpu), ("mem_gb", a.mem_gb)):
         if v:
-            needs[k] = _num(v)
-    needs.update(_kv(a.need, "--need", _num))
+            needs[k] = policy.num(v)
+    needs.update(_kv(a.need, "--need", policy.num))
     for k, v in needs.items():
         if not 0 < v < float("inf"):        # also nan: it compares false with everything, so it would never wait
             ui.die(f"{_PROG} add: {k}={v:g}: a need is a positive number", 2)
@@ -2158,7 +1946,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
     retries = a.retries if a.retries is not None else qc.get("retries", 0)
     if retries < 0:
         ui.die(f"{_PROG} add: --retries must be >= 0", 2)
-    retry_delay = _dur_arg(a.retry_delay, "--retry-delay") if a.retry_delay is not None else qc.get("retry_delay", RETRY_DELAY)
+    retry_delay = _dur_arg(a.retry_delay, "--retry-delay") if a.retry_delay is not None else qc.get("retry_delay", policy.RETRY_DELAY)
     retry_if = a.retry_if if a.retry_if is not None else qc.get("retry_if")
     if retry_if:
         try:
@@ -2169,8 +1957,8 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job) -> int:
         ui.die(f"{_PROG} add: --tag {a.tag} reads as a job id or a range, so it could not select its jobs; "
                "use a word", 2)
     owner = session.caller()
-    on_fail = _hook_spec(a.on_fail if a.on_fail is not None else qc.get("on_fail"))
-    on_done = _hook_spec(a.on_done if a.on_done is not None else qc.get("on_done"))
+    on_fail = policy.hook_spec(a.on_fail if a.on_fail is not None else qc.get("on_fail"))
+    on_done = policy.hook_spec(a.on_done if a.on_done is not None else qc.get("on_done"))
     shell_env = {k: os.environ[k] for k in CAPTURED_ENV if k in os.environ}
     state = "held" if a.hold else "queued"
     project = project_name(cwd)
@@ -2528,7 +2316,7 @@ def cmd_kill(a) -> int:
                 _finish(s, cur, "failed", None, "killed")
                 print(f"killed {jid} (it was {was}, with no process to stop)  {_text(j.get('tag'))}")
                 continue
-            cur["stop"] = merge_stop(cur.get("stop"), {"by": _by(), "t": time.time(), "grace": float(a.grace)})
+            cur["stop"] = policy.merge_stop(cur.get("stop"), {"by": _by(), "t": time.time(), "grace": float(a.grace)})
             s.save(cur)
         asked.append((j, cur["stop"]["t"]))
     for q in sorted({j["queue"] for j, _t in asked}):
@@ -2597,7 +2385,7 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
     elif cur.get("rc") is not None:
         print(f"job {jid} ended on its own as it was being killed: {_ended_line(cur, jid)}")
     else:
-        # the grace on the record, which is the shorter of every ask (`merge_stop`) and the one the SIGKILL
+        # the grace on the record, which is the shorter of every ask (`jobpolicy.merge_stop`) and the one the SIGKILL
         # went out after, not the one this kill asked for
         how = (f"SIGKILL after {float(stop.get('grace') or 0):g}s" if stop.get("kill9")
                else "stopped on SIGTERM")

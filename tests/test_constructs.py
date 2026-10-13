@@ -635,8 +635,9 @@ _SLOW_IN_A_TXN = ("spawn", "run", "git", "git_child", "signal_and_wait", "readin
                   "txn", "listing")
 
 # The decision about a job, and the helpers it is made of: pure, so the table that covers every combination
-# of the facts needs no process, no thread and no clock (pp/lib/jobq.py, `decide`).
-_PURE = ("decide", "merge_stop", "_ends", "_or_again", "_hook_due", "matches_retry_if")
+# of the facts needs no process, no thread and no clock (pp/lib/jobpolicy.py, `decide`).
+_POLICY = "pp/lib/jobpolicy.py"
+_PURE = ("decide", "merge_stop", "_ends", "_or_again", "hook_due", "matches")
 _IMPURE_MODULES = ("time", "os", "proc", "lock", "paths", "signal", "sys", "subprocess", "shutil")
 _IMPURE_CALLS = ("txn", "listing", "find", "write_json", "sleep", "json_txn")
 
@@ -669,10 +670,10 @@ class TestContracts(unittest.TestCase):
         the clock, of the store or of a process inside them, or inside the helpers they are made of, fails
         here, and the facts stay the one thing a decision is made from."""
         bad = []
-        for qual, node in _walk("pp/lib/jobq.py"):
+        for qual, node in _walk(_POLICY):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or _last(qual) not in _PURE:
                 continue
-            bad += [f"pp/lib/jobq.py:{line} ({qual}) {name}" for line, name in _calls_under(node)
+            bad += [f"{_POLICY}:{line} ({qual}) {name}" for line, name in _calls_under(node)
                     if name.split(".")[0] in _IMPURE_MODULES or _last(name) in _IMPURE_CALLS]
         self.assertEqual(bad, [], "a pure decision reads the record and the facts, and nothing else")
 
@@ -743,11 +744,11 @@ class TestWhatAScopeAndADecisionReach(unittest.TestCase):
         """`decide` and `merge_stop` are handed the record and the facts and give back one action. No clock,
         no store and no process is reached from inside them, in their own code or in the helpers they are
         made of, so the facts stay the one thing a decision is made from."""
-        tree = _source("pp/lib/jobq.py")
+        tree = _source(_POLICY)
         fns = _functions(tree)
         pure = [fns[name] for name in _PURE if name in fns]
         self.assertEqual(len(pure), len(_PURE), f"a pure function of {_PURE} is not in the file")
-        bad = [f"pp/lib/jobq.py:{line} {name}" for line, name in _reached(tree, pure)
+        bad = [f"{_POLICY}:{line} {name}" for line, name in _reached(tree, pure)
                if name.split(".")[0] in _IMPURE_MODULES or _last(name) in _IMPURE_CALLS]
         self.assertEqual(bad, [], "a pure decision reads the record and the facts, and nothing else")
 
@@ -758,9 +759,9 @@ class TestWhatAScopeAndADecisionReach(unittest.TestCase):
                          "def act(jid):\n    with txn() as s:\n        helper(s.job(jid))\n")
         self.assertEqual([name for _line, name in _reached(slow, _in_a_txn(slow))
                           if _last(name) in _SLOW_IN_A_TXN], ["proc.spawn"])
-        impure = ast.parse("def _hook_due(job, event):\n    return stamp(job)\n\n"
+        impure = ast.parse("def hook_due(job, event):\n    return stamp(job)\n\n"
                            "def stamp(job):\n    return time.time()\n")
-        self.assertEqual([name for _line, name in _reached(impure, [_functions(impure)["_hook_due"]])
+        self.assertEqual([name for _line, name in _reached(impure, [_functions(impure)["hook_due"]])
                           if name.split(".")[0] in _IMPURE_MODULES], ["time.time"])
 
 
