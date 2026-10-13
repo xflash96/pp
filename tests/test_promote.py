@@ -420,6 +420,103 @@ class TestPromote(Base):
 
 
 
+class TestARemoveThatCannotFinish(Base):
+    """Removing a release either happens or leaves that release whole. rmtree deletes what it can and leaves the
+    rest, so a release pp could not remove was emptied where it stood: `ls` listed the husk with no rev, a
+    `rollback --to` flipped `current` onto it and every registered link then pointed at nothing, and the mark
+    that keeps a rollback off a bad release went with the metadata rmtree deleted. The keep sweep of an
+    ordinary promote is the way in, not only the `gc` verb."""
+
+    def unwritable(self, p: str):
+        """Take the write bit off p for as long as the test lasts. Nothing in it can be unlinked then, which is
+        what a build that write-protects its output leaves in a release: a module cache, a `pip install
+        --target`, a packer's output directory."""
+        os.chmod(p, 0o555)
+        self.sb.later(self.writable_again)
+
+    def writable_again(self):
+        """Put the write bit back on every directory under the releases dir, whatever name it has by then: the
+        remove renames the directory the test took the bit off, and the scope's tree goes with the scope."""
+        for d, ds, _ in os.walk(self.rel):
+            for n in ds:
+                os.chmod(os.path.join(d, n), 0o755)
+        os.chmod(self.rel, 0o755)
+
+    def three(self):
+        for _ in range(3):
+            self.assertEqual(self.pp(self.repo, "--again")[0], 0)
+
+    def listed(self) -> list[dict]:
+        return json.loads(self.pp("ls", "demo", "--json")[1])
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes in a directory with no write bit")
+    def test_a_release_gc_cannot_take_out_of_the_way_is_left_whole(self):
+        """A releases directory pp may not write in, with the target's `.lock` already in it, so the lock is
+        taken and the remove is reached."""
+        self.make_repo("keep = 5\n")
+        self.three()
+        old = [s for s in self.stamps() if s != self.current()]
+        self.unwritable(self.rel)
+        rc, out, err = self.pp("gc", "demo", "--keep", "1", "-y")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("could not remove 1 old release(s)", err)
+        self.assertNotIn("gc: removed", out)
+        for s in old:
+            self.assertTrue(os.path.isfile(os.path.join(self.rel, s, promote.META)), f"{s} was emptied")
+        self.assertEqual(len(self.listed()), 3)
+        self.assertTrue(all(r.get("rev") for r in self.listed()))
+
+    @unittest.skipIf(os.geteuid() == 0, "root unlinks what the permissions refuse")
+    def test_a_release_whose_delete_stops_part_way_is_no_release_any_more(self):
+        self.make_repo("keep = 5\n")
+        self.three()
+        old = [s for s in self.stamps() if s != self.current()][0]
+        self.unwritable(os.path.join(self.rel, old, "bin"))
+        rc, out, err = self.pp("gc", "demo", "--keep", "1", "-y")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("could not remove 1 old release(s)", err)
+        self.assertFalse(os.path.lexists(os.path.join(self.rel, old)))
+        self.assertNotIn(old, [r["stamp"] for r in self.listed()])
+        rc, out, _ = self.pp("gc", "demo", "-n")        # what is left is a staging dir, which gc takes again
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 staging dir(s)", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root unlinks what the permissions refuse")
+    def test_a_promote_that_could_not_remove_its_staging_dir_says_so(self):
+        """A promote that is given up removes its staging dir, and a user who passed no `--keep-failed` reads
+        the run as keeping nothing. The same unwritable subdirectory left it emptied under its own name, with
+        no line in the output or in the log, and every later gc offered it, could not remove it and exited 0."""
+        self.make_repo('build = "mkdir -p cache/pkg && echo c > cache/pkg/x && chmod 555 cache/pkg"\n'
+                       'check = "false"\n')
+        self.sb.later(self.writable_again)
+        rc, out, _ = self.pp(self.repo)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the failed staging dir is not gone", out)
+        left = [n for n in os.listdir(self.rel) if n.startswith(".staging-")]
+        self.assertEqual(len(left), 1)
+        self.assertTrue(left[0].startswith(".staging-gone-"), left[0])   # no release's name, so no listing
+        self.assertEqual(self.listed(), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root unlinks what the permissions refuse")
+    def test_a_keep_sweep_that_left_a_release_says_so_and_the_promotion_stands(self):
+        """The sweep at the end of an ordinary promote is a gc with no verb typed, and the release is in
+        service whatever it could remove: the old one still on disk is a line on stderr, and the status is
+        the promotion's. Exit 1 of a promote is NOT PROMOTED, which a release script rolls back on, so a
+        directory that could not be deleted undid a release that had gone out."""
+        self.make_repo("keep = 1\n")
+        self.assertEqual(self.pp(self.repo, "--again")[0], 0)
+        first = self.current()
+        self.assertEqual(self.pp(self.repo, "--again")[0], 0)       # the one it flips away from always stays
+        self.unwritable(os.path.join(self.rel, first, "bin"))
+        rc, out, err = self.pp(self.repo, "--again")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("could not remove 1 old release(s)", err)
+        self.assertIn("promoted demo", out)
+        # the release the promote made is in service, read through the link a person uses
+        self.assertEqual(subprocess.run([self.link], capture_output=True, text=True).stdout, "v1\n")
+        self.assertNotIn(first, [r["stamp"] for r in self.listed()])
+
+
 class TestAWordThatIsNoVerb(Base):
     def test_a_mistyped_verb_does_not_release_the_project_in_the_cwd(self):
         """Every other word is a PATH, and a path that is not there resolves to the project of the cwd: a typo

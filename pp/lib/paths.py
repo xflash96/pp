@@ -121,7 +121,10 @@ def staging(parent: str, prefix: str) -> str:
     be the same. Another process has another pid. The random tail tells this pid from the same pid in another
     namespace or after a wrap. The caller creates the name itself, with a mkdir, an `open(..., "x")`, a symlink
     or a clone, each of which fails on a name that is there, so a name that did repeat would stop the command
-    instead of writing over what holds it.
+    instead of writing over what holds it. Two callers replace the name instead of creating it: the store's
+    `add` (jobq._stage_job writes it with write_json) and promote's `_discard` (it renames what it is removing
+    onto the name). Each holds the lock of the thing it is staging for, the store's or the target's, so no
+    other writer can hold the name.
 
     Nothing has to be removed before the name is used, and nobody else can remove it between its creation and
     its rename. The leading dot keeps it out of listings that read every entry as a real one."""

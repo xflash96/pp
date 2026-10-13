@@ -14,7 +14,8 @@ relink, and nothing registered ever runs a half-edited tree.
     pp promote rollback NAME [--to STAMP] [-y]   flip back to the previous release, rerun `after`; a release
                                    whose own `after`/`verify` failed is skipped (ls marks it); --to picks any
     pp promote diff NAME           what the source has that the current release does not
-    pp promote link NAME           reassert the links           pp promote gc NAME [--keep N] [-n]   prune releases, after asking
+    pp promote link NAME           reassert the links
+    pp promote gc NAME [--keep N] [-n]   prune old releases and leftover staging dirs, after asking
     pp promote init [PATH]         write a starter .pp.toml
 NAME is a promoted target's name, or a path into its project.
 
@@ -44,7 +45,12 @@ included (git archive leaves them out).
 
 Releases are ~/.local/share/pp/releases/<name>/<YYYYmmdd-HHMMSS>-<rev7>[-dirty]/; `current` is a relative
 symlink; revisions.log there records every flip; each run's full output is kept in
-~/.local/state/pp/promote/logs/. The gate's verdict is evidence, not scrollback.
+~/.local/state/pp/promote/logs/. The gate's verdict is evidence, not scrollback. A release pp removes is
+renamed out of its own name in one step and then deleted, so one whose rename pp could not do is still whole,
+and one whose delete could not finish is no longer a release: what is left of it is a staging dir `pp promote
+gc` takes again. `pp promote gc` exits 1 where something it meant to remove is still there. The keep sweep at
+the end of a promote names such a release on stderr and leaves the status to the promotion, so a release that
+went out still exits 0.
 
 Registering a service: point the unit at `current`, let `after` restart it.
     # ~/.config/systemd/user/notes.service
@@ -540,6 +546,14 @@ class Log:
             self.f.write(msg + "\n")
             self.f.flush()
 
+    def warn(self, msg: str):
+        """Something of this run that did not work, on stderr and in the log: it is no line of the product a
+        caller reads on stdout, and it is evidence of the run like every other line."""
+        ui.warn(msg)
+        if self.f:
+            self.f.write(msg + "\n")
+            self.f.flush()
+
     def sh(self, label: str, cmd: str, cwd: str, env: dict) -> int:
         """Run the check, printing its output as it comes. In pp's own group, so a Ctrl-C in this terminal reaches
         the check as well: that is how a person stops a promotion."""
@@ -600,12 +614,60 @@ def _gc_victims(t: Target, keep: int, also: str | None = None) -> list[str]:
     return [s for s in stamps if s not in spare]
 
 
-def _gc(t: Target, gone: list[str], say=print) -> None:
-    """Remove these releases (under the target's lock; current and the one before it are never in the list)."""
-    for s in gone:
-        shutil.rmtree(t.dir(s), ignore_errors=True)
+def _staging_dirs(t: Target) -> list[str]:
+    """What is left under a staging name in this target's releases dir: a full copy of the project where a
+    promote was killed before it could remove its own or --keep-failed kept it, a symlink where a flip was
+    killed between making it and renaming it, and what `_discard` renamed out of the way and could not finish
+    deleting. The leading dot keeps them out of `stamps()`, so no release listing can show one."""
+    try:
+        return sorted(n for n in os.listdir(t.releases) if n.startswith(".staging-"))
+    except OSError:
+        return []
+
+
+def _discard(p: str) -> bool:
+    """Delete p, out of its directory's namespace first: one rename, then the delete. -> whether it is gone.
+
+    Removing a release either happens or leaves that release whole. The rename is one step, so a delete that
+    stops part way (one unwritable subdirectory is enough, which is what a module cache or a `pip install
+    --target` leaves in a release) leaves nothing half removed under the name it had: `stamps()` reads no
+    release there, so no `ls` row and no `rollback --to` can reach it, and what is left sits under a staging
+    name, which `_staging_dirs` reports and `gc` takes again. A rename that failed moved nothing, so the
+    release is whole and the caller's "could not remove" is the whole truth. The name comes from
+    `paths.staging`, so no other writer picks it, and it is in the same directory, which is one file system."""
+    tmp = paths.staging(os.path.dirname(p), "gone")
+    try:
+        os.rename(p, tmp)
+    except OSError:
+        return not os.path.lexists(p)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if os.path.lexists(tmp):
+        try:
+            os.unlink(tmp)          # rmtree removes no symlink, and a flip that was killed leaves one
+        except OSError:
+            pass
+    return not os.path.lexists(tmp)
+
+
+def _remove(t: Target, names: list[str], what: str, say=print, warn=ui.warn) -> list[str]:
+    """Remove these entries of the target's releases dir, and say which ones went. Every caller holds the
+    target's lock and read the list under it, so the staging dir a promote is filling right now is never among
+    them, and what `_gc_victims` spares is never in the list.
+
+    What is reported is what is gone from disk afterwards, not what was offered: rmtree with ignore_errors
+    swallows what it could not remove, and it removes no symlink at all, so gc said it had removed the one an
+    interrupted flip leaves and then offered it again on every later run. What went is said on stdout and what
+    stayed on stderr, since one is the work and the other is what did not work. -> the names that are still
+    there, which is what `cmd_gc` exits non-zero on: the user typed a verb to remove something, and a release
+    script that reads the status of a gc which removed nothing must not read it as success."""
+    gone, stayed = [], []
+    for n in names:
+        (gone if _discard(os.path.join(t.releases, n)) else stayed).append(n)
     if gone:
-        say(f"gc: removed {len(gone)} old release(s): {', '.join(gone)}")
+        say(f"gc: removed {len(gone)} {what}: {', '.join(gone)}")
+    if stayed:
+        warn(f"could not remove {len(stayed)} {what} of {t.name}: {', '.join(stayed)}")
+    return stayed
 
 
 # ---- verbs ----------------------------------------------------------------------------------------
@@ -690,8 +752,8 @@ def cmd_run(argv: list[str]) -> int:
         def abandon(why: str) -> int:
             if a.keep_failed:
                 log.say(f"kept the failed staging dir: {staging}")
-            else:
-                shutil.rmtree(staging, ignore_errors=True)
+            elif not _discard(staging):
+                log.say(f"the failed staging dir is not gone; `pp promote gc {t.name}` lists what is left")
             log.say(ui.c(f"promote {t.name}: NOT PROMOTED: {why}; current stays {cur or '(none)'}", "red"))
             log.say(f"full output: {log.path}")
             return 1
@@ -754,7 +816,10 @@ def _release(t: Target, f: Facts, a, plan: list[dict], log: Log, stamp: str, sta
     if failed:
         _auto_rollback(t, stamp, cur, failed, log)
         return 1
-    _gc(t, _gc_victims(t, int(t.cfg.get("keep", DEFAULT_KEEP)), also=cur), log.say)
+    # the keep sweep is this run's own gc, and an old release it could not remove is a line on stderr: the
+    # status of a promote is whether the release went out, which is what `pp promote NAME -y || rollback` acts
+    # on. The verb a user types to remove something is the one whose status says it did not (`cmd_gc`)
+    _remove(t, _gc_victims(t, int(t.cfg.get("keep", DEFAULT_KEEP)), also=cur), "old release(s)", log.say, log.warn)
     log.say(ui.c(f"promoted {t.name} -> {stamp}", "green"))
     return 0
 
@@ -996,7 +1061,8 @@ def cmd_link(argv: list[str]) -> int:
 
 
 def cmd_gc(argv: list[str]) -> int:
-    ap = ui.parser("promote gc", "prune old releases (current and the one before it always stay)")
+    ap = ui.parser("promote gc", "prune old releases and leftover staging dirs (current and the one before it "
+                                 "always stay)")
     ap.add_argument("name", nargs="?")
     ap.add_argument("--keep", type=int, default=None)
     ap.add_argument("-n", "--dry-run", action="store_true", help="only show what it would remove")
@@ -1004,18 +1070,23 @@ def cmd_gc(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     t = _resolve(a.name)
     keep = a.keep if a.keep is not None else int(t.cfg.get("keep", DEFAULT_KEEP))
-    gone = _gc_victims(t, keep)
-    if not gone:
+    gone, left = _gc_victims(t, keep), _staging_dirs(t)
+    if not gone and not left:
         print(f"gc: nothing to remove ({len(t.stamps())} release(s); current and the one before it always stay)")
         return 0
-    print(f"gc: {len(gone)} old release(s) of {t.name} to remove: {', '.join(gone)}")
+    if gone:
+        print(f"gc: {len(gone)} old release(s) of {t.name} to remove: {', '.join(gone)}")
+    if left:
+        print(f"gc: {len(left)} staging dir(s) of {t.name} to remove: {', '.join(left)}")
     if a.dry_run:
         return 0
     if not ui.confirm("remove them?", a.yes):
         return 2
     with _lock(t):
-        _gc(t, [s for s in gone if s in _gc_victims(t, keep)])  # what was shown, if still old under the lock
-    return 0
+        # what was shown, if it is still what gc would remove under the lock
+        stayed = _remove(t, [s for s in gone if s in _gc_victims(t, keep)], "old release(s)")
+        stayed += _remove(t, [n for n in left if n in _staging_dirs(t)], "staging dir(s)")
+    return 1 if stayed else 0
 
 
 STARTER = """[promote]
