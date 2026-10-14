@@ -138,7 +138,9 @@ class TestOrdering(QueueJourney):
         queued = self.status()
         self.assertLess(queued.index(f"  {c}  p0"), queued.index(f"  {a}  p10"))
         self.pp("queue", "hold", b)
-        self.assertIn("is held; hold works on queued jobs", self.pp("queue", "hold", b, code=2).stderr)
+        # a held job is already held, which is a state `hold` suits: the job is left as it is, and exit 0
+        self.assertIn(f"{b} is already held", self.pp("queue", "hold", b).stdout)
+        self.assertEqual(self.state(b), "held")
         r = self.pp("queue", "drop", blocker, code=2)
         self.assertIn(f"drop works on queued/held jobs. `pp queue kill {blocker}` stops it", r.stderr)
         self.pp("queue", "drop", a)

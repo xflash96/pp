@@ -281,13 +281,14 @@ Workers, and after a reboot
     `worker status` covers them all.
 
 A job's environment, later entries winning: the worker's own, which is that of the `pp queue add` that started it,
-without an agent session's identity; PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added
-the job; the project's [queue] env; add's --env K=V; and then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE,
-PP_QUEUE_CONTAINER, PP_QUEUE_ENVFILE and CUDA_VISIBLE_DEVICES, the cards --gpu-gb reserved, unset where it reserved
-none. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what it meant
-where you typed it, and a variable you export before `pp queue add` reaches the job only through the worker that add
-started: pass a token with --env or [queue] env. An env name holds no =, NUL or newline, a value no newline. --json
-gives the names of a job's own variables with every value as ***, and `show` neither.
+without an agent session's identity;
+PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job; the project's [queue] env;
+add's --env K=V; and then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE, PP_QUEUE_CONTAINER, PP_QUEUE_ENVFILE and
+CUDA_VISIBLE_DEVICES, the cards --gpu-gb reserved, unset where it reserved none.
+PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what it meant where
+you typed it, and a variable you export before `pp queue add` reaches the job only through the worker that add
+started: pass a token with --env or [queue] env. An env name holds no =, NUL or newline, a value no newline.
+--json gives the names of a job's own variables with every value as ***, and `show` neither.
 
 Agents
     `add` prints each job's id on stdout, one per line, with everything else on stderr, and for an agent session the
