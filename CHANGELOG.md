@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.2.0
+
+The interface this minor version keeps. `pp help queue` says what is promised
+and what may change in a patch. `pp queue` stops what a container runner
+started, takes a campaign from a file with one job's flags per line, and runs
+a stage after the one it names.
 
 `pp queue`: a job is named and selected the same way by every verb.
 
