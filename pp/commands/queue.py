@@ -42,8 +42,7 @@ A first project whose work runs in a container, in four steps
        3. Delete any -e line in the runner for a variable the project sets in [queue] env: docker ranks -e above
           --env-file, so a leftover -e wins over what pp hands the runner. A variable whose value in the image is not
           its value here (HOME, PYTHONPATH, a cache path of the image's) stays a -e and goes in no [queue] env, which
-          the runner and the stop command both run with: an image's HOME, PYTHONPATH or cache path hides the docker
-          client's own.
+          the runner and the stop command both run with: an image's HOME or cache path hides the client's own.
        4. Prove the stop once: `pp queue add --tag stop_probe -- sleep 600`, then `pp queue kill stop_probe`, then
           look for what the runner started. It is gone. Then the same with `--tag stop_probe.t --timeout 15s`. An
           `add` is refused in a project that sets a runner and no stop.
@@ -57,8 +56,7 @@ Naming jobs
     never a key: adding a campaign file twice makes a second job per tag.
 
 Selecting jobs
-    Every verb that takes jobs takes the same five forms, and no others; `note` is the exception and takes
-    one job, by its id or by a tag that names one:
+    Every verb that takes jobs takes these five forms, and no others; `note` takes one job, by id or a tag of one:
         12              one job by id; ids are machine-wide, and `add` prints each one on stdout
         12-15           a range; one `add`'s ids are consecutive        c3_recall.s0   that tag, matched whole
         --prefix c3_    every job whose tag starts with c3_ (repeatable)  -q r1 --all    one queue's, whatever its tag
@@ -69,7 +67,7 @@ Selecting jobs
     retry show a plan and ask where a selection names more than one job, and clean asks for any; each of those four
     takes -y (do not ask) and -n (only show), so a driver with no terminal passes -y. To stop a whole set, `hold -q
     r1 --all` first, then `kill` and `drop` over it: a drop takes the held jobs too. A kill alone leaves the queued
-    jobs, so the lane refills within one poll, and kill starts a worker where none is up.
+    jobs, so the lane refills within one poll, and kill starts a worker itself.
 
 Order, and a stage after another
     Lower --prio runs first (default 10), ties by id, so in a lane (slots = 1) one campaign file's jobs run in its own
@@ -80,12 +78,12 @@ Order, and a stage after another
     ids, ranges and tags separated by commas (41,42,43 or 41-66 or s1_eval,s1_report), as many as a command line
     holds, a trailing or empty item ignored and a value that names no job refused. It is read when the job is added
     and the ids are kept, so nothing added later joins it, an id no job has is an error that queues nothing, and a
-    dropped job counts as ended. A reboot ends a stage as failed, and the stage behind it starts on that, so keep the
-    ids with --retries: a `retry` by hand queues a new id, which no --after already queued names. A job waiting on
-    --after is skipped rather than waited for, so it never becomes the head of its queue and never blocks the jobs
-    behind it. `wait` counts a held job as not ended: a wait over a stage still held says so and then waits for ever,
-    so wait for the stage before it and release this one. A stage spread over two queues is one wait for each (`wait
-    -q grid --prefix s1_`), since a prefix that spans two is an error.
+    dropped job counts as ended. A reboot ends a stage as failed and the next one starts on that, so keep the ids with
+    --retries: a `retry` by hand gets a new id no --after names. A job waiting on --after is skipped rather than
+    waited for, so it never becomes the head of its queue and never blocks the jobs behind it. `wait` counts a held
+    job as not ended: a wait over a stage still held says so and then waits for ever, so wait for the stage before it
+    and release this one. A stage over two queues is one wait each (`wait -q grid --prefix s1_`): a prefix spanning
+    two is an error.
 
         IDS=$(pp queue add --from stage1.txt)                         # one id per line on stdout
         pp queue add --from stage2.txt --after "$(echo "$IDS" | tr '\n' ',')"
@@ -95,9 +93,8 @@ Campaign files
     --from FILE (- for stdin) queues one job per line, and a line is the rest of an `add` command line: its own flags,
     then --, then the command.
 
-        # one job per layer, 36 GB each: a comment is a line of its own, since a # inside a line is a word
+        # a comment is a line of its own, since a # inside a line is a word; a line may be a command alone
         --tag s3_L00 --gpu-gb 36 -- python -m lab.run --layer 0
-        # a line that is only a command still works
         python -m lab.smoke
 
     Flags on the `add` itself are the defaults for every line, and a line's own flags win: --env and --need merge key
@@ -131,25 +128,24 @@ Containers, and anything else a runner starts elsewhere
     Mount the project root worked out from the script's own place, not $PWD, or a job queued from a subdirectory gets
     that as /work. The GPUS line and the --gpus that reads it REPLACE a fixed --gpus all rather than joining it, since
     a second --gpus adds a device request instead of narrowing the first; the -e is there because the card docker
-    gives a container is numbered 0 inside it; and the guard keeps a card-less job on --gpus all, where
-    ${GPUS:+--gpus "$GPUS"} in its place gives a job that wants the image and no card none at all (--gpu-gb 0 is
-    refused: a job declares an amount, or declares nothing). The runner process is the job, so it is given the job's
-    whole environment and may read [queue] env and --env out of its own. --name is how a stop finds the container
-    and how `docker ps` says which job it is: $PP_QUEUE_CONTAINER is one attempt's name, not one job's, so a retry
-    never meets the container the last attempt left, and it begins pp-<queue>-<id>-, which is what to match; `pp
-    queue show` prints the current one. --env-file is how the reserved card and the project's variables get inside.
+    gives a container is numbered 0 inside it; and the guard keeps a card-less job on --gpus all, where ${GPUS:+--gpus
+    "$GPUS"} in its place gives a job that wants the image and no card none at all (--gpu-gb 0 is refused: a job
+    declares an amount, or declares nothing). The runner process is the job, so it is given the job's whole
+    environment and may read [queue] env and --env out of its own. --name is how a stop finds the container and how
+    `docker ps` says which job it is: $PP_QUEUE_CONTAINER is one attempt's name, not one job's, so a retry never meets
+    the container the last attempt left, and it begins pp-<queue>-<id>-, which is what to match; `pp queue show`
+    prints the current one. --env-file is how the reserved card and the project's variables get inside.
     $PP_QUEUE_ENVFILE holds the project's [queue] env, the job's --env, CUDA_VISIBLE_DEVICES where a card was
-    reserved, PP_QUEUE, PP_QUEUE_JOB and PP_QUEUE_CONTAINER, and no PATH, VIRTUAL_ENV, CONDA_PREFIX,
-    CONDA_DEFAULT_ENV or PP_QUEUE_RCFILE of this machine's, which would name a python or a path outside the image.
-    It is readable by you alone.
+    reserved, PP_QUEUE, PP_QUEUE_JOB and PP_QUEUE_CONTAINER, and no PATH, VIRTUAL_ENV, CONDA_PREFIX, CONDA_DEFAULT_ENV
+    or PP_QUEUE_RCFILE of this machine's, which would name a python or a path outside the image. It is readable by you
+    alone.
         A stop command runs detached in the job's directory with the job's environment, its output in the job's log.
     `docker stop -t 5 $PP_QUEUE_CONTAINER` waits for the container and `docker rm -f` does not, so keep a -t below the
-    job's grace (--grace, 10s by default): the SIGKILL follows the grace whatever the stop command is doing, and a -t
-    of the whole grace takes the client with it, leaving the container it was waiting for behind. The command is read
-    when the job is queued and kept on the record, so a worker that comes back carries out the same stop on the same
-    container. A --no-runner job's stop is its own process group whatever the project says, so a job that starts a
-    container of its own names it $PP_QUEUE_CONTAINER for a stop to reach it; nothing in pp names docker: a runner and
-    a stop are commands.
+    job's grace (--grace, 10s by default): the SIGKILL follows the grace whatever the stop command is doing, a -t of
+    the whole grace takes the client as it waits, leaving the container. The command is read when the job is queued
+    and kept on the record, so a worker that comes back carries out the same stop on the same container. A --no-runner
+    job's stop is its own process group whatever the project says, so a job that starts its own container names it
+    $PP_QUEUE_CONTAINER for a stop to reach it; nothing in pp names docker: a runner and a stop are commands.
 
 Settings: one default, one key, one flag, one order
     Every setting has a built-in default. Where one has more than one source, the first of these that gives it wins,
@@ -163,9 +159,8 @@ Settings: one default, one key, one flag, one order
     because its worker re-reads it every loop. env and need merge key by key; every other setting is taken whole from
     one source. gpu_gb, cpu and mem_gb are per-job keys of [queue.NAME], what a job declares, and pool keys of
     [resources] or [queue.NAME.resources], what is provided. Every per-job flag but --tag, --hold, --after, --cwd,
-    --no-start, --from and --no-runner is also a key in both tables; those seven name one run or one add, and
-    --runner and --stop have the project's key alone. No key anywhere sets the queue: an add with no -q queues in
-    `default`, under that queue's pools and not the lane you meant.
+    --no-start, --from and --no-runner is also a key in both tables; --runner and --stop have the project's key alone.
+    No key sets the queue: an add with no -q queues in `default`, under its pools and not the lane you meant.
         Per project, in the nearest .pp.toml up from the job's directory, where a relative path is relative to that
     file's own directory: `name = "lab"` at the top level names the project in every status row, and [queue] takes any
     per-job key as this project's default, `log = "logs/{tag}.log"` among them, and two of its own: `runner =
@@ -216,14 +211,13 @@ Timeouts and retries
     REGEX retries only failures whose reason ("exit 1", "timeout", "lost") or whose own attempt's last 200 log lines
     match: a python regular expression, searched case sensitively, ^ and $ anchoring per line. One pattern is tried
     against both, so write one a log line will not match, and alternation puts two patterns in one: ^timeout$, CUDA
-    out of memory|^lost$. Any other failure is final at once, and wait, watch and show say "not retried" and why;
-    with no pattern, every failure is retried.
+    out of memory|^lost$. Any other failure is final at once, and wait, watch and show say "not retried" and why; with
+    no pattern, every failure is retried.
         `retry` re-runs an ended job by hand: it queues a new job with a new id, carrying everything but the outcome,
     and over a selection of more than one job it shows a plan and asks. A job that succeeded has ended, so it suits
     retry too and `retry --prefix s1_` re-queues the finished runs with the failed ones: type -n first. A priority is
-    set with `reprio` on the job the retry queued. There is no selection by outcome, so the jobs a reboot lost are
-    the records of `pp queue --json` whose state is failed and whose reason is lost, and `retry` takes their ids as
-    words.
+    set with `reprio` on the job the retry queued. There is no selection by outcome, so the jobs a reboot lost are the
+    records of `pp queue --json` whose state is failed and whose reason is lost, and `retry` takes their ids as words.
 
 Hooks, on the FINAL outcome of a job
     --on-fail CMD      a shell command run when the job has failed for good
@@ -275,26 +269,25 @@ Workers, and after a reboot
     worker holds the queue's claim, so two cannot run on one queue and double its limits. A job runs in its own
     process group inside an `sh` that writes the attempt's exit code to a file of its own, so that code outlives the
     worker and a worker that comes back adopts running jobs instead of losing them. `pp queue worker stop` is not a
-    pause, since the next command that needs a worker starts one: to give the card back for an hour, `hold -q NAME
-    --all` parks what is queued and the jobs running end or are killed; `pp queue work -q NAME` runs one in the
-    foreground for a supervisor or a unit file; and --no-start on add, release, retry, wait and watch does the verb's
-    work and starts none, which is a different flag from --no-runner, one letter apart: that one puts no runner before
-    the job's own command. After a reboot the records need nothing arranged: a job that was running when the machine
-    went down has no exit code and no live run, so the first worker up records it failed with reason "lost", and
-    retries it where --retry-if matches "lost". A job left queued waits for a worker, which one of the five verbs
-    above starts, or `pp queue worker start -q NAME` does, for the one queue it names. Those records say running until
-    that queue's worker is up, so start the workers first and read `pp queue --json` after; bringing several queues
-    back is one `worker start` each, and `worker status` is the one that covers them all.
+    pause, since the next command that needs a worker starts one: to give the card back, `hold -q NAME --all` parks
+    what is queued and the running jobs end or are killed; `pp queue work -q NAME` runs one in the foreground for a
+    supervisor or a unit file; and --no-start on add, release, retry, wait and watch does the verb's work and starts
+    none, which is a different flag from --no-runner, one letter apart: that one puts no runner before the job's own
+    command. After a reboot the records need nothing arranged: a job that was running when the machine went down has
+    no exit code and no live run, so the first worker up records it failed with reason "lost", and retries it where
+    --retry-if matches "lost". A job left queued waits for a worker, which one of the five verbs above starts, or `pp
+    queue worker start -q NAME` does, for the one queue it names. Such a record says running until that queue's worker
+    is up, so start the workers before reading `pp queue --json`; several queues are one `worker start` each, and only
+    `worker status` covers them all.
 
 A job's environment, later entries winning: the worker's own, which is that of the `pp queue add` that started it,
-without an agent session's identity;
-PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added the job; the project's [queue] env;
-add's --env K=V; and then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE, PP_QUEUE_CONTAINER, PP_QUEUE_ENVFILE and
-CUDA_VISIBLE_DEVICES, the cards --gpu-gb reserved, unset where it reserved none.
-PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what it meant where
-you typed it, and a variable you export before `pp queue add` reaches the job only through the worker that add
-started: pass a token with --env or [queue] env. An env name holds no =, NUL or newline, a value no newline.
---json gives the names of a job's own variables with every value as ***, and `show` neither.
+without an agent session's identity; PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV from the shell that added
+the job; the project's [queue] env; add's --env K=V; and then PP_QUEUE, PP_QUEUE_JOB, PP_QUEUE_RCFILE,
+PP_QUEUE_CONTAINER, PP_QUEUE_ENVFILE and CUDA_VISIBLE_DEVICES, the cards --gpu-gb reserved, unset where it reserved
+none. PATH, VIRTUAL_ENV, CONDA_PREFIX and CONDA_DEFAULT_ENV are captured at add time, so `python` means what it meant
+where you typed it, and a variable you export before `pp queue add` reaches the job only through the worker that add
+started: pass a token with --env or [queue] env. An env name holds no =, NUL or newline, a value no newline. --json
+gives the names of a job's own variables with every value as ***, and `show` neither.
 
 Agents
     `add` prints each job's id on stdout, one per line, with everything else on stderr, and for an agent session the
@@ -302,13 +295,12 @@ Agents
     are told how the job ended, with a failure's log tail, without polling. `wait --mine` is every job this session
     queued that is live, or that ended without a wait or watch of this session reporting it; `wait --idle` waits until
     nothing is queued or running, which a held job does not hold. `wait --timeout DUR` and `watch --timeout DUR` take
-    the duration spellings --timeout on add takes (90s, 30m, 2h, 1d, and a bare number is seconds) but no `none`, and
-    have no default: without one, a wait waits. A wait over a stage with a job still held is the one that needs it,
-    since that wait never returns on its own, and exit 3 is a real outcome there. Exit statuses: 0 it worked; 1 a job
-    failed or was dropped, or a config file is wrong; 2 a usage error or a refusal; 3 wait or watch gave up at its
-    --timeout; 130 interrupted. So `wait --prefix s1_ && ./next.sh` is a whole driver where a failure is meant to stop
-    it; a campaign that expects failures writes `;` and reads each outcome, since exit 1 is a failed or dropped job
-    and a wrong config alike.
+    the durations --timeout on add takes (90s, 30m, 2h, 1d, a bare number in seconds) but no `none`, and have no
+    default: without one, a wait waits, so a wait over a stage with a job still held wants one and exit 3 is its
+    answer. Exit statuses: 0 it worked; 1 a job failed or was dropped, or a config file is wrong; 2 a usage error or a
+    refusal; 3 wait or watch gave up at its --timeout; 130 interrupted. So `wait --prefix s1_ && ./next.sh` is a
+    driver for a campaign a failure should stop; one that expects failures writes `;`, since exit 1 is a failed or
+    dropped job and a wrong config alike.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not
     from the text, and ignore a field you do not know. One object per job, out of that job's record. The fields to
     count on: id, state (queued, held, running, done, failed), queue, tag, project, cwd, cmd and runner (each an
@@ -316,15 +308,15 @@ Agents
     timeout, retries, attempt, rc, reason, not_retried, added, started, ended, seconds, log, log_at, container,
     envfile, rcfile, owner, history (one entry per attempt that ended, with its own files and cards), notes, reported,
     hooks, stop (by, t, grace, timeout, sent, kill9, denied, was, cmd, rc), env and shell_env (their names, every
-    value ***), and from `show` also watchers. Every one of those is on a job in every state, null or empty where the
-    record does not hold it yet, but `after` is there only on a job that names the jobs it waits for and `stop` only
-    on a job asked to stop. A field is added and never renamed or retyped inside a minor version.
+    value ***), and from `show` also watchers. Each is on a job in every state, null or empty where the record holds
+    none yet, but `after` only on a job that names what it waits for and `stop` only on one asked to stop. A field is
+    added and never renamed or retyped inside a minor version.
 
 What is left to you, on purpose
     A dependency graph: --after is ids that already exist, with no cycles and no forward references. A log read as a
     result: make the command exit non-zero, or read its log in --on-done. Progress, a percentage and a finish time:
-    `pp queue` shows elapsed time and the last log line, and `show --json` has every attempt's duration, while no job
-    carries an estimate of its own, so a finish time for a grid is the `seconds` of the runs that have ended. Results,
+    `pp queue` shows elapsed time and the last log line, and `show --json` has every attempt's duration, and no job
+    carries an estimate, so a finish time comes from the `seconds` of the runs that ended. Results,
     which the job writes where its project wants them; `pp queue note` puts a reading beside the job. Skipping work
     already done, which the plan that writes your campaign file knows and pp does not. More than one machine: a
     submitting runner (stop = "scancel $PP_QUEUE_JOB"), or `ssh host ...`.
