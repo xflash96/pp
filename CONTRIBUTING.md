@@ -87,7 +87,9 @@ by running both.
 2. `def main(argv: list[str]) -> int`, which builds its parser with
    `ui.parser("NAME", __doc__)`.
 3. If you want short names for it, `ALIASES = ["x"]`, written as a literal
-   list.
+   list. A name one machine wants is `[alias]` in its own `config.toml`
+   instead (`pp cmd alias x NAME`), which beats both `ALIASES` and a
+   prefix and is checked against the command names before it is written.
 
 These rules keep pp working as commands come and go:
 

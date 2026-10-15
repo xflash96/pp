@@ -45,6 +45,9 @@ a built-in or one of yours. `pp` lists commands without loading them, so
 one broken command cannot break the others.
 `pp help NAME` prints a command's manual, with examples.
 
+A command answers to its file's name, to a unique prefix of it, and to any
+name you give it with `pp cmd alias`.
+
 Everything pp keeps is in plain files:
 
 ```
@@ -303,6 +306,19 @@ pp cmd update                               fetches, shows the diff, then asks
 pp cmd rm REPO
 pp cmd ls                                   every command, and where it comes from
 ```
+
+Any command can have a name of your own:
+
+```
+pp cmd alias st promote status              `pp st` is `pp promote status`
+pp cmd alias                                every alias, and what it runs
+pp cmd alias st --rm                        take the name back
+```
+
+The names live in `[alias]` in `~/.config/pp/config.toml`, and this is the
+one place pp writes that file. A name that is a command's own is refused,
+so an alias never hides a command, and `pp help st` and `pp st <TAB>` say
+what `pp promote status` does.
 
 pp clones the plugin into `~/.local/share/pp/plugins/` and checks out the
 commit you said yes to. Only `pp cmd update` moves it, after showing you

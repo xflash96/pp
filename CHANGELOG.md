@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+`pp queue`: the card reading and the calling session are named by you, with
+nvidia-smi and Claude Code's session as the defaults.
+
 - `[resources] gpu_gb = { probe = "CMD" }` reads the machine's cards with a
   command of yours instead of nvidia-smi. CMD prints one line a card,
   `index,name,total_MiB,used_MiB,util`, which is nvidia-smi's own
@@ -16,6 +19,28 @@
   place of `CLAUDE_CODE_SESSION_ID`, so any agent can use `--mine` and a job's
   `owner`. pp strips it from the workers, jobs, hooks and stop commands it
   starts, as it strips the other session variables.
+
+`pp`: a command answers to a name of your own.
+
+- `[alias]` in `~/.config/pp/config.toml` names any command anything on this
+  machine: `st = "promote status"`, or a list of words. A word is resolved
+  as a command's own name, then `[alias]`, then a module's `ALIASES`, then a
+  unique prefix, so an alias hides no command and beats a prefix. `pp help
+  st` and `pp st <TAB>` follow the expansion.
+- An alias runs no other alias. One whose key is a command's name or `help`,
+  or outside `[a-z][a-z0-9_-]*`, or whose first word names no command, is
+  skipped and listed under `pp -h`'s "broken (skipped)". The table is read
+  only where a word is not a command's exact name, so a config file that
+  cannot be parsed leaves every command pp ships working.
+- `pp cmd alias` lists every alias of both kinds, with what it runs and
+  where it is declared (`--json` for the same as data). `pp cmd alias NAME
+  CMD [ARGS...]` adds one, `pp cmd alias NAME --rm` takes it back, and `-n`
+  prints the change and writes nothing.
+- `pp cmd alias` is the one place pp writes `config.toml`: one line of the
+  `[alias]` table under a lock, the file's mode kept, every other byte as it
+  was. A change it cannot make as one line names the file to edit by hand.
+- `pp cmd ls` shows each command's aliases of both kinds, and its `--json`
+  rows gain `config_aliases` beside `aliases`.
 
 ## v0.2.0
 
