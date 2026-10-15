@@ -611,10 +611,9 @@ def _write_alias(name: str, value: str | None, dry_run: bool) -> None:
         print(ui.c("(dry run: nothing changed)", "dim"))
         return
     with lock.locked(path + ".lock", defer=True):
-        try:
+        try:        # the bytes and the mode of one open file, so the mode kept is the mode of what was read
             with open(path, "rb") as f:
-                raw = f.read()
-            mode = os.stat(path).st_mode & 0o7777
+                raw, mode = f.read(), os.fstat(f.fileno()).st_mode & 0o7777
         except FileNotFoundError:
             raw, mode = b"", 0o600
         try:
@@ -713,7 +712,8 @@ def cmd_ls(argv: list[str]) -> int:
     named: dict[str, list[str]] = {}        # the names `[alias]` gives, per command, beside its own ALIASES
     for n, words in cli.alias_names(cmds):
         got = cli.find(words[0], cmds)
-        named.setdefault(got.name if isinstance(got, cli.Command) else words[0], []).append(n)
+        if isinstance(got, cli.Command):
+            named.setdefault(got.name, []).append(n)
     rows = []
     for name, c in sorted(cmds.items()):
         row = {"name": name, "origin": c.origin, "path": c.path, "summary": c.summary, "error": c.error,

@@ -192,7 +192,7 @@ def alias_table(cmds: dict[str, Command]) -> tuple[dict[str, tuple[list[str], st
     return {key: _alias_of(key, value, cmds) for key, value in table.items()}, None
 
 
-def _alias_of(key, value, cmds: dict[str, Command]) -> tuple[list[str], str | None]:
+def _alias_of(key: str, value, cmds: dict[str, Command]) -> tuple[list[str], str | None]:
     """One entry of `[alias]`: the words it runs, and why pp skips it."""
     # a campaign line's own splitter: a shell's word rules, no shell, and no expansion of a variable or a `~`
     from pp.lib import jobpolicy      # imported here: every command imports this module, and only this needs it
