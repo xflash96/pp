@@ -581,6 +581,8 @@ def _edited(text: str, name: str, value: str | None) -> str | None:
         return "".join(lines)
     while end > at + 1 and not lines[end - 1].strip():      # the table's own lines end before the blank ones
         end -= 1
+    if not lines[end - 1].endswith("\n"):       # a file whose last line has no newline of its own
+        lines[end - 1] += "\n"
     lines.insert(end, f"{name} = {_toml_string(value)}\n")
     return "".join(lines)
 

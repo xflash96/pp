@@ -124,6 +124,12 @@ class TestAlias(Journey):
         self.assertEqual(self.bytes_of(), b'[alias]\nze = "zecho"\n')
         self.assertEqual(os.stat(self.cfg).st_mode & 0o777, 0o600)
 
+    def test_a_line_lands_at_the_end_of_a_table_in_a_file_that_ends_without_a_newline(self):
+        self.config('[http]\nport = 1\n\n[alias]\nc = "cmd ls"')
+        self.pp("cmd", "alias", "ze", "zecho")
+        self.assertEqual(self.bytes_of(), b'[http]\nport = 1\n\n[alias]\nc = "cmd ls"\nze = "zecho"\n')
+        self.assertEqual(self.pp("ze", "hi").stdout, "hi\n")
+
     def test_a_file_of_no_bytes_is_left_for_the_writer_that_is_saving_it(self):
         self.config(self.KEPT)
         with open(self.cfg, "wb"):      # what a rewrite in place leaves while its writer still holds the file
