@@ -165,6 +165,18 @@ class TestAliases(Journey):
         self.pp("chain", code=2)                                        # one expansion: `two` names no command
         self.pp("-h", code=0)                                           # the entries it skipped break nothing
 
+    def test_a_name_the_table_takes_is_listed_as_the_tables_own_and_no_module_s(self):
+        """`ze` is zecho's own ALIASES and a name the table gives: the table is read first, so every listing
+        offers that word once, as the table's, and none of them offers it as a name of zecho."""
+        self.config('[alias]\nze = "zother"\n')
+        self.assertEqual(self.pp("ze", "hi").stdout, "other hi\n")
+        rows = [r.split("\t") for r in self.pp("--commands").stdout.splitlines()]
+        self.assertEqual([r for r in rows if r[0] == "ze"], [["ze", "zother"]])
+        self.assertNotIn("zecho (ze)", self.pp().stdout)
+        if has("cmd"):
+            ls = {r["name"]: r for r in json.loads(self.pp("cmd", "ls", "--json").stdout)}
+            self.assertEqual((ls["zecho"]["aliases"], ls["zother"]["config_aliases"]), ([], ["ze"]))
+
     def test_a_config_file_that_does_not_parse_stops_the_word_that_needs_it(self):
         self.config('[alias\nze = "zother"\n')
         self.pp(code=0)                     # the listing names the file under what it skipped

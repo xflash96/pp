@@ -715,15 +715,16 @@ def cmd_ls(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     index, root = _index(), _root()
     cmds = cli.discover()
+    given = cli.alias_names(cmds)           # every name `[alias]` gives, with the words it runs
     named: dict[str, list[str]] = {}        # the names `[alias]` gives, per command, beside its own ALIASES
-    for n, words in cli.alias_names(cmds):
+    for n, words in given:
         got = cli.find(words[0], cmds)
         if isinstance(got, cli.Command):
             named.setdefault(got.name, []).append(n)
     rows = []
     for name, c in sorted(cmds.items()):
         row = {"name": name, "origin": c.origin, "path": c.path, "summary": c.summary, "error": c.error,
-               "aliases": list(c.aliases), "config_aliases": named.get(name, [])}
+               "aliases": cli.aliases_of(c, given), "config_aliases": named.get(name, [])}
         if c.origin == "plugin":
             plugin = os.path.relpath(c.path, root).split(os.sep)[0]
             rec = index.get(plugin, {})

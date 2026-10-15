@@ -242,6 +242,13 @@ def alias_names(cmds: dict[str, Command]) -> list[tuple[str, list[str]]]:
     return sorted((n, argv) for n, (argv, why) in alias_table(cmds)[0].items() if not why)
 
 
+def aliases_of(cmd: Command, named: list[tuple[str, list[str]]]) -> list[str]:
+    """A command's own ALIASES, less a name `[alias]` gives away: the table is read before a module's ALIASES,
+    so that word runs what the table says and the module is not reached by it. A listing offers these."""
+    taken = {n for n, _argv in named}
+    return [a for a in cmd.aliases if a not in taken]
+
+
 def _load(cmd: Command):
     if cmd.origin == "builtin":
         return importlib.import_module(f"pp.commands.{cmd.name}")
@@ -290,6 +297,8 @@ def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
     heads = {"builtin": "commands:", "user": f"user commands ({os.path.join(paths.config_dir(), 'commands')}):",
              "plugin": f"plugins ({paths.data_dir('plugins', create=False)}):", "path": "PP_PATH commands:",
              "external": "external (pp-* on PATH):"}
+    table, unreadable = alias_table(cmds)
+    named = sorted((n, argv) for n, (argv, why) in table.items() if not why)
     for origin in ORIGINS:
         group = sorted((c for c in cmds.values() if c.origin == origin and not c.error), key=lambda c: c.name)
         if not group:
@@ -297,15 +306,14 @@ def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
         out.append(heads[origin])
         rows = []
         for c in group:
-            label = c.name + (f" ({', '.join(c.aliases)})" if c.aliases else "")
+            own = aliases_of(c, named)
+            label = c.name + (f" ({', '.join(own)})" if own else "")
             extra = f"  [{ui.printable(c.path)}]" if show_all else ""
             if show_all and c.shadows:
                 extra += "  shadows: " + ", ".join(f"{s.origin}:{ui.printable(s.path)}" for s in c.shadows)
             rows.append([ui.printable(label), ui.printable(c.summary) + extra])
         out.append(ui.table(rows, indent="  "))
         out.append("")
-    table, unreadable = alias_table(cmds)
-    named = sorted((n, argv) for n, (argv, why) in table.items() if not why)
     if named:
         out.append("aliases (config.toml):")
         out.append(ui.table([[ui.printable(n), ui.printable(" ".join(argv))] for n, argv in named], indent="  "))
@@ -371,9 +379,10 @@ def _main(argv: list[str]) -> int:
         print(help_text(cmds, show_all="--all" in argv))
         return 0
     if argv[0] == "--commands":      # for shell completion: name<TAB>summary, aliases of both kinds included
+        named = alias_names(cmds)
         _for_a_shell([[n, c.summary] for c in sorted(cmds.values(), key=lambda c: c.name) if not c.error
-                      for n in (c.name, *c.aliases)]
-                     + [[n, " ".join(words)] for n, words in alias_names(cmds)])
+                      for n in (c.name, *aliases_of(c, named))]
+                     + [[n, " ".join(words)] for n, words in named])
         return 0
     if argv[0] == "--complete":      # for shell completion: candidates for the last of the words after `pp`
         _for_a_shell([[cand] for cand in complete(argv[1:], cmds)])
