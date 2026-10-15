@@ -32,6 +32,11 @@ class ConfigError(Exception):
     pass
 
 
+def empty_error(path: str) -> ConfigError:
+    """The error for a file of 0 bytes, in the same words wherever a reader meets one."""
+    return ConfigError(f"{path} is empty: being saved, or remove it to use the defaults")
+
+
 def _read(path: str, empty_ok: bool = True) -> dict:
     """The parsed file; {} when it is absent. With empty_ok False an empty file is an error: rewritten in place
     (`cat >`, some editors), a file is empty for a moment, and a reader acting on what it says must not take that
@@ -42,7 +47,7 @@ def _read(path: str, empty_ok: bool = True) -> dict:
     except FileNotFoundError:
         return {}
     if not raw and not empty_ok:
-        raise ConfigError(f"{path} is empty: being saved, or remove it to use the defaults")
+        raise empty_error(path)
     try:
         return tomllib.loads(raw.decode())
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:

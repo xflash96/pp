@@ -614,8 +614,11 @@ def _write_alias(name: str, value: str | None, dry_run: bool) -> None:
         try:        # the bytes and the mode of one open file, so the mode kept is the mode of what was read
             with open(path, "rb") as f:
                 raw, mode = f.read(), os.fstat(f.fileno()).st_mode & 0o7777
-        except FileNotFoundError:
+        except FileNotFoundError:       # no file at all: this writer makes one
             raw, mode = b"", 0o600
+        else:
+            if not raw:     # a file rewritten in place is empty for a moment, which is not "no settings"
+                raise config.empty_error(path)
         try:
             old = tomllib.loads(raw.decode())
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:

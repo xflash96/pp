@@ -124,6 +124,13 @@ class TestAlias(Journey):
         self.assertEqual(self.bytes_of(), b'[alias]\nze = "zecho"\n')
         self.assertEqual(os.stat(self.cfg).st_mode & 0o777, 0o600)
 
+    def test_a_file_of_no_bytes_is_left_for_the_writer_that_is_saving_it(self):
+        self.config(self.KEPT)
+        with open(self.cfg, "wb"):      # what a rewrite in place leaves while its writer still holds the file
+            pass
+        self.pp("cmd", "alias", "ze", "zecho", code=1)
+        self.assertEqual(self.bytes_of(), b"")
+
     def test_a_dry_run_prints_the_change_and_writes_nothing(self):
         self.config(self.KEPT)
         was, stamp = self.bytes_of(), os.stat(self.cfg).st_mtime_ns
