@@ -285,7 +285,7 @@ SETTINGS = (
        refuses="a non-finite value"),
     _S("backfill", "queue", "boolean", default=False, printed=True, refuses="a non-boolean"),
     _S("resources", "queue", "pools", default={"slots": 3}, printed=True, merge=True,
-       refuses="an unknown key in a pool table"),
+       refuses="an unknown key in a pool table; probe on gpu_gb, since the cards are the machine's"),
 
     # The machine: `[resources]` in config.toml, and no flag. One machine has one set of limits, and every
     # queue counts against them. The four below are the keys of one pool's table.
