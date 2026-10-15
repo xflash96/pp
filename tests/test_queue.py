@@ -1437,6 +1437,27 @@ class TestProbe(QueueCase):
         self.assertEqual(data["pools"]["default"][0]["name"], "slots")
 
 
+class TestTheCardReading(QueueCase):
+    """The machine's cards: [resources] gpu_gb's probe where it gives one, and nvidia-smi where it does not.
+    This scope's own card reader sees no card, so a card here is one a reader of the test's prints."""
+
+    def gpu_pool(self) -> dict:
+        return next(p for p in jobq.pools("default") if p["name"] == "gpu_gb")
+
+    def test_a_reading_older_than_every_is_taken_again_before_an_add_is_refused(self):
+        """Whoever finds the cached reading older than `every` runs the probe, an add among them, so a job is
+        not refused for a failure the probe no longer gives."""
+        up = self.sb.path("cards-are-up")
+        self.resources(f"gpu_gb = {{ probe = \"test -f {up} && echo '0, Fake GPU, 24576, 1024, 0' || exit 3\","
+                       ' every = "0s" }')
+        self.assertIsNone(jobq.card_reading([self.gpu_pool()])[0])      # the failure every reader shares now
+        with open(up, "w"):
+            pass
+        rc, out, err = self.call("add", "--no-start", "--cwd", self.work, "--gpu-gb", "2", "--", "true")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.state(int(out.split()[-1])), "queued")
+
+
 class TestTimeoutRetry(QueueCase):
     def test_timeout_kills_the_group(self):
         j = self.add("--timeout", "0.5", cmd="sleep 30 & sleep 30; wait")

@@ -576,16 +576,17 @@ def reading(p: dict, run: bool = True) -> dict | None:
     return r
 
 
-def card_reading(ps: list[dict], run: bool = True) -> tuple[list[dict] | None, float, str]:
+def card_reading(ps: list[dict]) -> tuple[list[dict] | None, float, str]:
     """The machine's cards, the time they were read, and why there are none ("" where they were read).
 
     `ps` is every pool named gpu_gb. Where [resources] gpu_gb gives a probe, that probe is the reading: its
-    cached reading is the one every reader shares, run where it is older than `every`, as for any probe.
-    Without one pp runs nvidia-smi itself, uncached, so `run` says nothing about that reading."""
+    cached reading is the one every reader shares, and a reader that finds it older than `every` runs the
+    probe, so an add, a launch pass and `pp queue` read the cards the probe reads now. Without one pp runs
+    nvidia-smi itself, uncached."""
     p = next((p for p in ps if p["probe"]), None)
     if p is None:
         return _cards(), time.time(), CARDS_WHY
-    r = reading(p, run=run) or {}
+    r = reading(p) or {}
     if r.get("value") is None:
         return None, float(r.get("t") or 0.0), r.get("error") or policy.NO_READING
     return r["value"], float(r["t"]), ""
@@ -607,7 +608,7 @@ class Resources:
         gpu = self.by_name.get("gpu_gb") if "gpu_gb" in needed else None
         # the cards, read once: a pass's settle window counts from this reading's own time, so the time
         # travels with it and so does the reason there are none
-        self.cards, self.cards_t, self.cards_why = (card_reading(gpu, run=live) if gpu
+        self.cards, self.cards_t, self.cards_why = (card_reading(gpu) if gpu
                                                     else (None, time.time(), ""))
         self.readings = {(p["scope"], p["name"]): reading(p, run=live)
                          for p in self.pools if p["probe"] and p["name"] in needed and p["name"] != "gpu_gb"}

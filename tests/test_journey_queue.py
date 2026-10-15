@@ -365,8 +365,9 @@ class TestTheCardReading(QueueJourney):
     def test_a_reader_that_fails_or_prints_no_card_line_leaves_the_job_queued(self):
         """A reading that failed is no card: the job waits instead of being placed, and `cards_why` says why
         `cards` is null. An exit of 0 with nothing that parses is a failed reading too."""
-        self.reader("echo cannot reach the box >&2\nexit 3\n")
+        self.reader("echo '0, Fake GPU, 24576, 23552, 0'\n")     # 1 GB free: the job is queued, not placed
         j = self.add("--gpu-gb", "2", "--", "true")
+        self.tool("cards", "echo cannot reach the box >&2\nexit 3\n")
         d = self.until(lambda: (x := self.cards())["cards_why"] and x, what="a reading that failed")
         self.assertIsNone(d["cards"])
         self.assertIn("exit 3", d["cards_why"])
