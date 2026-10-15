@@ -427,6 +427,10 @@ class TestConfigMistakes(QueueJourney):
 
 
 class TestAgent(QueueJourney):
+    def sessions(self, jid) -> list:
+        """The sessions a job's outcome was reported to, off its own record."""
+        return [r["session"] for r in self.show(jid)["reported"]]
+
     def test_an_agent_queues_waits_on_its_own_jobs_and_is_told_how(self):
         me, other = self.as_agent("sess-a"), self.as_agent("sess-b")
         r = self.pp("queue", "add", "--", "sh", "-c", "sleep 0.5; echo agent-tail; exit 2", env=me)
@@ -446,6 +450,21 @@ class TestAgent(QueueJourney):
         self.assertIn("nothing of this session's", self.wait(env=me, extra=("--mine",)).stdout)
         self.assertIn("not inside an agent session", self.wait(code=2, extra=("--mine",)).stderr)
         self.assertNotIn("in the background", self.pp("queue", "add", "--", "true").stderr)     # a person: no hint
+
+    def test_an_agent_names_its_own_session_with_pp_session(self):
+        """PP_SESSION names the calling session, so `--mine` and a job's owner are any agent's. The job pp
+        starts does not inherit it: the environment it writes down holds no name of its caller's."""
+        envfile = f"{self.work}/job-env"
+        me, other = dict(self.env, PP_SESSION="sess-a"), dict(self.env, PP_SESSION="sess-b")
+        jid = self.add("--", "sh", "-c", f"env > {envfile}", env=me)
+        self.assertEqual(self.show(jid)["owner"]["session"], "sess-a")
+        self.wait(jid)                                          # it ends, reported to no session of its own
+        self.wait(env=other, extra=("--mine",))                 # another session's: nothing of its own
+        self.assertNotIn("sess-b", self.sessions(jid))
+        self.wait(env=me, extra=("--mine",))                    # its own, ended and never reported to it
+        self.assertIn("sess-a", self.sessions(jid))
+        job_env = dict(ln.split("=", 1) for ln in self.read(envfile).splitlines() if "=" in ln)
+        self.assertNotIn("PP_SESSION", job_env)
 
     def test_watch_streams_each_event_and_a_drop_is_not_success(self):
         x = self.add("--hold", "--tag", "hx", "--", "true")

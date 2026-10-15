@@ -297,7 +297,8 @@ Agents
     `add` prints each job's id on stdout, one per line, with everything else on stderr, and for an agent session the
     one command to run next. Run `pp queue wait ID` in the background (or `pp queue watch ID` under a monitor) and you
     are told how the job ended, with a failure's log tail, without polling. `wait --mine` is every job this session
-    queued that is live, or that ended without a wait or watch of this session reporting it; `wait --idle` waits until
+    queued that is live, or that ended without a wait or watch of this session reporting it; another agent names its
+    own session with PP_SESSION in pp's environment, which pp strips from what it starts. `wait --idle` waits until
     nothing is queued or running, which a held job does not hold. `wait --timeout DUR` and `watch --timeout DUR` take
     the durations --timeout on add takes (90s, 30m, 2h, 1d, a bare number in seconds) but no `none`, and have no
     default: without one, a wait waits, so a wait over a stage with a job still held wants one and exit 3 is its

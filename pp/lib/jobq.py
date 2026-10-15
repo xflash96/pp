@@ -1823,7 +1823,7 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
     elif a.mine:
         me = session.caller()
         if not me:
-            ui.die(f"{_PROG} {verb} --mine: not inside an agent session (no CLAUDE_CODE_SESSION_ID)", 2)
+            ui.die(f"{_PROG} {verb} --mine: not inside an agent session (set PP_SESSION to name this one)", 2)
 
         def mine(j):
             return isinstance(j.get("owner"), dict) and j["owner"].get("session") == me["session"]
