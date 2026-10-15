@@ -655,7 +655,8 @@ def _own_flags(argv: list[str]) -> tuple[list[str], list[str]]:
 
 
 def cmd_alias(argv: list[str]) -> int:
-    ap = ui.parser("cmd alias", "Name a command whatever you like, on this machine.")
+    ap = ui.parser("cmd alias", "Name a command whatever you like, on this machine.",
+                   usage="pp cmd alias [-n] [NAME [CMD [ARGS...] | --rm]]  (bare: the listing, --json for data)")
     ap.add_argument("name", nargs="?", help="the name to give; without one, every alias is listed")
     ap.add_argument("--rm", action="store_true", help="take this name back")
     ap.add_argument("--json", action="store_true", help="the listing as data")
@@ -672,6 +673,9 @@ def cmd_alias(argv: list[str]) -> int:
         rows = _alias_rows(cmds, table)
         if a.json:
             ui.print_json(rows)
+            return 0
+        if not rows:
+            print("no aliases (pp cmd alias st promote status)")
             return 0
         print(ui.table([[ui.printable(r["name"]), ui.printable(" ".join(r["argv"])),
                          ui.printable(r["path"]) + (f"  ({ui.printable(r['error'])})" if r["error"] else "")]
