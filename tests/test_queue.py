@@ -1457,6 +1457,18 @@ class TestTheCardReading(QueueCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.state(int(out.split()[-1])), "queued")
 
+    def test_a_job_over_the_pools_max_is_refused_while_the_first_reading_is_anothers(self):
+        """A pool's own max is a budget no card widens, so a job no card can ever hold is refused at add time
+        where nothing is read of the cards yet. A queue is strict head-of-line, and such a job queued would be
+        a head no pass can start."""
+        self.resources("gpu_gb = { probe = \"echo '0, Fake GPU, 8192, 1024, 0'\", max = 6 }")
+        p = self.gpu_pool()
+        with jobq.lock.Claim.take(jobq._probe_claim(p)):        # the first reading is another holder's
+            self.assertEqual(jobq.card_reading([p])[2], jobpolicy.NO_READING)
+            rc, _, err = self.call("add", "--no-start", "--cwd", self.work, "--gpu-gb", "80", "--", "true")
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(jobstore.jobs("queued"), [])
+
 
 class TestTimeoutRetry(QueueCase):
     def test_timeout_kills_the_group(self):

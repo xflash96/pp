@@ -433,13 +433,14 @@ def check(needs: dict, seen: dict) -> str | None:
             return (f"nothing provides '{k}': set [resources] {k} (shared by every queue) or "
                     f"[queue.{seen['q']}.resources] {k} (this queue's own) in {seen['where']}")
         if k == "gpu_gb":
-            if not seen["cards"]:
-                if seen["cards_why"] == NO_READING:
-                    continue        # nothing is known of the cards yet, so nothing is refused for them here
+            if seen["cards"]:
+                top = max(min(gpu_budget(p, c) for p in ps) for c in seen["cards"])
+            elif seen["cards_why"] != NO_READING:
                 return (f"needs gpu_gb but {card_reader(ps)} sees no GPU"
                         + (f" ({seen['cards_why']})" if seen["cards_why"] else ""))
-            top = max(min(gpu_budget(p, c) for p in ps) for c in seen["cards"])
-            if v > top:
+            else:   # nothing is read of the cards yet, so a pool's own max is the budget known here
+                top = min((p["max"] for p in ps if p["max"] is not None), default=None)
+            if top is not None and v > top:
                 return f"needs gpu_gb={v:g} but no card's budget is that large ({top:g})"
             continue
         for p in ps:
