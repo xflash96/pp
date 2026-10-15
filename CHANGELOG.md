@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- `[resources] gpu_gb = { probe = "CMD" }` reads the machine's cards with a
+  command of yours instead of nvidia-smi. CMD prints one line a card,
+  `index,name,total_MiB,used_MiB,util`, which is nvidia-smi's own
+  `--format=csv,noheader,nounits` line, and the index it prints is the one pp
+  reserves and publishes in `CUDA_VISIBLE_DEVICES`. The reading is cached for
+  the pool's `every` and taken under the probe's own claim, as any probe's is.
+  A probe in a `[queue.NAME.resources] gpu_gb` is still refused: one machine
+  has one set of cards.
+- `pp queue status --json` gains `cards_why`: why `cards` is null, and `""`
+  where the cards were read.
+- `PP_SESSION`, where it is set and not empty, names the calling session, in
+  place of `CLAUDE_CODE_SESSION_ID`, so any agent can use `--mine` and a job's
+  `owner`. pp strips it from the workers, jobs, hooks and stop commands it
+  starts, as it strips the other session variables.
+
 ## v0.2.0
 
 The interface this minor version keeps. `pp help queue` says what is promised
