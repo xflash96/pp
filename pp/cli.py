@@ -336,7 +336,7 @@ def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
         out.append(ui.table(broken, indent="  "))
         out.append("")
     out.append("Unique prefixes work (`pp pro` = `pp promote`). `pp cmd new NAME --user` writes one of your own.")
-    out.append("`pp cmd alias st promote status` names a command yourself, in config.toml's [alias].")
+    out.append("`pp cmd alias st promote status` makes `pp st` run `pp promote status` ([alias] in config.toml).")
     return "\n".join(out)
 
 

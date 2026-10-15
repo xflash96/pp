@@ -14,7 +14,7 @@
     pp cmd rm tools                 remove a plugin and its commands
     pp cmd ls                       every command and where it comes from (--json, with its aliases)
     pp cmd alias                    every alias, what it runs and where it is declared (--json)
-    pp cmd alias st promote status  name a command yourself; pp cmd alias st --rm takes the name back
+    pp cmd alias st promote status  `pp st` runs `pp promote status`; pp cmd alias st --rm removes it
     pp cmd alias st -n promote      print the change, write nothing
 
 A new command has a docstring whose first line is its summary, a main(argv), and only the standard library at
