@@ -11,6 +11,10 @@ A command is found in one of five places, first match wins (so a plugin cannot s
 A Python command is a module whose docstring's first line is its summary and which defines main(argv) -> int.
 Listing reads modules with `ast` and never imports them, so a command whose file is absent, unparsable or whose
 imports fail cannot break `pp -h` or any other command. Publishing a subset of pp is deleting files.
+
+A word is resolved in one order: a command's exact name, then `[alias]` in config.toml, then a module's own
+`ALIASES`, then a unique prefix. `[alias]` names any command anything on this machine, and `pp cmd alias`
+writes it.
 """
 from __future__ import annotations
 
@@ -166,6 +170,78 @@ def resolve(name: str, cmds: dict[str, Command]) -> Command:
     ui.die(f"no command '{name}'{hint}", 2)
 
 
+# ---- [alias] ----------------------------------------------------------------------------------------------
+# `[alias]` in config.toml gives any command any name on this machine. The table is read where a word is not a
+# command's exact name, and for the listings and the completions below, so dispatching a command pp ships reads
+# no config file at all. One word in, one expansion out: an alias's own first word is resolved without the
+# table, so there is no chain to follow, and an alias can hide no command, since the exact name is read first.
+
+ALIAS_KEY = re.compile(r"[a-z][a-z0-9_-]*")
+
+
+def alias_table(cmds: dict[str, Command]) -> tuple[dict[str, tuple[list[str], str | None]], str | None]:
+    """`[alias]` as {name: (the words it runs, why it is skipped)}, and why config.toml could not be read.
+
+    This raises nothing: `pp -h` prints both as a note, and an entry that cannot work is skipped without
+    touching the entries beside it. The word that needs an alias is where an unreadable file becomes an error.
+    """
+    try:
+        table = config.load("alias")
+    except config.ConfigError as e:
+        return {}, str(e)
+    return {key: _alias_of(key, value, cmds) for key, value in table.items()}, None
+
+
+def _alias_of(key, value, cmds: dict[str, Command]) -> tuple[list[str], str | None]:
+    """One entry of `[alias]`: the words it runs, and why pp skips it."""
+    # a campaign line's own splitter: a shell's word rules, no shell, and no expansion of a variable or a `~`
+    from pp.lib import jobpolicy      # imported here: every command imports this module, and only this needs it
+    argv: list[str] = []
+    if isinstance(value, str):
+        try:
+            argv = jobpolicy.words_of(value)[0]
+        except ValueError as e:
+            return argv, str(e)
+    elif isinstance(value, list) and all(isinstance(w, str) for w in value):
+        argv = list(value)
+    else:
+        return argv, "a value is a command line or a list of words"
+    if not ALIAS_KEY.fullmatch(key):
+        return argv, "a name is a letter, then letters, digits, _ and -"
+    if key == "help":
+        return argv, "`pp help CMD` is pp's own"
+    if key in cmds:
+        return argv, f"the name of a {cmds[key].origin} command ({ui.printable(cmds[key].path)})"
+    if not argv:
+        return argv, "it names no command"
+    if not isinstance(find(argv[0], cmds), Command):
+        return argv, f"no command '{ui.printable(argv[0])}'"
+    return argv, None
+
+
+def expand(words: list[str], cmds: dict[str, Command], quiet: bool = False) -> list[str]:
+    """`words` with a leading `[alias]` name replaced once by what it stands for: the alias's own words, then
+    the words typed after it. Anything else comes back as it was.
+
+    A file that cannot be parsed is this word's error, as any bad config file is, unless `quiet`: a completion
+    offers what it can and says nothing.
+    """
+    if not words or words[0] in cmds:
+        return words
+    table, err = alias_table(cmds)
+    if err:
+        if quiet:
+            return words
+        raise config.ConfigError(err)
+    argv, why = table.get(words[0]) or ([], "not an alias")
+    return words if why else argv + words[1:]
+
+
+def alias_names(cmds: dict[str, Command]) -> list[tuple[str, list[str]]]:
+    """Each name `[alias]` gives with the words it runs, the skipped ones left out: what a listing offers."""
+    return sorted((n, argv) for n, (argv, why) in alias_table(cmds)[0].items() if not why)
+
+
 def _load(cmd: Command):
     if cmd.origin == "builtin":
         return importlib.import_module(f"pp.commands.{cmd.name}")
@@ -228,19 +304,31 @@ def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
             rows.append([ui.printable(label), ui.printable(c.summary) + extra])
         out.append(ui.table(rows, indent="  "))
         out.append("")
+    table, unreadable = alias_table(cmds)
+    named = sorted((n, argv) for n, (argv, why) in table.items() if not why)
+    if named:
+        out.append("aliases (config.toml):")
+        out.append(ui.table([[ui.printable(n), ui.printable(" ".join(argv))] for n, argv in named], indent="  "))
+        out.append("")
     hidden = [s for c in cmds.values() for s in c.shadows if s.origin != "external"]
     if hidden and not show_all:      # a file someone wrote that can never run: say so where they look
         out.append(ui.c("hidden by a same-named command found first (rename to use):", "yellow"))
         out.append(ui.table([[ui.printable(h.name), f"{h.origin}  [{ui.printable(h.path)}]"]
                              for h in sorted(hidden, key=lambda h: h.name)], indent="  "))
         out.append("")
-    broken = sorted((c for c in cmds.values() if c.error), key=lambda c: c.name)
+    cfg = ui.printable(config.global_path())
+    broken = [[ui.printable(c.name), f"{ui.printable(c.error)}  [{ui.printable(c.path)}]"]
+              for c in sorted((c for c in cmds.values() if c.error), key=lambda c: c.name)]
+    broken += [[ui.printable(n), f"{ui.printable(why)}  [{cfg}]"]
+               for n, (argv, why) in sorted(table.items()) if why]
+    if unreadable:
+        broken.append(["[alias]", ui.printable(unreadable)])
     if broken:
         out.append(ui.c("broken (skipped):", "yellow"))
-        out.append(ui.table([[ui.printable(c.name), f"{ui.printable(c.error)}  [{ui.printable(c.path)}]"]
-                             for c in broken], indent="  "))
+        out.append(ui.table(broken, indent="  "))
         out.append("")
     out.append("Unique prefixes work (`pp pro` = `pp promote`). `pp cmd new NAME --user` writes one of your own.")
+    out.append("`pp cmd alias st promote status` names a command yourself, in config.toml's [alias].")
     return "\n".join(out)
 
 
@@ -282,9 +370,10 @@ def _main(argv: list[str]) -> int:
     if not argv or set(argv) <= {"-h", "--help", "--all"}:
         print(help_text(cmds, show_all="--all" in argv))
         return 0
-    if argv[0] == "--commands":      # for shell completion: name<TAB>summary, aliases included
+    if argv[0] == "--commands":      # for shell completion: name<TAB>summary, aliases of both kinds included
         _for_a_shell([[n, c.summary] for c in sorted(cmds.values(), key=lambda c: c.name) if not c.error
-                      for n in (c.name, *c.aliases)])
+                      for n in (c.name, *c.aliases)]
+                     + [[n, " ".join(words)] for n, words in alias_names(cmds)])
         return 0
     if argv[0] == "--complete":      # for shell completion: candidates for the last of the words after `pp`
         _for_a_shell([[cand] for cand in complete(argv[1:], cmds)])
@@ -299,9 +388,11 @@ def _main(argv: list[str]) -> int:
         if not rest:
             print(help_text(cmds, show_all="--all" in argv))
             return 0
+        rest = expand(rest, cmds)       # `pp help st` is the help of what `st` runs: `pp promote status --help`
         return run(resolve(rest[0], cmds), rest[1:] + ["--help"])     # `pp help queue add` = `pp queue add -h`
     if argv[0].startswith("-"):
         ui.die(f"unknown option {argv[0]}; `pp -h` for usage", 2)
+    argv = expand(argv, cmds)
     return run(resolve(argv[0], cmds), argv[1:])
 
 
@@ -370,11 +461,13 @@ def complete(words: list[str], cmds: dict[str, Command]) -> list[str]:
         before = before[1:]
     if not before:
         names = {n for c in cmds.values() if not c.error for n in (c.name, *c.aliases)}
+        names |= {n for n, _ in alias_names(cmds)}
         if words[:1] != ["help"]:
             names.add("help")
         return sorted(n for n in names if n.startswith(cur))
     if "--" in before:          # past `--`: the rest is someone else's command line
         return []
+    before = expand(before, cmds, quiet=True)       # an alias completes as the words it stands for do
     cmd = find(before[0], cmds)
     if not isinstance(cmd, Command):
         return []

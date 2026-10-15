@@ -8,12 +8,15 @@ Who owns which table, and what rejects an unknown key in it:
     config.toml  [resources], [queue.NAME]   queue    jobq (a queue's table and [resources])
                  [http]                      http     http's KEYS
                  [batch]                     batch    batch._presets
+                 [alias]                     cli      cli.alias_table (a name pp gives a command)
     .pp.toml     name                        promote and queue (the releases dir, a job's project)
                  [promote]                   promote  promote._checked
                  [queue]                     queue    queue._prepare
                  [NAME] of your own          your command; pp ignores tables it does not own
 
-Both are read-only to pp; edit them by hand. A malformed file is a loud error naming the file, not a silent default.
+Both are edited by hand. pp writes one line of one of them: `pp cmd alias` adds or removes a key of
+config.toml's [alias], and that verb is the only writer of either file. A malformed file is a loud error naming
+the file, not a silent default.
 """
 from __future__ import annotations
 

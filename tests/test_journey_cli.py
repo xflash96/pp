@@ -144,6 +144,48 @@ class TestFindingACommand(Journey):
         self.assertIn("quote (qt)", self.pp().stdout)
 
 
+class TestAliases(Journey):
+    """`[alias]` in config.toml, and the one order a word is resolved in: an exact command name, then the
+    table, then a module's own ALIASES, then a unique prefix."""
+
+    def setUp(self):
+        super().setUp()
+        self.write("home/.config/pp/commands/zecho.py",
+                   '"""Show argv"""\nALIASES = ["ze"]\ndef main(argv):\n    print(" ".join(argv))\n    return 0\n')
+        self.write("home/.config/pp/commands/zother.py",
+                   '"""Show argv, too"""\ndef main(argv):\n    print("other", *argv)\n    return 0\n')
+
+    def test_a_word_is_resolved_in_one_order(self):
+        self.config('[alias]\nzecho = "zother"\nze = "zother"\nzec = "zother"\n'
+                    'two = "zecho a b"\nchain = "two"\n')
+        self.assertEqual(self.pp("zecho", "hi").stdout, "hi\n")         # an exact name beats an alias of it
+        self.assertEqual(self.pp("ze", "hi").stdout, "other hi\n")      # an alias beats a module's ALIASES
+        self.assertEqual(self.pp("zec", "hi").stdout, "other hi\n")     # ... and a unique prefix
+        self.assertEqual(self.pp("two", "c").stdout, "a b c\n")         # its own words come before the typed
+        self.pp("chain", code=2)                                        # one expansion: `two` names no command
+        self.pp("-h", code=0)                                           # the entries it skipped break nothing
+
+    def test_a_config_file_that_does_not_parse_stops_the_word_that_needs_it(self):
+        self.config('[alias\nze = "zother"\n')
+        self.pp(code=0)                     # the listing names the file under what it skipped
+        self.pp("-h", code=0)
+        self.pp("zecho", "x", code=0)       # an exact name is dispatched without reading the table
+        self.pp("zq", code=1)               # a word that needs the table: the usual bad-config error
+        if has("queue"):
+            self.pp("queue", "-h", code=0)
+
+    @needs("promote")
+    def test_the_help_and_the_completion_follow_the_expansion(self):
+        self.config('[alias]\nst = "promote status"\n')
+        self.assertEqual(self.pp("help", "st").stdout, self.pp("promote", "status", "--help").stdout)
+        for cur in ("", "-"):
+            want = self.pp("--complete", "promote", "status", cur).stdout
+            self.assertEqual(self.pp("--complete", "st", cur).stdout, want)
+        self.assertTrue(self.pp("--complete", "st", "-").stdout.strip())
+        self.assertIn("st", self.pp("--complete", "s").stdout.split())
+        self.assertIn("st", self.pp("--commands").stdout.split())
+
+
 class TestPlugins(Journey):
     def setUp(self):
         super().setUp()
