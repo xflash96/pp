@@ -1469,6 +1469,21 @@ class TestTheCardReading(QueueCase):
         self.assertEqual(rc, 2, err)
         self.assertEqual(jobstore.jobs("queued"), [])
 
+    def test_a_reading_carries_the_time_it_was_taken(self):
+        """A pass holds a job's reservation for the pool's settle window from the reading's own time, so a
+        reading carries the time it was taken: the time `reading` records for a probe, and the time
+        nvidia-smi's reading records as well."""
+        launched: list[float] = []
+
+        def reader():
+            launched.append(time.time())
+            while time.time() == launched[0]:       # the clock moves on while a reading is being taken
+                pass
+            return [card()]
+
+        with mock.patch.object(jobq, "_cards", reader):
+            self.assertLessEqual(jobq.card_reading(jobq.card_pools())[1], launched[0])
+
 
 class TestTimeoutRetry(QueueCase):
     def test_timeout_kills_the_group(self):

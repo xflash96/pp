@@ -585,7 +585,8 @@ def card_reading(ps: list[dict]) -> tuple[list[dict] | None, float, str]:
     nvidia-smi itself, uncached."""
     p = next((p for p in ps if p["probe"]), None)
     if p is None:
-        return _cards(), time.time(), CARDS_WHY
+        t = time.time()     # before the reading runs, as `reading` takes a probe's own t
+        return _cards(), t, CARDS_WHY
     r = reading(p) or {}
     if r.get("value") is None:
         return None, float(r.get("t") or 0.0), r.get("error") or policy.NO_READING
