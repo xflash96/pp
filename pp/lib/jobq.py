@@ -292,9 +292,11 @@ SETTINGS = (
     _S("resources", "machine", "pools", default={"cpu": "auto", "mem_gb": "auto", "gpu_gb": "auto"},
        printed=True, merge=True,
        refuses='an unknown key in the table; "auto" for a name that is not cpu, mem_gb or gpu_gb; '
-               "probe on gpu_gb; a table with neither max nor probe, except gpu_gb"),
+               "a table with neither max nor probe, except gpu_gb"),
     _S("max", "machine", "number", default="auto", auto_ok=True, refuses="not a number"),
-    _S("probe", "machine", "shell", refuses="an empty string; probe on gpu_gb"),
+    # gpu_gb's probe prints the machine's cards in nvidia-smi's own format and stands in for it. One machine
+    # has one set of cards, so [queue.NAME.resources] gpu_gb refuses a probe (jobpolicy.cards, section 16.1).
+    _S("probe", "machine", "shell", refuses="an empty string; probe on a queue's own gpu_gb"),
     _S("every", "machine", "duration", default=PROBE_EVERY, printed=True, refuses="a non-finite value"),
     _S("settle", "machine", "duration", default=SETTLE, printed=True, refuses="a non-finite value"),
 )
@@ -438,7 +440,7 @@ def _mem_total_gb() -> float:
         return 0.0
 
 
-CARDS_WHY = ""      # why the last _cards() gave None, for the messages that report it ("" when it had no card)
+CARDS_WHY = ""      # why the last _cards() gave None, which `card_reading` hands on to whoever reports it
 
 
 def _cards() -> list[dict] | None:
@@ -458,16 +460,8 @@ def _cards() -> list[dict] | None:
         said = (out.stderr.strip() or out.stdout.strip()).splitlines()
         CARDS_WHY = f"nvidia-smi exited {out.returncode}" + (f": {said[-1][:120]}" if said else "")
         return None
-    cards = []
-    for line in out.stdout.strip().splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        try:     # the name may hold commas: index first, the three numbers last
-            total, used = float(parts[-3]) / 1024, float(parts[-2]) / 1024
-            cards.append({"index": int(parts[0]), "name": ",".join(parts[1:-3]), "total_gb": total,
-                          "used_gb": used, "free_gb": total - used, "util": parts[-1]})
-        except (ValueError, IndexError):
-            continue
-    return cards or None
+    cards, CARDS_WHY = policy.cards(out.stdout)      # the one card parser, which a probe's output goes through too
+    return cards
 
 
 def _pool(name: str, v, scope: str | None) -> dict | None:
@@ -488,11 +482,16 @@ def _pool(name: str, v, scope: str | None) -> dict | None:
         mx = {"cpu": os.cpu_count() or 1, "mem_gb": round(_mem_total_gb()), "gpu_gb": None}[name]   # gpu: per card
     p = {"name": name, "scope": scope, "where": where, "max": mx, "probe": read.get("probe"),
          "every": read.get("every", PROBE_EVERY), "settle": read.get("settle", SETTLE)}
-    if p["probe"] is not None and name == "gpu_gb":
-        raise config.ConfigError(f"{where}: gpu_gb is probed with nvidia-smi already")
+    if p["probe"] is not None and name == "gpu_gb" and scope is not None:
+        raise config.ConfigError(f"{where}: the cards are the machine's, so [resources] gpu_gb takes the probe")
     if p["max"] is None and p["probe"] is None and name != "gpu_gb":
         raise config.ConfigError(f"{where}: a number, or a table with max and/or probe")
     return p
+
+
+def _machine_pools(empty_ok: bool = True) -> dict:
+    """[resources] as its row reads it: the machine's pools, the row's default merged with what the file says."""
+    return policy.resolve(BY_SCOPE["machine"]["resources"], config=config.load("resources", empty_ok))
 
 
 def pools(q: str, empty_ok: bool = True) -> list[dict]:
@@ -502,8 +501,18 @@ def pools(q: str, empty_ok: bool = True) -> list[dict]:
     if own is not policy.NOTSET and not isinstance(own, dict):
         raise config.ConfigError(f"[queue.{q}.resources] must be a table")
     own = policy.resolve(BY_SCOPE["queue"]["resources"], config=own)
-    shared = policy.resolve(BY_SCOPE["machine"]["resources"], config=config.load("resources", empty_ok))
+    shared = _machine_pools(empty_ok)
     return [p for p in [_pool(k, v, q) for k, v in own.items()] + [_pool(k, v, None) for k, v in shared.items()] if p]
+
+
+def card_pools() -> list[dict]:
+    """Where the machine's card reading is declared: [resources] gpu_gb, as a pool list, or none where that
+    table removes the pool. A config this cannot read leaves the reading to nvidia-smi and is named by the
+    view that reads it, so the card line stands while a config error is being fixed."""
+    try:
+        return [p for p in [_pool("gpu_gb", _machine_pools().get("gpu_gb", False), None)] if p]
+    except config.ConfigError:
+        return []
 
 
 def _probe_path(p: dict) -> str:
@@ -531,7 +540,10 @@ def reading(p: dict, run: bool = True) -> dict | None:
     and the user's command is never run twice over at once.
 
     Where another holder is running the first reading there is, this gives back {t, value: None, running: True}:
-    a job waits for that reading, and nobody is told the probe failed."""
+    a job waits for that reading, and nobody is told the probe failed.
+
+    A pool's value is the amount free, the first number the command prints. `gpu_gb`'s value is the machine's
+    cards, one line each, since admission needs a fact per card (jobpolicy.cards)."""
     path = _probe_path(p)
     r = _cached(path)
     if not run or (r and time.time() - float(r.get("t", 0)) < p["every"]):
@@ -551,6 +563,9 @@ def reading(p: dict, run: bool = True) -> dict | None:
         else:
             if out.timed_out:
                 r = {"t": t, "value": None, "error": f"it did not answer in {PROBE_WAIT:g}s"}
+            elif out.returncode == 0 and p["name"] == "gpu_gb":
+                got, why = policy.cards(out.stdout)
+                r = {"t": t, "value": got, "error": why or None}
             elif out.returncode == 0 and (m := re.search(r"-?\d+(?:\.\d+)?", out.stdout)):
                 r = {"t": t, "value": policy.num(m[0]), "error": None}
             else:
@@ -561,8 +576,23 @@ def reading(p: dict, run: bool = True) -> dict | None:
     return r
 
 
+def card_reading(ps: list[dict], run: bool = True) -> tuple[list[dict] | None, float, str]:
+    """The machine's cards, the time they were read, and why there are none ("" where they were read).
+
+    `ps` is every pool named gpu_gb. Where [resources] gpu_gb gives a probe, that probe is the reading: its
+    cached reading is the one every reader shares, run where it is older than `every`, as for any probe.
+    Without one pp runs nvidia-smi itself, uncached, so `run` says nothing about that reading."""
+    p = next((p for p in ps if p["probe"]), None)
+    if p is None:
+        return _cards(), time.time(), CARDS_WHY
+    r = reading(p, run=run) or {}
+    if r.get("value") is None:
+        return None, float(r.get("t") or 0.0), r.get("error") or policy.NO_READING
+    return r["value"], float(r["t"]), ""
+
+
 class Resources:
-    """Queue q's pools with their live readings (nvidia-smi, probes), taken once and outside the store lock.
+    """Queue q's pools with their live readings (the cards, probes), taken once and outside the store lock.
 
     What a pass is handed is `seen`, those readings as a value: the arithmetic over them is pure, so every
     rule of admission is a table (pp/lib/jobpolicy.py)."""
@@ -574,17 +604,20 @@ class Resources:
         for p in self.pools:
             self.by_name.setdefault(p["name"], []).append(p)
         needed = set(needed)
-        self.cards_t = time.time()
-        self.cards = _cards() if "gpu_gb" in needed and "gpu_gb" in self.by_name else None
+        gpu = self.by_name.get("gpu_gb") if "gpu_gb" in needed else None
+        # the cards, read once: a pass's settle window counts from this reading's own time, so the time
+        # travels with it and so does the reason there are none
+        self.cards, self.cards_t, self.cards_why = (card_reading(gpu, run=live) if gpu
+                                                    else (None, time.time(), ""))
         self.readings = {(p["scope"], p["name"]): reading(p, run=live)
-                         for p in self.pools if p["probe"] and p["name"] in needed}
+                         for p in self.pools if p["probe"] and p["name"] in needed and p["name"] != "gpu_gb"}
 
     @property
     def seen(self) -> dict:
         """These readings as the value a pass admits against, with the file a pool is declared in, which a
         refusal names."""
         return {"q": self.q, "pools": self.pools, "by_name": self.by_name, "cards": self.cards,
-                "cards_t": self.cards_t, "probes": self.readings, "cards_why": CARDS_WHY,
+                "cards_t": self.cards_t, "probes": self.readings, "cards_why": self.cards_why,
                 "where": config.global_path()}
 
     def check(self, needs: dict) -> str | None:
@@ -1155,12 +1188,15 @@ def cmd_status(a, scope: list[str] | None) -> int:
         recent          [job], the jobs that ended most recently, at most -n of them
         pools           {queue: [pool]}, each queue's own pools
         shared          [pool], the pools every queue draws from; a pool is {name, max, used, probe, reading}
-        cards           [{index, name, total_gb, used_gb, free_gb, util}], the GPUs nvidia-smi reports
+        cards           [{index, name, total_gb, used_gb, free_gb, util}], the GPUs the card reading reports
+        cards_why       why `cards` is null; "" where the cards were read
         config_errors   [message]; while there is one, workers launch nothing
 
     A field change goes in CHANGELOG.md (CONTRIBUTING.md, "Adding a command").
     """
-    cards = _cards()            # before the listing: nvidia-smi may take seconds, and a reader holds the store
+    # before the listing: a card reading may take seconds, and a reader holds the store. The line this view
+    # prints and the `cards` an agent reads are this one reading.
+    cards, _t, cards_why = card_reading(card_pools())
     now = time.time()
     # one listing: the counts, the rows and what the shared pools hold are the same jobs, so no job is shown
     # twice or in two states. Every queue is listed, since a shared pool counts every queue's running jobs.
@@ -1201,7 +1237,8 @@ def cmd_status(a, scope: list[str] | None) -> int:
     if a.json:
         flat = lambda st: [public(j) for q in qs for j in per[q]["data"][st]]   # noqa: E731
         recent = sorted((j for q in qs for j in per[q]["recent"]), key=lambda j: -(j.get("ended") or 0))
-        ui.print_json({"cards": cards, "queues": qs, "workers": {q: per[q]["wpid"] for q in qs},
+        ui.print_json({"cards": cards, "cards_why": cards_why, "queues": qs,
+                       "workers": {q: per[q]["wpid"] for q in qs},
                        "starting": [q for q in qs if per[q]["how"] == jobcore.STARTING],
                        "pools": {q: per[q]["pools"] for q in qs}, "shared": shared,
                        "waiting": {q: per[q]["waiting"] for q in qs},
@@ -1210,7 +1247,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
         return 1 if bad else 0
     width = shutil.get_terminal_size((120, 20)).columns
     gpu = "  ".join(f"GPU{c['index']} {c['util']}% {c['used_gb']:.1f}/{c['total_gb']:.0f}G" for c in cards) if cards else (
-        "GPU n/a" + (f" ({CARDS_WHY})" if CARDS_WHY else ""))
+        "GPU n/a" + (f" ({cards_why})" if cards_why else ""))
     print(f"{gpu}   {datetime.now():%Y-%m-%d %H:%M:%S}")
     default_pools = BY_SCOPE["machine"]["resources"].default
     pool_strs = [_pool_str(p, now) for p in shared if p["used"] or p["probe"] or p["name"] not in default_pools]

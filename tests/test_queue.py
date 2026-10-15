@@ -1318,12 +1318,23 @@ class TestPools(QueueCase):
 
     def test_config_errors(self):
         for text, msg in (("nodes = { maxx = 3 }", "unknown maxx"), ('lic = "auto"', "know their own size"),
-                          ('gpu_gb = { probe = "x" }', "nvidia-smi already"), ("nodes = { every = 3 }", "max and/or probe"),
+                          ("nodes = { every = 3 }", "max and/or probe"),
                           ('nodes = "lots"', "not a number"), ('nodes = { probe = "x", every = "soon" }', "every")):
             self.resources(text)
             with self.assertRaises(config.ConfigError, msg=text) as cm:
                 jobq.pools("default")
             self.assertIn(msg, str(cm.exception))
+
+    def test_a_card_probe_belongs_to_the_machine_and_not_to_one_queue(self):
+        """One machine has one set of cards, so [resources] gpu_gb takes the probe and a queue's own table
+        refuses it."""
+        self.resources('gpu_gb = { probe = "x" }')
+        self.assertEqual([p["probe"] for p in jobq.pools("default") if p["name"] == "gpu_gb"], ["x"])
+        self.resources("")
+        self.config('gpu_gb = { probe = "x" }')
+        with self.assertRaises(config.ConfigError) as cm:
+            jobq.pools("default")
+        self.assertIn("[queue.default.resources] gpu_gb", str(cm.exception))
 
     def test_reserved_queue_names(self):
         rc, _, err = self.call("add", "-q", "probes", "--no-start", "--", "true")

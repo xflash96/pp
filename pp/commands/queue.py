@@ -182,8 +182,11 @@ Settings: one default, one key, one flag, one order
     own count only its own. A pool is a number, "auto", false, or a table of max, probe, every and settle; a bare
     number means max, and `false` removes a pool a default would otherwise give, in that scope. A probe is a command
     printing the amount FREE now, the first number it prints, cached for `every` (30s unless set); max = N beside it
-    also caps what pp's own jobs may hold. gpu_gb takes no probe, since nvidia-smi is its reading: one on it is
-    refused, gpu_gb = { settle = "2m" } is legal, and a max of its own is what that scope's jobs may reserve on one
+    also caps what pp's own jobs may hold. nvidia-smi is gpu_gb's reading, and [resources] gpu_gb = { probe = "CMD" }
+    replaces it: CMD prints one line a card, index,name,total_MiB,used_MiB,util, which is nvidia-smi's own
+    --query-gpu line under --format=csv,noheader,nounits; the index it prints is the one pp reserves and publishes in
+    CUDA_VISIBLE_DEVICES; and a probe in a per-queue table is refused, since one machine has one set of cards.
+    gpu_gb = { settle = "2m" } is legal, and a max of its own is what that scope's jobs may reserve on one
     card, which the live free reading has to allow besides. settle (30s unless set, for gpu_gb and every probe) holds
     a job's reservation against a reading it may not show in yet. An unknown key or a bad value is an error that `pp
     queue` names; while it stands the worker launches nothing, but still records how running jobs end and enforces

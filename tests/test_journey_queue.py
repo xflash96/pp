@@ -336,6 +336,62 @@ class TestResources(QueueJourney):
                       self.pp("queue", "add", "--gpu-gb", "1", "--", "true", code=2).stderr)
 
 
+class TestTheCardReading(QueueJourney):
+    """[resources] gpu_gb = { probe = "CMD" }: the machine's cards read by a command of the user's, in place
+    of nvidia-smi. The fake nvidia-smi of the sandbox sees no GPU throughout, so every card here is the
+    probe's, and no test needs a real one."""
+
+    def reader(self, script: str, every: str = "0.2s") -> str:
+        """A fake card reader on the sandbox's PATH, declared as the machine's gpu_gb probe."""
+        path = self.tool("cards", script)
+        self.setcfg(BASE + f'[resources]\ngpu_gb = {{ probe = "{path}", every = "{every}" }}\n')
+        return path
+
+    def cards(self, code: int = 0) -> dict:
+        return json.loads(self.pp("queue", "--json", code=code).stdout)
+
+    def test_a_card_reader_of_your_own_reads_the_cards_a_job_is_placed_on(self):
+        """One line a card, index,name,total_MiB,used_MiB,util, with a name that holds a comma. The job takes
+        the index of the card with the most free memory, and `--json` holds both cards."""
+        self.reader("cat <<'EOF'\n0, Tiny, GPU, 8192, 7168, 11\n1, Big GPU, 24576, 1024, 3\nEOF\n")
+        d = self.cards()
+        self.assertEqual([(c["index"], c["name"], c["total_gb"], c["free_gb"]) for c in d["cards"]],
+                         [(0, "Tiny,GPU", 8.0, 1.0), (1, "Big GPU", 24.0, 23.0)])
+        self.assertEqual(d["cards_why"], "")
+        j = self.add("--gpu-gb", "2", "--", "sh", "-c", "echo card=$CUDA_VISIBLE_DEVICES")
+        self.wait(j)
+        self.assertEqual(self.show(j)["cards"], [1])            # the card the reading left the most free
+
+    def test_a_reader_that_fails_or_prints_no_card_line_leaves_the_job_queued(self):
+        """A reading that failed is no card: the job waits instead of being placed, and `cards_why` says why
+        `cards` is null. An exit of 0 with nothing that parses is a failed reading too."""
+        self.reader("echo cannot reach the box >&2\nexit 3\n")
+        j = self.add("--gpu-gb", "2", "--", "true")
+        d = self.until(lambda: (x := self.cards())["cards_why"] and x, what="a reading that failed")
+        self.assertIsNone(d["cards"])
+        self.assertIn("exit 3", d["cards_why"])
+        self.assertEqual(self.state(j), "queued")
+        self.tool("cards", "echo not a card line\n")
+        d = self.until(lambda: (x := self.cards())["cards_why"].startswith("printed no card line") and x,
+                       what="a reading with no card line")
+        self.assertIsNone(d["cards"])
+        self.assertEqual(self.state(j), "queued")
+
+    def test_the_reading_is_cached_so_two_readers_inside_every_run_it_once(self):
+        """Every reader shares one cached reading, and it is taken again where it is older than `every`."""
+        marker = f"{self.tmp}/reads"
+        self.reader(f"echo read >> {marker}\necho '0, Fake GPU, 24576, 1024, 0'\n", every="5m")
+        first, second = self.cards(), self.cards()
+        self.assertEqual(first["cards"], second["cards"])
+        self.assertEqual(len(self.read(marker).splitlines()), 1)
+
+    def test_a_card_probe_in_a_queues_own_table_is_a_config_error(self):
+        """One machine has one set of cards, so only [resources] gpu_gb takes the probe."""
+        self.setcfg(BASE + '[queue.default.resources]\ngpu_gb = { probe = "true" }\n')
+        d = self.cards(code=1)
+        self.assertEqual(len(d["config_errors"]), 1, d["config_errors"])
+
+
 class TestConfigMistakes(QueueJourney):
     def test_a_broken_config_is_named_and_stops_launches_but_not_bookkeeping(self):
         runner = self.add("--tag", "gated", "--", "sh", "-c", "while [ ! -f go ]; do sleep 0.05; done")

@@ -283,7 +283,7 @@ and `tests/test_constructs.py` reads the source for each:
   every write is one call and one whole transaction. Two sites outside it run a
   process of their own, and both are named exemptions: `reading`, which runs a
   user's probe under that probe's own claim, and `_cards`, which runs
-  nvidia-smi.
+  nvidia-smi where `[resources] gpu_gb` gives no probe of its own.
 - The purity rule. A function of `jobpolicy.py` reaches no clock, no store, no
   process, no signal and no file. It is handed records, readings, settings and
   `now`, and gives back a value, so a rule that could be raced is a rule no

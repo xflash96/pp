@@ -378,6 +378,38 @@ def gpu_budget(p: dict, card: dict) -> float:
     return p["max"] if p["max"] is not None else round(max(card["total_gb"] - 2, 0), 1)
 
 
+NO_READING = "it has not been read yet"     # a card reading nobody has taken: nothing is known of the cards
+
+
+def cards(text: str) -> tuple[list[dict] | None, str]:
+    """The cards a card reading printed, or None and the reason there are none.
+
+    One line a card, `index,name,total_MiB,used_MiB,util`, which is the line `nvidia-smi
+    --query-gpu=index,name,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits` prints and
+    the line [resources] gpu_gb's probe prints in its place. The index is a non-negative integer and comes
+    first, the three numbers come last, so a name may hold commas. MiB is divided by 1024, so a pool's GB is
+    GiB, and `util` is kept as the text it was printed as. A line that does not parse is skipped, and output
+    with no line that parses is a reading with no card."""
+    out = []
+    for line in text.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        try:        # the name may hold commas: the index first, the three numbers last
+            i, total, used = int(parts[0]), float(parts[-3]) / 1024, float(parts[-2]) / 1024
+            if i < 0:   # the index a job's libraries use, so it is one a card can have
+                continue
+            out.append({"index": i, "name": ",".join(parts[1:-3]), "total_gb": total,
+                        "used_gb": used, "free_gb": total - used, "util": parts[-1]})
+        except (ValueError, IndexError):
+            continue
+    said = text.strip().splitlines()
+    return (out, "") if out else (None, "printed no card line" + (f": {said[0][:120]}" if said else ""))
+
+
+def card_reader(ps: list[dict]) -> str:
+    """What reads the machine's cards: [resources] gpu_gb's probe where it gives one, else nvidia-smi."""
+    return "the gpu_gb probe" if any(p["probe"] for p in ps) else "nvidia-smi"
+
+
 def ready(queued: list[dict], now: float, live=()) -> list[dict]:
     """The queued jobs a pass may start: the ones whose retry delay is up and whose `after` is met.
 
@@ -402,7 +434,10 @@ def check(needs: dict, seen: dict) -> str | None:
                     f"[queue.{seen['q']}.resources] {k} (this queue's own) in {seen['where']}")
         if k == "gpu_gb":
             if not seen["cards"]:
-                return "needs gpu_gb but nvidia-smi sees no GPU" + (f" ({seen['cards_why']})" if seen["cards_why"] else "")
+                if seen["cards_why"] == NO_READING:
+                    continue        # nothing is known of the cards yet, so nothing is refused for them here
+                return (f"needs gpu_gb but {card_reader(ps)} sees no GPU"
+                        + (f" ({seen['cards_why']})" if seen["cards_why"] else ""))
             top = max(min(gpu_budget(p, c) for p in ps) for c in seen["cards"])
             if v > top:
                 return f"needs gpu_gb={v:g} but no card's budget is that large ({top:g})"
@@ -447,7 +482,8 @@ def fits(job: dict, running: list[dict], seen: dict) -> tuple[bool, str, int | N
     if not ps:
         return False, "gpu_gb: nothing provides it", None
     if not seen["cards"]:
-        return False, "gpu: nvidia-smi unreadable" + (f" ({seen['cards_why']})" if seen["cards_why"] else ""), None
+        return False, (f"gpu: no reading from {card_reader(ps)}"
+                       + (f" ({seen['cards_why']})" if seen["cards_why"] else "")), None
     settle = max(p["settle"] for p in ps)
     whys = []
     for c in sorted(seen["cards"], key=lambda c: -c["free_gb"]):
