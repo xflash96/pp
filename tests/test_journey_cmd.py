@@ -150,6 +150,7 @@ class TestAlias(Journey):
     def test_a_table_written_inline_is_named_rather_than_rewritten(self):
         self.config('# mine\nalias = { c = "cmd ls" }\n')
         was = self.bytes_of()
+        self.pp("cmd", "alias", "ze", "-n", "zecho", code=2)        # the plan is the answer the run gives
         self.pp("cmd", "alias", "ze", "zecho", code=2)
         self.pp("cmd", "alias", "c", "--rm", code=2)
         self.assertEqual(self.bytes_of(), was)

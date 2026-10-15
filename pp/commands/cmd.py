@@ -603,13 +603,10 @@ def _write_alias(name: str, value: str | None, dry_run: bool) -> None:
     """Add or remove one key of `[alias]`, or refuse and leave the file byte for byte as it was.
 
     Under config.toml's own lock, through a temporary file in its directory renamed over it with its mode kept
-    (0600 where there was no file), and only once the result parses as the old file with that one change."""
+    (0600 where there was no file), and only once the result parses as the old file with that one change. A dry
+    run builds the edit and checks it too, so the change it prints is the change the run makes."""
     path = config.global_path()
     change = f"remove {name}" if value is None else f"write {name} = {_toml_string(value)}"
-    if dry_run:
-        print(f"would {change} in [alias] of {ui.printable(path)}")
-        print(ui.c("(dry run: nothing changed)", "dim"))
-        return
     with lock.locked(path + ".lock", defer=True):
         try:        # the bytes and the mode of one open file, so the mode kept is the mode of what was read
             with open(path, "rb") as f:
@@ -627,6 +624,10 @@ def _write_alias(name: str, value: str | None, dry_run: bool) -> None:
         if text is None or want is None or _parse(text) != want:
             ui.die(f"pp cannot make this change one line of {ui.printable(path)}; {change} in its [alias] "
                    "table by hand", 2)
+        if dry_run:     # the edit is made and checked first, so the plan is the run and not another answer
+            print(f"would {change} in [alias] of {ui.printable(path)}")
+            print(ui.c("(dry run: nothing changed)", "dim"))
+            return
         paths.write_text(path, text, mode)
         print(f"{'removed' if value is None else 'wrote'} {name} in [alias] of {ui.printable(path)}")
 
