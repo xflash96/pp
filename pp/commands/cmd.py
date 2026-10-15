@@ -13,9 +13,16 @@
     pp cmd update tools -n          only show what would change
     pp cmd rm tools                 remove a plugin and its commands
     pp cmd ls                       every command and where it comes from (--json, with its aliases)
+    pp cmd alias                    every alias, what it runs and where it is declared (--json)
+    pp cmd alias st promote status  name a command yourself; pp cmd alias st --rm takes the name back
+    pp cmd alias st -n promote      print the change, write nothing
 
 A new command has a docstring whose first line is its summary, a main(argv), and only the standard library at
 the top of the file (the rest: https://github.com/xflash96/pp/blob/main/CONTRIBUTING.md).
+
+A command is named by its file, by its module's ALIASES, and by `[alias]` in ~/.config/pp/config.toml, which
+names any command anything on this machine. `pp cmd alias` is the one place pp writes that file: it adds or
+removes one line of the [alias] table and leaves every other byte of it as it was.
 
 A plugin is a git repository of such command files: the *.py files in its commands/ folder, or at its top when
 it has no commands/ folder. Each plugin is a clone in ~/.local/share/pp/plugins/NAME, checked out at the commit
@@ -29,12 +36,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
+import tomllib
 
 from pp import cli
-from pp.lib import lock, paths, proc, ui
+from pp.lib import config, lock, paths, proc, ui
 
 TEMPLATE = '''"""{summary}
 
@@ -524,15 +533,187 @@ def cmd_rm(argv: list[str]) -> int:
     return 0
 
 
+# ---- aliases ------------------------------------------------------------------------------------
+#
+# `[alias]` in config.toml is pp's own naming table, read in pp/cli.py and written here and nowhere else. The
+# file is a person's: their comments and their other tables are in it, so this writes one line of the `[alias]`
+# table and leaves every other byte alone.
+#
+# The edit is checked before it lands: the result is parsed, and it must be the old parse with exactly that one
+# key added or removed. So an edit this line edit cannot make (an `alias = { ... }` written inline, a value
+# spread over lines) ends with the file named for the person to change by hand, never with pp rewriting it.
+
+_TABLE = re.compile(r"\[\s*alias\s*\]\s*(#.*)?")    # the `[alias]` header line, with the comment TOML allows
+_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def _toml_string(s: str) -> str:
+    """s as a TOML basic string: the escapes TOML names, and \\uXXXX for every other control character."""
+    out = "".join(_ESCAPES.get(ch) or (ch if ch >= " " and ch != "\x7f" else f"\\u{ord(ch):04X}") for ch in s)
+    return f'"{out}"'
+
+
+def _key_line(name: str) -> re.Pattern:
+    """What the line holding this key of `[alias]` looks like: the bare key, or the key quoted, then `=`."""
+    k = re.escape(name)
+    return re.compile(rf"""\s*({k}|"{k}"|'{k}')\s*=""")
+
+
+def _edited(text: str, name: str, value: str | None) -> str | None:
+    """text with one line added to or removed from its `[alias]` table; None where that cannot be one line.
+
+    An added key goes at the end of the table's own lines, or into a new `[alias]` table at the end of the
+    file. A removed one is the line it is written on. Nothing else in the file is touched."""
+    lines = text.splitlines(keepends=True)
+    at = next((i for i, line in enumerate(lines) if _TABLE.fullmatch(line.strip())), None)
+    if at is None:
+        if value is None:
+            return None
+        pad = "" if not text or text.endswith("\n") else "\n"
+        blank = "\n" if text else ""        # a table of its own, one blank line below whatever was there
+        return text + pad + blank + "[alias]\n" + f"{name} = {_toml_string(value)}\n"
+    end = next((i for i in range(at + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+    if value is None:
+        hit = [i for i in range(at + 1, end) if _key_line(name).match(lines[i])]
+        if len(hit) != 1:
+            return None
+        del lines[hit[0]]
+        return "".join(lines)
+    while end > at + 1 and not lines[end - 1].strip():      # the table's own lines end before the blank ones
+        end -= 1
+    lines.insert(end, f"{name} = {_toml_string(value)}\n")
+    return "".join(lines)
+
+
+def _wanted(old: dict, name: str, value: str | None) -> dict | None:
+    """The parse the edited file must come to: the old one with exactly that key of `[alias]` added or removed.
+    None where the old file holds an `alias` that is no table, which this cannot edit."""
+    table = old.get("alias", {})
+    if not isinstance(table, dict):
+        return None
+    table = dict(table)
+    if value is None:
+        table.pop(name, None)
+    else:
+        table[name] = value
+    return {**old, "alias": table}
+
+
+def _write_alias(name: str, value: str | None, dry_run: bool) -> None:
+    """Add or remove one key of `[alias]`, or refuse and leave the file byte for byte as it was.
+
+    Under config.toml's own lock, through a temporary file in its directory renamed over it with its mode kept
+    (0600 where there was no file), and only once the result parses as the old file with that one change."""
+    path = config.global_path()
+    change = f"remove {name}" if value is None else f"write {name} = {_toml_string(value)}"
+    if dry_run:
+        print(f"would {change} in [alias] of {ui.printable(path)}")
+        print(ui.c("(dry run: nothing changed)", "dim"))
+        return
+    with lock.locked(path + ".lock", defer=True):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            mode = os.stat(path).st_mode & 0o7777
+        except FileNotFoundError:
+            raw, mode = b"", 0o600
+        try:
+            old = tomllib.loads(raw.decode())
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+            raise config.ConfigError(f"{path}: {e}") from None
+        text, want = _edited(raw.decode(), name, value), _wanted(old, name, value)
+        if text is None or want is None or _parse(text) != want:
+            ui.die(f"pp cannot make this change one line of {ui.printable(path)}; {change} in its [alias] "
+                   "table by hand", 2)
+        paths.write_text(path, text, mode)
+        print(f"{'removed' if value is None else 'wrote'} {name} in [alias] of {ui.printable(path)}")
+
+
+def _parse(text: str) -> dict | None:
+    """What TOML makes of the edited file; None where it makes nothing of it."""
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+
+
+def _alias_rows(cmds: dict, table: dict) -> list[dict]:
+    """Every alias of both kinds: the `[alias]` table's, then each module's own ALIASES."""
+    path = config.global_path()
+    rows = [{"name": n, "argv": words, "source": "config", "path": path, "error": why}
+            for n, (words, why) in sorted(table.items())]
+    return rows + [{"name": a, "argv": [c.name], "source": "command", "path": c.path, "error": c.error}
+                   for c in sorted(cmds.values(), key=lambda c: c.name) for a in c.aliases]
+
+
+def _own_flags(argv: list[str]) -> tuple[list[str], list[str]]:
+    """This verb's own words, and the command line after NAME, which is read as nobody's flags but that
+    command's: `pp cmd alias q queue -q big` gives `-q big` to `queue` and not to argparse here."""
+    plain = [i for i, w in enumerate(argv) if not w.startswith("-")]
+    cut = plain[1] if len(plain) > 1 else len(argv)
+    return argv[:cut], argv[cut:]
+
+
+def cmd_alias(argv: list[str]) -> int:
+    ap = ui.parser("cmd alias", "Name a command whatever you like, on this machine.")
+    ap.add_argument("name", nargs="?", help="the name to give; without one, every alias is listed")
+    ap.add_argument("--rm", action="store_true", help="take this name back")
+    ap.add_argument("--json", action="store_true", help="the listing as data")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="print the change, write nothing")
+    head, line = _own_flags(argv)
+    a = ap.parse_args(head)
+    cmds = cli.discover()
+    table, unreadable = cli.alias_table(cmds)
+    if unreadable:      # this verb's own file: the error every reader of a bad config file gives
+        raise config.ConfigError(unreadable)
+    if a.name is None:
+        if a.rm:
+            ui.die("usage: pp cmd alias NAME --rm", 2)
+        rows = _alias_rows(cmds, table)
+        if a.json:
+            ui.print_json(rows)
+            return 0
+        print(ui.table([[ui.printable(r["name"]), ui.printable(" ".join(r["argv"])),
+                         ui.printable(r["path"]) + (f"  ({ui.printable(r['error'])})" if r["error"] else "")]
+                        for r in rows], ["alias", "runs", "declared in"]))
+        return 0
+    if a.rm:
+        if line:
+            ui.die("`pp cmd alias NAME --rm` takes no command after the name", 2)
+        if a.name not in table:
+            ui.die(f"no alias '{ui.printable(a.name)}' in [alias]; `pp cmd alias` lists them", 2)
+        _write_alias(a.name, None, a.dry_run)
+        return 0
+    if not line:
+        ui.die(f"usage: pp cmd alias {ui.printable(a.name)} CMD [ARGS...]   (or --rm)", 2)
+    if not cli.ALIAS_KEY.fullmatch(a.name):
+        ui.die("an alias is a letter, then letters, digits, _ and -", 2)
+    taken = _taken(a.name, cmds)
+    if taken:
+        ui.die(f"'{ui.printable(a.name)}' is taken: {taken}; pick another name", 2)
+    if a.name in table:
+        ui.die(f"'{ui.printable(a.name)}' is an alias already; `pp cmd alias {ui.printable(a.name)} --rm` "
+               "first", 2)
+    if not isinstance(cli.find(line[0], cmds), cli.Command):
+        ui.die(f"no command '{ui.printable(line[0])}'; `pp -h` lists them", 2)
+    _write_alias(a.name, shlex.join(line), a.dry_run)
+    return 0
+
+
 def cmd_ls(argv: list[str]) -> int:
     ap = ui.parser("cmd ls", "Every command, and where it comes from.")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     index, root = _index(), _root()
+    cmds = cli.discover()
+    named: dict[str, list[str]] = {}        # the names `[alias]` gives, per command, beside its own ALIASES
+    for n, words in cli.alias_names(cmds):
+        got = cli.find(words[0], cmds)
+        named.setdefault(got.name if isinstance(got, cli.Command) else words[0], []).append(n)
     rows = []
-    for name, c in sorted(cli.discover().items()):
+    for name, c in sorted(cmds.items()):
         row = {"name": name, "origin": c.origin, "path": c.path, "summary": c.summary, "error": c.error,
-               "aliases": list(c.aliases)}
+               "aliases": list(c.aliases), "config_aliases": named.get(name, [])}
         if c.origin == "plugin":
             plugin = os.path.relpath(c.path, root).split(os.sep)[0]
             rec = index.get(plugin, {})
@@ -545,12 +726,13 @@ def cmd_ls(argv: list[str]) -> int:
     for r in rows:
         where = (f"{r['plugin']} at {(r['commit'] or '?')[:7]}" + (f" ({r['ref']})" if r.get("ref") else "")
                  + f" from {r['url']}") if r["origin"] == "plugin" else r["path"]
-        shown.append([ui.printable(r["name"]), r["origin"], ui.printable(where)])
-    print(ui.table(shown, ["command", "from", "where"]))
+        shown.append([ui.printable(r["name"]), r["origin"],
+                      ui.printable(" ".join(r["aliases"] + r["config_aliases"])), ui.printable(where)])
+    print(ui.table(shown, ["command", "from", "aliases", "where"]))
     return 0
 
 
-VERBS = {"new": cmd_new, "add": cmd_add, "update": cmd_update, "rm": cmd_rm, "ls": cmd_ls}
+VERBS = {"new": cmd_new, "add": cmd_add, "update": cmd_update, "rm": cmd_rm, "ls": cmd_ls, "alias": cmd_alias}
 
 
 def main(argv: list[str]) -> int:

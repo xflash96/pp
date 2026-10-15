@@ -1,5 +1,5 @@
-"""Journeys through `pp cmd`: writing a command of your own, and adding, updating and removing a git repository of
-someone else's. A local repository stands in for GitHub."""
+"""Journeys through `pp cmd`: writing a command of your own, naming a command whatever you like, and adding,
+updating and removing a git repository of someone else's. A local repository stands in for GitHub."""
 import json
 import os
 import shutil
@@ -84,6 +84,86 @@ class TestNew(Journey):
         self.assertEqual(r.returncode, 2)
         self.assertIn("--user", r.stderr)
         self.assertFalse(os.path.exists(os.path.join(rel, "pp/commands/baz.py")))
+
+
+class TestAlias(Journey):
+    """`pp cmd alias`, the one place pp writes config.toml: one line of its `[alias]` table changes, and every
+    other byte of the file is the person's and stays as it was."""
+
+    KEPT = '# mine\n[http]\nport = 8080\n\n[alias]\nc = "cmd ls"   # short\n\n[batch]\n'
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = os.path.join(self.env["PP_CONFIG_DIR"], "config.toml")
+        self.write("home/.config/pp/commands/zecho.py",
+                   '"""Show argv"""\ndef main(argv):\n    print(" ".join(argv))\n    return 0\n')
+
+    def bytes_of(self) -> bytes:
+        with open(self.cfg, "rb") as f:
+            return f.read()
+
+    def test_a_line_lands_inside_the_table_and_comes_back_out_of_it(self):
+        self.config(self.KEPT)
+        was = self.bytes_of()
+        self.pp("cmd", "alias", "ze", "zecho", "a b")
+        self.assertEqual(self.bytes_of().replace(b'ze = "zecho \'a b\'"\n', b"", 1), was)
+        self.assertEqual(self.pp("ze", "c").stdout, "a b c\n")
+        self.pp("cmd", "alias", "ze", "--rm")
+        self.assertEqual(self.bytes_of(), was)
+
+    def test_a_file_with_no_table_gets_one_at_its_end_and_a_new_file_is_private(self):
+        self.config("[http]\nport = 1\n")
+        was = self.bytes_of()
+        self.pp("cmd", "alias", "ze", "zecho")
+        self.assertEqual(self.bytes_of(), was + b'\n[alias]\nze = "zecho"\n')
+        os.chmod(self.cfg, 0o640)
+        self.pp("cmd", "alias", "zf", "zecho")
+        self.assertEqual(os.stat(self.cfg).st_mode & 0o777, 0o640)
+        os.remove(self.cfg)
+        self.pp("cmd", "alias", "ze", "zecho")
+        self.assertEqual(self.bytes_of(), b'[alias]\nze = "zecho"\n')
+        self.assertEqual(os.stat(self.cfg).st_mode & 0o777, 0o600)
+
+    def test_a_dry_run_prints_the_change_and_writes_nothing(self):
+        self.config(self.KEPT)
+        was, stamp = self.bytes_of(), os.stat(self.cfg).st_mtime_ns
+        self.pp("cmd", "alias", "qz", "-n", "zecho")
+        self.pp("cmd", "alias", "c", "-n", "--rm")
+        self.assertEqual((self.bytes_of(), os.stat(self.cfg).st_mtime_ns), (was, stamp))
+        self.pp("qz", code=2)       # the name the plan printed names nothing
+
+    def test_a_name_or_a_command_it_refuses_leaves_the_file_alone(self):
+        self.config(self.KEPT)
+        was = self.bytes_of()
+        for args in ((ANY, "zecho"), ("help", "zecho"), ("Ze", "zecho"), ("z e", "zecho"),
+                     ("ze", "nosuchthing"), ("c", "zecho"), ("nope", "--rm")):
+            self.pp("cmd", "alias", *args, code=2)
+        self.assertEqual(self.bytes_of(), was)
+
+    def test_a_table_written_inline_is_named_rather_than_rewritten(self):
+        self.config('# mine\nalias = { c = "cmd ls" }\n')
+        was = self.bytes_of()
+        self.pp("cmd", "alias", "ze", "zecho", code=2)
+        self.pp("cmd", "alias", "c", "--rm", code=2)
+        self.assertEqual(self.bytes_of(), was)
+
+    def test_every_alias_is_listed_with_what_it_runs_and_where_it_is_declared(self):
+        self.write("home/.config/pp/commands/zal.py",
+                   '"""Aliased"""\nALIASES = ["zq"]\ndef main(argv):\n    return 0\n')
+        self.config('[alias]\nc = "cmd ls"\nbad = "nosuchthing"\nzecho = "cmd ls"\n')
+        by = {(r["source"], r["name"]): r for r in json.loads(self.pp("cmd", "alias", "--json").stdout)}
+        self.assertEqual(by[("config", "c")]["argv"], ["cmd", "ls"])
+        self.assertEqual(by[("config", "c")]["path"], self.cfg)
+        self.assertIsNone(by[("config", "c")]["error"])
+        self.assertIsNotNone(by[("config", "bad")]["error"])
+        self.assertIsNotNone(by[("config", "zecho")]["error"])      # a command's own name, so it is skipped
+        self.assertEqual(self.pp("zecho", "hi").stdout, "hi\n")
+        self.assertEqual(by[("command", "zq")]["argv"], ["zal"])
+        self.assertEqual(by[("command", "zq")]["path"],
+                         os.path.join(self.env["PP_CONFIG_DIR"], "commands", "zal.py"))
+        ls = {r["name"]: r for r in json.loads(self.pp("cmd", "ls", "--json").stdout)}
+        self.assertEqual((ls["zal"]["aliases"], ls["zal"]["config_aliases"]), (["zq"], []))
+        self.assertEqual(ls["cmd"]["config_aliases"], ["c"])
 
 
 class PluginJourney(Journey):
