@@ -225,6 +225,15 @@ class QueueCase(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         return int(out.split()[-1])
 
+    def add_as(self, sid: str, *args, **kw) -> int:
+        """One job queued by session sid, which PP_SESSION names, with the session before it put back."""
+        was = os.environ.get("PP_SESSION")
+        self.sb.setenv(PP_SESSION=sid)
+        try:
+            return self.add(*args, **kw)
+        finally:
+            self.sb.setenv(PP_SESSION=was)
+
     def state(self, jid):
         j = jobstore.find(jid)
         return j["state"] if j else None
@@ -1985,6 +1994,44 @@ class TestStatusWait(QueueCase):
         self.assertEqual(out.count("…"), 4, f"a tag of each section is cut to fit:\n{out}")
         self.assertIn("worker up (pid", out)
         self.assertRegex(out, r"\n  slots 1/1 · queued 1")      # the counts on a line of their own
+
+    def test_status_mine_is_this_sessions_jobs_in_every_state(self):
+        """`--mine` narrows the four lists of jobs to the ones this session queued, in every state, and `ls`
+        answers as `status` does. It applies together with `--here`. The machine's own part of the view counts
+        every job, whoever queued it. Where pp started the process it runs under there is no session, so
+        `--mine` can name nothing and it is the usage error `wait --mine` gives."""
+        self.config("slots = 2")
+        other = self.sb.dir("other")
+        self.sb.chdir(self.work)        # so --here is the project of this directory, which is `work`
+        self.sb.setenv(PP_SESSION="session-a")
+        a_done, b_done = self.add(cmd="true"), self.add_as("session-b", cmd="true")
+        w = self.as_the_worker()
+        self.run_until(w, lambda: {self.state(a_done), self.state(b_done)} == {"done"})
+        a_run, b_run = self.add(cmd="sleep 30"), self.add_as("session-b", cmd="sleep 30")
+        w.tick()
+        self.assertEqual([self.state(x) for x in (a_run, b_run)], ["running", "running"])
+        a_q = self.add(cmd="true")
+        self.add_as("session-b", cmd="true")       # queued, with no slot free
+        a_h, b_h = self.add("--hold", cmd="true"), self.add_as("session-b", "--hold", cmd="true")
+        a_elsewhere = self.add("--hold", cwd=other, cmd="true")
+        for verb in ("status", "ls"):
+            rc, out, err = self.call(verb, "--json", "--mine")
+            self.assertEqual(rc, 0, err)
+            data = json.loads(out)
+            self.assertEqual({k: [j["id"] for j in data[k]] for k in ("running", "queued", "held", "recent")},
+                             {"running": [a_run], "queued": [a_q], "held": [a_h, a_elsewhere], "recent": [a_done]})
+            # the machine's part of the view is every job's: both sessions' running jobs hold a slot
+            slots = [p for p in data["pools"]["default"] if p["name"] == "slots"]
+            self.assertEqual([(p["used"], p["max"]) for p in slots], [(2, 2)])
+            self.assertEqual(data["queues"], ["default"])
+        # both narrowings apply: this session's jobs, and only the ones of this directory's project
+        data = json.loads(self.call("status", "--json", "--mine", "--here")[1])
+        self.assertEqual([j["id"] for j in data["held"]], [a_h])
+        self.assertEqual([j["id"] for j in data["running"]], [a_run])
+        self.assertNotIn(b_h, [j["id"] for st in ("running", "queued", "held", "recent") for j in data[st]])
+        # no session: pp started the process it runs under
+        self.sb.setenv(PP_SESSION=None, PP_QUEUE_JOB="1")
+        self.assertEqual([self.call(v, "--mine")[0] for v in ("status", "ls")], [2, 2])
 
     def test_no_queues(self):
         """A machine with none of the three: no records, no worker, and no queue its config names."""

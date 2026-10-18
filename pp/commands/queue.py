@@ -12,6 +12,7 @@ starts the queue's worker itself.
     pp queue add -- make docs                       queue a command, run in this directory, in the `default` queue
     pp queue                                        every queue: running (with each job's last log line),
                                                     queued with what it waits for, held, recent
+    pp queue --mine    pp queue --here              only the jobs this session queued / this project's
     pp queue wait                                   until every queued and running job has ended
     pp queue show 12       pp queue log 12 -f       every field and the log tail / follow the log across retries
     pp queue add --tag c3_recall.s0 --gpu-gb 36 -- python -m lab.run --cell c3 --seed 0
@@ -26,9 +27,10 @@ starts the queue's worker itself.
 
 `status` is the verb the bare command runs: `pp queue` is `pp queue status`, and a flag goes there too, so `pp queue
 --json` and `pp queue status --json` are one command. `status --here` is this directory's project only, `--project
-NAME` one named project. -q narrows any verb to one queue, before or after the verb. A queue name begins with a
-lowercase letter or a digit and holds letters, digits, - and _; `probes`, `watchers` and `counter` are taken, so
-name a lane after its work (probe_runs). `pp help queue add`, or `pp -h queue add`, prints that verb's own flags.
+NAME` one named project, and `--mine` the jobs this session queued; the three apply together and narrow the jobs
+shown, not the queues or the pools. -q narrows any verb to one queue, before or after the verb. A queue name begins
+with a lowercase letter or a digit and holds letters, digits, - and _; `probes`, `watchers` and `counter` are taken,
+so name a lane after its work (probe_runs). `pp help queue add`, or `pp -h queue add`, prints that verb's own flags.
 
 A first project whose work runs in a container, in four steps
 
@@ -305,14 +307,14 @@ Agents
     `add` prints each job's id on stdout, one per line, with everything else on stderr, and for an agent session the
     one command to run next. Run `pp queue wait ID` in the background (or `pp queue watch ID` under a monitor) and you
     are told how the job ended, with a failure's log tail, without polling. `wait --mine` is every job this session
-    queued that is live, or that ended without a wait or watch of this session reporting it. `wait --idle` waits until
-    nothing is queued or running, which a held job does not hold. `wait --timeout DUR` and `watch --timeout DUR` take
-    the durations --timeout on add takes (90s, 30m, 2h, 1d, a bare number in seconds) but no `none`, and have no
-    default: without one, a wait waits, so a wait over a stage with a job still held wants one and exit 3 is its
-    answer. Exit statuses: 0 it worked; 1 a job failed or was dropped, or a config file is wrong; 2 a usage error or a
-    refusal; 3 wait or watch gave up at its --timeout; 130 interrupted. So `wait --prefix s1_ && ./next.sh` is a
-    driver for a campaign a failure should stop; one that expects failures writes `;`, since exit 1 is a failed or
-    dropped job and a wrong config alike.
+    queued that is live, or that ended without a wait or watch of this session reporting it, and `pp queue --mine` is
+    this session's jobs in every state. `wait --idle` waits until nothing is queued or running, which a held job does
+    not hold. `wait --timeout DUR` and `watch --timeout DUR` take the durations --timeout on add takes (90s, 30m, 2h,
+    1d, a bare number in seconds) but no `none`, and have no default: without one, a wait waits, so a wait over a
+    stage with a job still held wants one and exit 3 is its answer. Exit statuses: 0 it worked; 1 a job failed or was
+    dropped, or a config file is wrong; 2 a usage error or a refusal; 3 wait or watch gave up at its --timeout; 130
+    interrupted. So `wait --prefix s1_ && ./next.sh` is a driver for a campaign a failure should stop; one that
+    expects failures writes `;`, since exit 1 is a failed or dropped job and a wrong config alike.
         pp finds this session itself, with nothing set: it is the nearest process above pp that is neither a shell nor
     a wrapper (timeout, env, nice, nohup, stdbuf, setsid, ionice, time), named with its pid and its start time. That
     is an agent's own process, and it is a person's terminal, tmux server or ssh connection, so `--mine` works in a

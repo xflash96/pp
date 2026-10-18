@@ -24,6 +24,12 @@ nvidia-smi and the process pp runs under as the defaults.
   own session instead, and wins over `CLAUDE_CODE_SESSION_ID`. A process pp
   started itself, a job or its runner or a hook or a stop command, is no
   session. pp strips those variables from everything it starts.
+- `pp queue status --mine`, which `pp queue --mine` and `ls --mine` are too,
+  is the jobs this session queued, in every state, in the text view and in
+  `--json`'s `running`, `queued`, `held` and `recent`. It applies together
+  with `--here` and `--project`, and narrows the jobs shown and not what the
+  queues, the workers and the pools hold. Where there is no session it exits
+  2, as `wait --mine` does.
 
 `pp`: a command answers to a name of your own.
 

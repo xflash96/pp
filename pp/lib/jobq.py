@@ -729,8 +729,8 @@ def _append_log(job: dict, line: str):
 def _of_session(verb: str) -> tuple:
     """What `--mine` means, for every verb that takes it: this session's name, and whether a job is its own.
 
-    One answer for every such verb, so they all select the same jobs. Where there is no session (pp started the
-    process it runs under) `--mine` can name nothing, so it is a usage error."""
+    One answer for `wait`, `watch`, `status` and `ls`, so the four select the same jobs. Where there is no
+    session (pp started the process it runs under) `--mine` can name nothing, so it is a usage error."""
     me = session.caller()
     if not me:
         ui.die(f"{_PROG} {verb} --mine: there is no session, since pp started the process it runs under "
@@ -1202,6 +1202,9 @@ def _scope_list(scope: list[str] | None) -> list[str]:
 def cmd_status(a, scope: list[str] | None) -> int:
     """The state of every queue in scope, or of the one named with -q.
 
+    `--here`/`--project` and `--mine` narrow the four lists of jobs, and apply together. The machine's own part
+    of the view (the queues, the workers, the pools, the cards) counts every job, whoever queued it.
+
     `--json` is what an agent reads, and this is its shape, stated once:
 
         queues          [name], the queues this status covers: those that hold records, those a worker is up
@@ -1243,11 +1246,16 @@ def cmd_status(a, scope: list[str] | None) -> int:
     qs = [q for q in workers
           if scope is not None or q in named or any(j["queue"] == q for j in all_jobs)
           or workers[q].how != jobcore.DOWN]
+    # what the view narrows to, applied together: --here/--project one project's jobs, --mine this session's.
+    # The machine's own part of the view (the queues, the workers, the pools, the cards) is every job's, so
+    # these name the four lists of jobs and nothing else.
+    tests = []
     if a.here or a.project:
         want = a.project or project_name(os.getcwd())
-        keep = lambda js: [j for j in js if j.get("project") == want]   # noqa: E731
-    else:
-        keep = lambda js: js   # noqa: E731
+        tests.append(lambda j: j.get("project") == want)
+    if a.mine:
+        tests.append(_of_session(a.verb)[1])
+    keep = lambda js: [j for j in js if all(t(j) for t in tests)]   # noqa: E731
     running_all = [j for j in all_jobs if j["state"] == "running"]
     live = {j["id"] for j in all_jobs if j["state"] in jobstore.LIVE}   # what an unmet `after` waits for
     per: dict = {}
@@ -1300,8 +1308,9 @@ def cmd_status(a, scope: list[str] | None) -> int:
     if scope and scope[0] not in jobcore.queues() and not _configured(scope[0]):
         known = [q for q in jobcore.queues() if q != scope[0]]
         print(f"no queue '{scope[0]}' yet" + (f" (there are: {', '.join(known)})" if known else ""))
-    if (a.here or a.project) and not any(per[q]["data"][st] for q in qs for st in jobstore.STATES):
-        print(f"no jobs of project '{want}'")
+    if tests and not any(per[q]["data"][st] for q in qs for st in jobstore.STATES):
+        narrowed = ([f"project '{want}'"] if a.here or a.project else []) + (["this session"] if a.mine else [])
+        print(f"no jobs of {' and '.join(narrowed)}")
     for q in qs:
         s = per[q]
         data, waiting, wpid = s["data"], s["waiting"], s["wpid"]
@@ -2073,6 +2082,8 @@ def _parser(prog: str, doc: str, add_args=None):
         g = p.add_mutually_exclusive_group()
         g.add_argument("--here", action="store_true", help="only this directory's project")
         g.add_argument("--project")
+        p.add_argument("--mine", action="store_true",
+                       help="only the jobs this session queued, in every state; applies with --here/--project")
     p = sp("show", help="every field of a job, and its log tail")
     p.add_argument("id", nargs="?", metavar="ID")
     _selectors(p)
