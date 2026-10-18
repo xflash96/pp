@@ -4740,6 +4740,82 @@ class TestWhatASettingRefuses(QueueCase):
         self.assertIn("A=B", str(cm.exception))
 
 
+class TestAProjectBelowTheJobsDirectory(QueueCase):
+    """A job added from a directory that holds projects instead of being one: its command runs bare, which is
+    a whole stack of a lab's missing, so the `add` says what is below it and how to run the job as that
+    project's. The runner and the stop are the command's own part of an add (pp/commands/queue.py), so these
+    go through it."""
+
+    def setUp(self):
+        super().setUp()
+        queue_cmd._LOOKED.clear()       # one process runs every test, and this says it once per directory
+
+    def cmd(self, *argv) -> tuple[int, str, str]:
+        """An `add` through the command that owns the runner and the stop, as the CLI runs it."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = jobq.run_cli(list(argv), "queue", "default", queue_cmd.__doc__,
+                                  prepare_job=queue_cmd._prepare, add_args=queue_cmd._add_args)
+            except SystemExit as e:
+                rc = e.code
+        return rc, out.getvalue(), err.getvalue()
+
+    def a_project(self, where: str, runner: str = "./run.sh") -> str:
+        root = self.sb.dir("work", where)
+        with open(os.path.join(root, "run.sh"), "w") as f:
+            f.write('#!/bin/sh\nexec "$@"\n')
+        os.chmod(os.path.join(root, "run.sh"), 0o755)
+        with open(os.path.join(root, ".pp.toml"), "w") as f:
+            f.write(f'[queue]\nrunner = "{runner}"\nstop = "group"\n')
+        return root
+
+    def test_an_add_above_a_project_queues_the_job_and_names_the_project(self):
+        root = self.a_project("lab")
+        rc, out, err = self.cmd("add", "--no-start", "--cwd", self.work, "--", "true")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(jobstore.find(int(out.split()[-1]))["runner"], [])      # queued as it asked
+        self.assertIn(root, err)                    # the directory below, and the flag that runs it there
+        self.assertIn("--cwd", err)
+
+    def test_the_same_directory_is_named_once(self):
+        self.a_project("lab")
+        self.cmd("add", "--no-start", "--cwd", self.work, "--", "true")
+        rc, _out, err = self.cmd("add", "--no-start", "--cwd", self.work, "--", "true")
+        self.assertEqual((rc, "--cwd" in err), (0, False), err)
+
+    def test_a_directory_with_no_project_under_it_says_nothing(self):
+        self.sb.dir("work", "data")
+        with open(self.sb.path("work", "data", ".pp.toml"), "w") as f:
+            f.write('name = "data"\n')        # a project that puts no runner before a command
+        self.sb.dir("work", "deeper", "lab")
+        self.a_project(os.path.join("deeper", "lab"))        # two levels down, which this does not read
+        rc, _out, err = self.cmd("add", "--no-start", "--cwd", self.work, "--", "true")
+        self.assertEqual((rc, "--cwd" in err), (0, False), err)
+
+    def test_a_project_file_that_does_not_parse_is_skipped(self):
+        bad = self.sb.dir("work", "broken")
+        with open(os.path.join(bad, ".pp.toml"), "w") as f:
+            f.write("[queue\nrunner =\n")
+        root = self.a_project("lab")
+        rc, out, err = self.cmd("add", "--no-start", "--cwd", self.work, "--", "true")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.state(int(out.split()[-1])), "queued")
+        self.assertIn(root, err)
+
+    def test_a_job_of_the_project_itself_says_nothing(self):
+        root = self.a_project("lab")
+        rc, out, err = self.cmd("add", "--no-start", "--cwd", root, "--", "true")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(jobstore.find(int(out.split()[-1]))["runner"], [f"{root}/run.sh"])
+        self.assertNotIn("--cwd", err)
+
+    def test_no_runner_asks_for_a_bare_job_and_is_answered(self):
+        self.a_project("lab")
+        rc, _out, err = self.cmd("add", "--no-start", "--no-runner", "--cwd", self.work, "--", "true")
+        self.assertEqual((rc, "--cwd" in err), (0, False), err)
+
+
 class TestTheJobsGrace(QueueCase):
     """`grace` is one setting of the job and one number: the gap between a stop of it and the SIGKILL that
     follows, whoever asked. A timeout's stop takes the job's own, `kill` takes it too, and `kill --grace`

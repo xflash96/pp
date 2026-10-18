@@ -102,7 +102,8 @@ Campaign files
 
     Flags on the `add` itself are the defaults for every line, and a line's own flags win: --env and --need merge key
     by key, every other flag is replaced. The queue, the file, --hold and --no-start are the `add`'s own, and a line
-    that names one is refused, so a grid spread over two queues is one file and one `add` for each of them. A line is
+    that names one is refused, so a grid spread over two queues is one file and one `add` for each of them. A line's
+    --cwd is that line's own directory, and so its own project: one file may queue the work of several. A line is
     split into words the way a shell splits them, quotes and backslashes honoured, and then at its first bare --
     word; a line with no -- is the whole command, and one with no -- whose first word begins with - is refused.
     Nothing is expanded: no variable, no ~ and no glob, because a command is argv. An unquoted |, &, ;, <, >, (, ),
@@ -169,7 +170,9 @@ Settings: one default, one key, one flag, one order
     per-job key as this project's default, `log = "logs/{tag}.log"` among them, and two of its own: `runner =
     "docker/run.sh"` (a path with a / is in the project, a bare name is on PATH) and `stop = "docker rm -f
     $PP_QUEUE_CONTAINER"` (a command, or "group"; required where there is a runner). --runner CMD and --stop CMD on
-    `add` say both for one job, with no .pp.toml at all. Per machine and per queue, in config.toml:
+    `add` say both for one job, with no .pp.toml at all. An `add` from a directory with no .pp.toml above it says so
+    where a directory below it holds one that sets a runner: the job is queued and runs its command bare, and --cwd
+    DIR runs it as that project's. Per machine and per queue, in config.toml:
 
         [queue.NAME]            poll = 2 (the worker's loop period in seconds), idle_exit = 600 (it exits after
                                 this long with nothing queued or running), backfill = false, and any per-job key
@@ -349,7 +352,11 @@ import os
 import shlex
 import shutil
 
-from pp.lib import jobq, ui
+from pp.lib import config, jobq, ui
+
+# The directories this process has looked below, so an `add` of a hundred lines from one directory says it once.
+_LOOKED: set = set()
+
 
 def _add_args(p):
     p.add_argument("--no-runner", action="store_true", help="ignore the project's [queue] runner")
@@ -374,6 +381,35 @@ def _runner(spec, root: str, where: str, path: str | None) -> list[str]:
     return [exe] + argv[1:]
 
 
+def _a_project_below(cwd: str) -> None:
+    """Say once, where a job of cwd found no project of its own, that a directory directly below cwd is a
+    project whose [queue] puts a runner before its commands: such a job runs its command bare, which is a
+    whole stack of a lab's missing, and `--cwd DIR` is what runs it as that project's.
+
+    The job is queued as it asks: a directory holding several projects is a normal place to stand, and this
+    is a thing to look at rather than a refusal. One level of the tree is read, and nothing of it but those
+    files: one that does not parse or cannot be read is skipped, and a link to a directory is the one level
+    it stands for."""
+    if cwd in _LOOKED:
+        return
+    _LOOKED.add(cwd)
+    try:
+        below = sorted(e.path for e in os.scandir(cwd) if e.is_dir())
+    except OSError:
+        return
+    for d in below:
+        if not os.path.isfile(os.path.join(d, config.PROJECT_FILE)):
+            continue
+        try:
+            t = config.find_project(d)[1].get("queue")
+        except config.ConfigError:
+            continue
+        if isinstance(t, dict) and t.get("runner"):
+            ui.warn(f"queue add: no {config.PROJECT_FILE} above {cwd}, so this job runs with no runner. "
+                    f"{d} is a project whose [queue] sets one: `--cwd {d}` adds the job as that project's.")
+            return
+
+
 def _prepare(job: dict, a, project) -> None:
     """How this job's work is launched and stopped, onto the record: the runner put before its command, and
     the stop that reaches what that runner started. Both are rows of the settings declaration, so the flag
@@ -382,12 +418,15 @@ def _prepare(job: dict, a, project) -> None:
     A job whose work runs through a runner needs a stop, because no signal of pp's reaches work the runner
     started elsewhere: such an add is refused here, where the runner is read. A job that skips the runner has
     its work in its own process group, so its stop is that group whatever its project says."""
-    spec, where = (None, "") if getattr(a, "no_runner", False) else jobq.resolved(a, project, "runner")
+    bare = getattr(a, "no_runner", False)
+    spec, where = (None, "") if bare else jobq.resolved(a, project, "runner")
     root = project.root or job["cwd"]
     job["runner"] = _runner(spec, root, where, (job.get("shell_env") or {}).get("PATH"))
     stop, _where = jobq.resolved(a, project, "stop")
     if not job["runner"]:
         job["stop_cmd"] = "group"       # its work is in its own process group, and pp's signals reach it
+        if not bare and project.root is None:
+            _a_project_below(job["cwd"])        # a runner one directory away is the one a job meant to use
     elif stop:
         job["stop_cmd"] = stop
     else:
