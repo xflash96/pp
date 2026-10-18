@@ -307,13 +307,16 @@ Agents
     driver for a campaign a failure should stop; one that expects failures writes `;`, since exit 1 is a failed or
     dropped job and a wrong config alike.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not
-    from the text, and ignore a field you do not know. One object per job, out of that job's record. The fields to
-    count on: id, state (queued, held, running, done, failed), queue, tag, project, cwd, cmd and runner (each an
-    argv), stop_cmd ("group", or the command that reaches what the runner started), prio, needs, cards, after, grace,
-    timeout, retries, attempt, rc, reason, not_retried, added, started, ended, seconds, log, log_at, container,
-    envfile, rcfile, owner, history (one entry per attempt that ended, with its own files and cards), notes, reported,
-    hooks, stop (by, t, grace, timeout, sent, kill9, denied, was, cmd, rc), env and shell_env (their names, every
-    value ***), and from `show` also watchers. Each is on a job in every state, null or empty where the record holds
+    from the text, and ignore a field you do not know. `status --json` is one object, whose keys are queues, workers,
+    starting, waiting, pools, shared, cards, cards_why, config_errors, and running, queued, held and recent: those
+    four are lists of jobs, each job the object the fields below describe. `show --json` is one such job, with
+    watchers beside its own fields, and `worker status --json` is a list of {queue, pid, how, log, up}, one a queue.
+    A job's fields to count on: id, state (queued, held, running, done, failed), queue, tag, project, cwd, cmd and
+    runner (each an argv), stop_cmd ("group", or the command that reaches what the runner started), prio, needs,
+    cards, after, grace, timeout, retries, attempt, rc, reason, not_retried, added, started, ended, seconds, log,
+    log_at, container, envfile, rcfile, owner, history (one entry per attempt that ended, with its own files and
+    cards), notes, reported, hooks, stop (by, t, grace, timeout, sent, kill9, denied, was, cmd, rc), env and
+    shell_env (their names, every value ***). Each is on a job in every state, null or empty where the record holds
     none yet, but `after` only on a job that names what it waits for and `stop` only on one asked to stop. A field is
     added and never renamed or retyped inside a minor version.
 
