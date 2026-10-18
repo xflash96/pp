@@ -305,8 +305,7 @@ Agents
     `add` prints each job's id on stdout, one per line, with everything else on stderr, and for an agent session the
     one command to run next. Run `pp queue wait ID` in the background (or `pp queue watch ID` under a monitor) and you
     are told how the job ended, with a failure's log tail, without polling. `wait --mine` is every job this session
-    queued that is live, or that ended without a wait or watch of this session reporting it; another agent names its
-    own session with PP_SESSION in pp's environment, which pp strips from what it starts. `wait --idle` waits until
+    queued that is live, or that ended without a wait or watch of this session reporting it. `wait --idle` waits until
     nothing is queued or running, which a held job does not hold. `wait --timeout DUR` and `watch --timeout DUR` take
     the durations --timeout on add takes (90s, 30m, 2h, 1d, a bare number in seconds) but no `none`, and have no
     default: without one, a wait waits, so a wait over a stage with a job still held wants one and exit 3 is its
@@ -314,6 +313,12 @@ Agents
     refusal; 3 wait or watch gave up at its --timeout; 130 interrupted. So `wait --prefix s1_ && ./next.sh` is a
     driver for a campaign a failure should stop; one that expects failures writes `;`, since exit 1 is a failed or
     dropped job and a wrong config alike.
+        pp finds this session itself, with nothing set: it is the nearest process above pp that is neither a shell nor
+    a wrapper (timeout, env, nice, nohup, stdbuf, setsid, ionice, time), named with its pid and its start time. That
+    is an agent's own process, and it is a person's terminal, tmux server or ssh connection, so `--mine` works in a
+    terminal too. PP_SESSION names the session instead, for an agent that wants a name of its own, and pp strips it
+    from what it starts. The limit: a program between the agent and pp, a script that runs `pp queue add`, is the
+    session pp finds, so wait for the ids its `add` printed, or give it PP_SESSION.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not
     from the text, and ignore a field you do not know. `status --json` is one object, whose keys are queues, workers,
     starting, waiting, pools, shared, cards, cards_why, config_errors, and running, queued, held and recent: those

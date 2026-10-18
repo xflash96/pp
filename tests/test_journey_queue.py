@@ -181,7 +181,9 @@ class TestFailures(QueueJourney):
         self.pp("queue", "note", jid, "--by", "nightly", "told the team")
         self.assertIn("note: told the team", self.status())        # the latest note, in the recent list
         notes = self.show(jid)["notes"]
-        self.assertEqual([(n["text"], n["by"]) for n in notes], [("kaboom because X", "user"), ("told the team", "nightly")])
+        # the note with no --by carries the session pp found, which here is the terminal the story is typed in
+        self.assertEqual([(n["text"], n["by"]) for n in notes],
+                         [("kaboom because X", self.my_session), ("told the team", "nightly")])
         self.pp("queue", "note", jid, code=2)
         r = self.pp("queue", "retry", jid)
         new = r.stdout.strip()
@@ -452,8 +454,11 @@ class TestAgent(QueueJourney):
         self.assertNotIn(f" {theirs} ", r.stdout)
         self.assertIn("wait pid", self.pp("queue", "show", mine).stdout)       # reported to
         self.assertIn("nothing of this session's", self.wait(env=me, extra=("--mine",)).stdout)
-        self.assertIn("not inside an agent session", self.wait(code=2, extra=("--mine",)).stderr)
-        self.assertNotIn("in the background", self.pp("queue", "add", "--", "true").stderr)     # a person: no hint
+        # a person's terminal is a session too, so --mine works with nothing set and the hint is printed there
+        self.assertIn("nothing of this session's", self.wait(extra=("--mine",)).stdout)
+        self.assertIn("in the background", self.pp("queue", "add", "--no-start", "--", "true").stderr)
+        # what pp started is no session, so --mine there can name nothing: a usage error
+        self.wait(code=2, env=dict(self.env, PP_QUEUE_JOB="1"), extra=("--mine",))
 
     def test_an_agent_names_its_own_session_with_pp_session(self):
         """PP_SESSION names the calling session, so `--mine` and a job's owner are any agent's. The job pp

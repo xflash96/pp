@@ -726,6 +726,19 @@ def _append_log(job: dict, line: str):
         pass
 
 
+def _of_session(verb: str) -> tuple:
+    """What `--mine` means, for every verb that takes it: this session's name, and whether a job is its own.
+
+    One answer for every such verb, so they all select the same jobs. Where there is no session (pp started the
+    process it runs under) `--mine` can name nothing, so it is a usage error."""
+    me = session.caller()
+    if not me:
+        ui.die(f"{_PROG} {verb} --mine: there is no session, since pp started the process it runs under "
+               f"(set PP_SESSION to name this one)", 2)
+    sid = me["session"]
+    return sid, lambda j: isinstance(j.get("owner"), dict) and j["owner"].get("session") == sid
+
+
 def _stamp_reported(jid: int, verb: str):
     who = session.caller()
     stamp = {"t": time.time(), "by": f"{verb} pid {os.getpid()}", "session": who["session"] if who else None}
@@ -1867,15 +1880,10 @@ def cmd_wait(a, scope: list[str] | None, stream: bool = False) -> int:
     if specs:
         targets = [j["id"] for j in _resolve(specs, scope)]
     elif a.mine:
-        me = session.caller()
-        if not me:
-            ui.die(f"{_PROG} {verb} --mine: not inside an agent session (set PP_SESSION to name this one)", 2)
-
-        def mine(j):
-            return isinstance(j.get("owner"), dict) and j["owner"].get("session") == me["session"]
+        sid, mine = _of_session(verb)
 
         def unheard(j):     # ended before this session waited on it: a quick failure must not be missed
-            return not any(isinstance(r, dict) and r.get("session") == me["session"] for r in j.get("reported") or [])
+            return not any(isinstance(r, dict) and r.get("session") == sid for r in j.get("reported") or [])
 
         # one listing of both halves: a job is listed once, in one state, so a target is named once
         here = jobcore.jobs(queue=scope)

@@ -144,8 +144,12 @@ class Sandbox:
         # test: a GIT_CONFIG_GLOBAL or a GIT_DIR of the contributor's would reach every git a test runs
         self.setenv(**{k: None for k in os.environ if k.startswith(("PP_", "XDG_", "GIT_"))})
         self.setenv(**{k: None for k in session.SESSION_VARS})
+        # No calling session, whatever process tree the suite is run from: pp finds the nearest process above
+        # it that is no shell, and that is the test runner's own caller on one machine and init on another.
+        # PP_QUEUE_JOB is how pp is told there is none (pp.lib.session, rule 3), so a test's answer is the
+        # same everywhere, and a test that wants a session names one with `as_session`.
         self.setenv(PP_STATE_DIR=self.state, PP_CONFIG_DIR=self.config, PP_DATA_DIR=self.data, NO_COLOR="1",
-                    HOME=self.home, **git_env(self.gitconfig))
+                    PP_QUEUE_JOB="0", HOME=self.home, **git_env(self.gitconfig))
         return self
 
     def close(self) -> None:

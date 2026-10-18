@@ -3,7 +3,7 @@
 ## Unreleased
 
 `pp queue`: the card reading and the calling session are named by you, with
-nvidia-smi and Claude Code's session as the defaults.
+nvidia-smi and the process pp runs under as the defaults.
 
 - `[resources] gpu_gb = { probe = "CMD" }` reads the machine's cards with a
   command of yours instead of nvidia-smi. CMD prints one line a card,
@@ -15,10 +15,15 @@ nvidia-smi and Claude Code's session as the defaults.
   has one set of cards.
 - `pp queue status --json` gains `cards_why`: why `cards` is null, and `""`
   where the cards were read.
-- `PP_SESSION`, where it is set and not empty, names the calling session, in
-  place of `CLAUDE_CODE_SESSION_ID`, so any agent can use `--mine` and a job's
-  `owner`. pp strips it from the workers, jobs, hooks and stop commands it
-  starts, as it strips the other session variables.
+- pp finds the calling session from the process it runs under: the nearest
+  process above pp that is neither a shell nor a wrapper, named with its pid,
+  its start time and this boot. So `--mine` and a job's `owner` are any
+  agent's with nothing set, since every command an agent runs is a child of
+  the agent's own process, and a person's terminal is a session the same way.
+  `PP_SESSION`, where it is set and not empty, is the name an agent gives its
+  own session instead, and wins over `CLAUDE_CODE_SESSION_ID`. A process pp
+  started itself, a job or its runner or a hook or a stop command, is no
+  session. pp strips those variables from everything it starts.
 
 `pp`: a command answers to a name of your own.
 
