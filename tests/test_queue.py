@@ -2192,6 +2192,14 @@ class TestPull(QueueCase):
         self.sb.as_session("session-a")
         rc, out, err = self.call("add", "--no-start", "--on-fail", "none", "--", "true")
         self.assertIn(f"pp queue wait {out.split()[0]}` in the background", err)
+        # one `add`'s ids are consecutive, so the command it hands an agent names them as one range word
+        plan = self.sb.path("plan.txt")
+        with open(plan, "w") as f:
+            f.write("true\ntrue\ntrue\n")
+        rc, out, err = self.call("add", "--no-start", "--from", plan)
+        ids = out.split()
+        self.assertEqual((rc, len(ids)), (0, 3), err)
+        self.assertIn(f"pp queue wait {ids[0]}-{ids[2]}` in the background", err)
 
 
 class TestEndToEnd(QueueCase):

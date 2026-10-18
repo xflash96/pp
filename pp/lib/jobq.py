@@ -1174,7 +1174,7 @@ def cmd_add(a, cmd: list[str], q: str, prepare_job, ap) -> int:
     if not a.hold and not a.no_start:
         _worker_up(q, wake=True)
     if owner:     # the pull side: an agent hears the outcome by waiting on it in the background
-        some = " ".join(map(str, ids))
+        some = _ranges(ids).replace(", ", " ")      # as range words, the form a verb takes: wait 8-13 20
         print(f"pp {_PROG}: to hear how it ends, run `pp {_PROG} wait {some}` in the background (it exits with the "
               f"outcome and, on failure, the log tail), or `pp {_PROG} watch {some}` for a line per event", file=sys.stderr)
     return 0

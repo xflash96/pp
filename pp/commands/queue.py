@@ -60,6 +60,7 @@ Selecting jobs
         12              one job by id; ids are machine-wide, and `add` prints each one on stdout
         12-15           a range; one `add`'s ids are consecutive        c3_recall.s0   that tag, matched whole
         --prefix c3_    every job whose tag starts with c3_ (repeatable)  -q r1 --all    one queue's, whatever its tag
+    Several forms are several words on one verb (`pp queue wait 8 9 12-15`), and the jobs they name are taken once.
     A job named by its own id must suit the verb, or it is an error. A range, a tag, a prefix or --all leaves the jobs
     it does not suit as they are and says which, so a driver that runs twice is not an error the second time, while a
     selection that matches no job at all is an error. A tag or a prefix that spans two queues is an error that names
