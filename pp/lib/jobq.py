@@ -626,16 +626,18 @@ class Resources:
         """Why these needs can never fit; None when they might."""
         return policy.check(needs, self.seen)
 
-    def usage(self, running: list[dict], scope: str | None) -> list[dict]:
-        """The pools of one scope (a queue name, or None = shared) with what running jobs hold: for status."""
+    def usage(self, running: list[dict], scope: str | None, cards: list[dict] | None = None) -> list[dict]:
+        """The pools of one scope (a queue name, or None = shared) with what running jobs hold: for status.
+
+        The arithmetic is `policy.pool_usage`; this adds the cached reading a probe pool carries, which is a
+        file. `cards` is the card reading its caller already took, so a gpu_gb pool's per-card numbers cost
+        no second reading of the machine's cards."""
         out = []
         for p in self.pools:
-            if p["scope"] != scope or p["name"] == "gpu_gb":
+            if p["scope"] != scope:
                 continue
-            r = reading(p, run=False) if p["probe"] else None
-            out.append({"name": p["name"], "max": p["max"],
-                        "used": sum(policy.need(j, p["name"]) for j in policy.pool_jobs(p, running)),
-                        "probe": p["probe"], "reading": r})
+            r = reading(p, run=False) if p["probe"] and p["name"] != "gpu_gb" else None
+            out.append({**policy.pool_usage(p, running, cards), "reading": r})
         return out
 
 
@@ -1198,7 +1200,11 @@ def cmd_status(a, scope: list[str] | None) -> int:
         running, queued, held    [job], each one as `public()` gives it
         recent          [job], the jobs that ended most recently, at most -n of them
         pools           {queue: [pool]}, each queue's own pools
-        shared          [pool], the pools every queue draws from; a pool is {name, max, used, probe, reading}
+        shared          [pool], the pools every queue draws from; a pool is {name, max, used, probe, reading},
+                        with `max` null where the pool takes its number from elsewhere (gpu_gb = "auto": a
+                        card's). A gpu_gb pool carries per_card besides, [{index, max, used}], that scope's
+                        budget on each card of the reading and what is reserved on it, and [] where there is
+                        no reading
         cards           [{index, name, total_gb, used_gb, free_gb, util}], the GPUs the card reading reports
         cards_why       why `cards` is null; "" where the cards were read
         config_errors   [message]; while there is one, workers launch nothing
@@ -1231,7 +1237,7 @@ def cmd_status(a, scope: list[str] | None) -> int:
 
     def usage(q, sc):
         try:
-            return Resources(q, live=False, empty_ok=False).usage(running_all, sc)
+            return Resources(q, live=False, empty_ok=False).usage(running_all, sc, cards)
         except config.ConfigError as e:
             if str(e) not in bad:
                 bad.append(str(e))
@@ -1260,8 +1266,12 @@ def cmd_status(a, scope: list[str] | None) -> int:
     gpu = "  ".join(f"GPU{c['index']} {c['util']}% {c['used_gb']:.1f}/{c['total_gb']:.0f}G" for c in cards) if cards else (
         "GPU n/a" + (f" ({cards_why})" if cards_why else ""))
     print(f"{gpu}   {datetime.now():%Y-%m-%d %H:%M:%S}")
+    # a shared pool is on this line where a job holds some of it, a probe reads it, or this machine named it:
+    # a pool every machine has and nothing holds says nothing. gpu_gb is named by a max of its own, since the
+    # default "auto" takes its numbers from the cards
     default_pools = BY_SCOPE["machine"]["resources"].default
-    pool_strs = [_pool_str(p, now) for p in shared if p["used"] or p["probe"] or p["name"] not in default_pools]
+    pool_strs = [_pool_str(p, now) for p in shared if p["used"] or p["probe"]
+                 or p["name"] not in default_pools or (p["name"] == "gpu_gb" and p["max"] is not None)]
     if pool_strs:
         print("shared: " + " · ".join(pool_strs))
     for e in bad:
@@ -1349,6 +1359,10 @@ def _configured(q: str) -> bool:
 
 
 def _pool_str(p: dict, now: float) -> str:
+    if p.get("per_card"):
+        # the cards are counted one by one, since a job runs on one of them: what this scope holds of each,
+        # against that card's own budget, in the order the reading gave them
+        return p["name"] + " " + ",".join(f"{c['used']:g}/{c['max']:g}" for c in p["per_card"])
     out = p["name"] + (f" {p['used']:g}/{p['max']:g}" if p["max"] is not None
                        else (f" {p['used']:g} in use" if p["used"] else ""))
     if p["probe"]:

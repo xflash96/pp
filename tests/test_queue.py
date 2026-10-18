@@ -1272,6 +1272,36 @@ class TestGpu(QueueCase):
         wb.tick()
         self.assertEqual(self.state(b), "running")
 
+    def test_status_publishes_the_gpu_pool_of_every_scope_per_card(self):
+        """A planner sizes --gpu-gb against the smallest budget of every scope its queue draws from, so each
+        scope's gpu_gb pool is an entry of `status --json` like any other pool, with one field of its own:
+        its budget on each card of the one reading `status` took, and what is reserved on that card."""
+        jobq._cards = lambda: [card(0, total=24), card(1, total=24)]
+        self.resources("gpu_gb = 20")
+        self.config("slots = 3\ngpu_gb = 16", q="alpha")
+        j = self.add("--gpu-gb", "8", cmd="sleep 30", q="alpha")
+        jobq.worker_for("alpha").tick()
+        self.assertEqual((self.state(j), jobstore.find(j)["cards"]), ("running", [0]))
+        data = json.loads(self.call("status", "--json")[1])
+        own = next(p for p in data["pools"]["alpha"] if p["name"] == "gpu_gb")
+        self.assertEqual((own["max"], own["used"], own["probe"], own["reading"]), (16, 8, None, None))
+        self.assertEqual(own["per_card"], [{"index": 0, "max": 16, "used": 8},
+                                           {"index": 1, "max": 16, "used": 0}])
+        shared = next(p for p in data["shared"] if p["name"] == "gpu_gb")
+        self.assertEqual((shared["max"], shared["used"]), (20, 8))
+        self.assertEqual(shared["per_card"], [{"index": 0, "max": 20, "used": 8},
+                                              {"index": 1, "max": 20, "used": 0}])
+        self.assertEqual(self.call("status")[0], 0)      # and the text view of the same, per card
+
+    def test_the_gpu_pool_of_a_scope_with_no_card_reading_has_no_cards(self):
+        """Without a reading there is nothing to say per card, so per_card is empty and the pool's own max is
+        what a planner reads. `pp queue` says what there is either way."""
+        self.resources("gpu_gb = 20")
+        data = json.loads(self.call("status", "--json")[1])
+        self.assertIsNone(data["cards"])
+        self.assertEqual([p["per_card"] for p in data["shared"] if p["name"] == "gpu_gb"], [[]])
+        self.assertEqual(self.call("status")[0], 0)
+
     def test_picks_the_card_that_fits(self):
         jobq._cards = lambda: [card(0, total=24, used=14), card(1, total=24, used=4)]
         j = self.add("--gpu-gb", "15", cmd='echo "dev=$CUDA_VISIBLE_DEVICES"')
@@ -4212,6 +4242,36 @@ class TestThePolicyTables(unittest.TestCase):
         self.assertIn("no card's budget is that large", jobpolicy.check({"gpu_gb": 23}, seen))
         self.assertIn("[resources] slots = 3", jobpolicy.check({"slots": 4}, seen))
         self.assertIn("sees no GPU", jobpolicy.check({"gpu_gb": 1}, self.seen(pools, cards=None)))
+
+    # -- pool_usage: what a scope's running jobs hold of one pool -------------------------------------------
+    def test_what_a_scopes_running_jobs_hold_of_one_pool(self):
+        """The entry a view publishes for one pool, over every class of pool there is: a shared one counts
+        every queue's running jobs and a queue's own counts that queue's, and a gpu_gb pool counts each card
+        of the reading on its own, against the budget that scope has on that card.
+
+        A gpu_gb pool with no card reading carries an empty per_card, and a pool of any other kind carries
+        none: the amount its jobs hold is the whole of what there is to say about it."""
+        mine = {**self.job(1, needs={"gpu_gb": 8, "slots": 1}, state="running"), "cards": [0]}
+        other = {**self.job(2, needs={"gpu_gb": 6, "slots": 1}, state="running", queue="other"), "cards": [1]}
+        cards = [card(0, total=24), card(1, total=24)]
+        rows = [
+            ("a shared pool of the cards, over two of them", self.pool(name="gpu_gb", mx=None), cards, 14,
+             [{"index": 0, "max": 22.0, "used": 8}, {"index": 1, "max": 22.0, "used": 6}]),
+            ("a queue's own, which counts that queue's jobs alone",
+             self.pool(name="gpu_gb", scope="default", mx=16), cards, 8,
+             [{"index": 0, "max": 16, "used": 8}, {"index": 1, "max": 16, "used": 0}]),
+            ("one card", self.pool(name="gpu_gb", mx=None), cards[:1], 14,
+             [{"index": 0, "max": 22.0, "used": 8}]),
+            ("no card reading", self.pool(name="gpu_gb", mx=None), None, 14, []),
+            ("a pool that is not the cards'", self.pool(name="slots", mx=3), cards, 2, None),
+        ]
+        for what, p, reading, used, per_card in rows:
+            with self.subTest(what):
+                got = jobpolicy.pool_usage(p, [mine, other], reading)
+                self.assertEqual((got["name"], got["max"], got["probe"], got["reading"]),
+                                 (p["name"], p["max"], None, None))
+                self.assertEqual(got["used"], used)
+                self.assertEqual(got.get("per_card"), per_card)
 
     # -- campaign: one line of a file, split the way a shell splits words ----------------------------------
     LINES = (

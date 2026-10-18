@@ -378,6 +378,27 @@ def gpu_budget(p: dict, card: dict) -> float:
     return p["max"] if p["max"] is not None else round(max(card["total_gb"] - 2, 0), 1)
 
 
+def pool_usage(p: dict, running: list[dict], cards: list[dict] | None = None) -> dict:
+    """One pool of one scope, with what the running jobs it counts hold: the entry a view publishes.
+
+    `used` is the amount those jobs reserve, every card together for gpu_gb. `max` is null where the pool
+    knows no number of its own, which `gpu_gb = "auto"` is: its number is a card's. `reading` is the probe's,
+    which the caller that reads files fills in, and it stays null for gpu_gb, whose reading is the cards.
+
+    A gpu_gb pool carries `per_card` besides: this scope's budget on each card of the reading, and what the
+    jobs holding that card reserve on it. It is empty where there is no reading, so a planner sizing a job
+    against the smallest budget of every scope reads the pool's own `max` instead."""
+    mine = pool_jobs(p, running)
+    out = {"name": p["name"], "max": p["max"], "used": sum(need(j, p["name"]) for j in mine),
+           "probe": p["probe"], "reading": None}
+    if p["name"] != "gpu_gb":
+        return out
+    out["per_card"] = [{"index": c["index"], "max": gpu_budget(p, c),
+                        "used": sum(need(j, "gpu_gb") for j in mine if c["index"] in (j.get("cards") or ()))}
+                       for c in cards or ()]
+    return out
+
+
 NO_READING = "it has not been read yet"     # a card reading nobody has taken: nothing is known of the cards
 
 
