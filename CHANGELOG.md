@@ -56,19 +56,18 @@ about your cards, your queues and your projects.
   with nothing in it is a section with nothing in it and an entry in
   `--json`, and reading it creates no directory and no file. "no queues yet"
   is for a machine with none of the three.
-- `pp queue add` says on stderr where the job has no runner, no `.pp.toml`
-  stands above its directory, and a directory below it is a project whose
-  `[queue]` sets one. It names that directory and `--cwd`, once per
-  directory, and queues the job as it asks.
+- `pp queue add` warns on stderr where the job has no runner, no `.pp.toml`
+  is in or above its directory, and a directory directly below is a project
+  whose `[queue]` sets one. The warning names that directory and `--cwd`,
+  once per directory, and the job is queued as it asks.
 - The command `add` hands an agent names the ids it queued as ranges (`wait
   8-13 20`), which is one word for a campaign of a hundred lines.
 - `clean` and `drop` say in their plan that they remove the records and pp's
   own files for them, and that a log at a path a `log` pattern or `--log`
   named stays.
-- A run of the project's stop command that nobody asked for, after a run
-  whose work may still be out there, writes to the worker's own output
-  instead of the job's log. The stop a kill or a timeout asked for still
-  writes in the job's log.
+- The extra run of the project's stop command once a run is over writes to
+  the worker's log instead of the job's log. The stop a kill or a timeout
+  asked for still writes in the job's log.
 - `pp help queue` names the shape of each `--json`: one object with its keys
   for `status`, one job and its watchers for `show`, and a list of `{queue,
   pid, how, log, up}` for `worker status`.
