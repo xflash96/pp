@@ -171,9 +171,9 @@ Settings: one default, one key, one flag, one order
     per-job key as this project's default, `log = "logs/{tag}.log"` among them, and two of its own: `runner =
     "docker/run.sh"` (a path with a / is in the project, a bare name is on PATH) and `stop = "docker rm -f
     $PP_QUEUE_CONTAINER"` (a command, or "group"; required where there is a runner). --runner CMD and --stop CMD on
-    `add` say both for one job, with no .pp.toml at all. An `add` from a directory with no .pp.toml above it says so
-    where a directory below it holds one that sets a runner: the job is queued and runs its command bare, and --cwd
-    DIR runs it as that project's. Per machine and per queue, in config.toml:
+    `add` say both for one job, with no .pp.toml at all. An `add` with no .pp.toml in or above its directory warns
+    where a directory directly below holds one that sets a runner: the job is queued and runs on this host, and
+    --cwd DIR queues it as that project's. Per machine and per queue, in config.toml:
 
         [queue.NAME]            poll = 2 (the worker's loop period in seconds), idle_exit = 600 (it exits after
                                 this long with nothing queued or running), backfill = false, and any per-job key
@@ -385,8 +385,8 @@ def _runner(spec, root: str, where: str, path: str | None) -> list[str]:
 
 def _a_project_below(cwd: str) -> None:
     """Say once, where a job of cwd found no project of its own, that a directory directly below cwd is a
-    project whose [queue] puts a runner before its commands: such a job runs its command bare, which is a
-    whole stack of a lab's missing, and `--cwd DIR` is what runs it as that project's.
+    project whose [queue] puts a runner before its commands: such a job runs its command on this host, outside
+    whatever that runner starts, and `--cwd DIR` is what runs it as that project's.
 
     The job is queued as it asks: a directory holding several projects is a normal place to stand, and this
     is a thing to look at rather than a refusal. One level of the tree is read, and nothing of it but those
@@ -407,7 +407,7 @@ def _a_project_below(cwd: str) -> None:
         except (config.ConfigError, OSError):       # a file this may not read is one of the tree, and skipped
             continue
         if isinstance(t, dict) and t.get("runner"):
-            ui.warn(f"queue add: no {config.PROJECT_FILE} above {cwd}, so this job runs with no runner. "
+            ui.warn(f"queue add: no {config.PROJECT_FILE} in {cwd} or above it, so this job runs with no runner. "
                     f"{d} is a project whose [queue] sets one: `--cwd {d}` adds the job as that project's.")
             return
 

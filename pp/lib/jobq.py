@@ -1272,11 +1272,11 @@ def cmd_status(a, scope: list[str] | None) -> int:
         "GPU n/a" + (f" ({cards_why})" if cards_why else ""))
     print(f"{gpu}   {datetime.now():%Y-%m-%d %H:%M:%S}")
     # a shared pool is on this line where a job holds some of it, a probe reads it, or this machine named it:
-    # a pool every machine has and nothing holds says nothing. gpu_gb is named by a max of its own, since the
-    # default "auto" takes its numbers from the cards
+    # a pool every machine has and nothing holds says nothing. gpu_gb is there where a job holds some or it has
+    # a max of its own, since its reading is the card line above
     default_pools = BY_SCOPE["machine"]["resources"].default
-    pool_strs = [_pool_str(p, now) for p in shared if p["used"] or p["probe"]
-                 or p["name"] not in default_pools or (p["name"] == "gpu_gb" and p["max"] is not None)]
+    pool_strs = [_pool_str(p, now) for p in shared if p["used"] or (
+        p["max"] is not None if p["name"] == "gpu_gb" else p["probe"] or p["name"] not in default_pools)]
     if pool_strs:
         print("shared: " + " · ".join(pool_strs))
     for e in bad:
