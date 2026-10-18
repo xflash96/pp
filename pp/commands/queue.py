@@ -404,7 +404,7 @@ def _a_project_below(cwd: str) -> None:
             continue
         try:
             t = config.find_project(d)[1].get("queue")
-        except config.ConfigError:
+        except (config.ConfigError, OSError):       # a file this may not read is one of the tree, and skipped
             continue
         if isinstance(t, dict) and t.get("runner"):
             ui.warn(f"queue add: no {config.PROJECT_FILE} above {cwd}, so this job runs with no runner. "

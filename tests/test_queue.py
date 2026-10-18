@@ -4803,6 +4803,20 @@ class TestAProjectBelowTheJobsDirectory(QueueCase):
         self.assertEqual(self.state(int(out.split()[-1])), "queued")
         self.assertIn(root, err)
 
+    @unittest.skipIf(os.geteuid() == 0, "root may read every file")
+    def test_a_project_file_that_cannot_be_read_is_skipped(self):
+        """A file this may not open is one of the tree, like one that does not parse: the scan goes on to the
+        next directory, and the job is queued as it asks."""
+        shut = self.sb.dir("work", "closed")        # before "lab", so the scan reads it first
+        with open(os.path.join(shut, ".pp.toml"), "w") as f:
+            f.write('[queue]\nrunner = "./run.sh"\n')
+        os.chmod(os.path.join(shut, ".pp.toml"), 0)
+        root = self.a_project("lab")
+        rc, out, err = self.cmd("add", "--no-start", "--cwd", self.work, "--", "true")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.state(int(out.split()[-1])), "queued")
+        self.assertIn(root, err)
+
     def test_a_job_of_the_project_itself_says_nothing(self):
         root = self.a_project("lab")
         rc, out, err = self.cmd("add", "--no-start", "--cwd", root, "--", "true")
