@@ -1518,6 +1518,17 @@ class TestTheCardReading(QueueCase):
         self.assertEqual(rc, 2, err)
         self.assertEqual(jobstore.jobs("queued"), [])
 
+    def test_the_view_of_a_gpu_pool_says_nothing_about_the_probe(self):
+        """The cards are this pool's reading, so the card line is where a reader is told how they were read
+        and what came of it. The pool's own line is its budget and what the scope holds of it."""
+        self.resources('gpu_gb = { max = 40, probe = "echo nothing" }')
+        rc, out, _ = self.call()
+        self.assertEqual(rc, 0)
+        r = json.loads(text(jobq._probe_path(self.gpu_pool())))
+        self.assertEqual((r["value"], bool(r["error"])), (None, True))   # the probe ran, and it failed
+        line = next(s for s in out.splitlines() if s.startswith("shared:"))
+        self.assertNotIn("probe", next(f for f in line.split(" · ") if "gpu_gb" in f))
+
     def test_a_reading_carries_the_time_it_was_taken(self):
         """A pass holds a job's reservation for the pool's settle window from the reading's own time, so a
         reading carries the time it was taken: the time `reading` records for a probe, and the time

@@ -1382,7 +1382,8 @@ def _pool_str(p: dict, now: float) -> str:
         return p["name"] + " " + ",".join(f"{c['used']:g}/{c['max']:g}" for c in p["per_card"])
     out = p["name"] + (f" {p['used']:g}/{p['max']:g}" if p["max"] is not None
                        else (f" {p['used']:g} in use" if p["used"] else ""))
-    if p["probe"]:
+    if p["probe"] and p["name"] != "gpu_gb":
+        # a gpu_gb pool's reading is the cards, which the card line above reports, so this says the budget
         r = p["reading"]
         out += (" (probe: not run yet)" if not r else f" (probe: {r['value']:g} free, {ui.human_age(r['t'], now)})"
                 if r.get("value") is not None else f" (probe failed {ui.human_age(r['t'], now)}: {r.get('error')})")
