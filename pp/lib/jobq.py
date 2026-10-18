@@ -1366,13 +1366,16 @@ def _configured_queues() -> list[str]:
     section of the view with nothing in it, so a reader sees the lanes there are without being told their
     names, and reading them creates no directory and no file.
 
-    A name no queue could have is left out, as it is wherever a queue is named. A config file that cannot be
-    read names none here; the error is the view's own, from the pools it reads beside this."""
+    A name no queue could have is left out, as it is wherever a queue is named. So is a key of [queue] whose
+    value is no table: that is a setting of a project's own file, written here by mistake, and it names no
+    queue. A config file that cannot be read names none here; the error is the view's own, from the pools it
+    reads beside this."""
     try:
         names = config.load("queue")
     except config.ConfigError:
         return []
-    return sorted(q for q in names if jobstore.NAME_RE.fullmatch(q) and q not in jobstore.RESERVED)
+    return sorted(q for q, t in names.items()
+                  if isinstance(t, dict) and jobstore.NAME_RE.fullmatch(q) and q not in jobstore.RESERVED)
 
 
 def _pool_str(p: dict, now: float) -> str:

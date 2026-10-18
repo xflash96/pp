@@ -1214,6 +1214,16 @@ class TestNamedQueues(QueueCase):
         self.assertFalse(os.path.exists(os.path.join(self.sb.state, "queue", "lane")),
                          "reading the status of a queue a table names created it")
 
+    def test_a_key_of_the_queue_table_that_is_no_table_names_no_queue(self):
+        """`[queue] retries = 2` is the .pp.toml spelling of a job's setting, written in config.toml by
+        mistake. It names no queue, so the view covers none for it: a queue is a [queue.NAME] table."""
+        with open(os.path.join(self.cfg, "config.toml"), "w") as f:
+            f.write("[queue]\nretries = 2\n")
+        rc, _out, _ = self.call()
+        data = json.loads(self.call("status", "--json")[1])
+        self.assertEqual((rc, data["queues"], data["config_errors"]), (0, [], []))
+        self.assertEqual((data["workers"], data["waiting"], data["pools"]), ({}, {}, {}))
+
     def test_worker_status_lists_every_queue(self):
         self.add(cmd="true", q="alpha")
         self.add(cmd="true", q="beta")
