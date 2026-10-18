@@ -106,7 +106,10 @@ class TestKillJourneys(KillJourney):
         self.assertTrue(p.dead())
 
     def test_a_tree(self):
-        p = self.start(["sh", "-c", f"sleep 120 & sleep 121 & sh -c 'sleep 122' & echo ready; wait # {self.tok}"])
+        # each shell waits for its children, so it stays in the tree whichever shell sh is: a shell may run a
+        # lone command in its own place, as bash does
+        p = self.start(["sh", "-c",
+                        f"sleep 120 & sleep 121 & sh -c 'sleep 122 & wait' & echo ready; wait # {self.tok}"])
         kids = self.until(lambda: len([ln for ln in self.pp("kill", "-n", "--tree", str(p.pid)).stdout.splitlines()
                                        if "child of" in ln]) == 4)
         self.assertTrue(kids)
