@@ -328,7 +328,8 @@ What is left to you, on purpose
 
 State: ~/.local/state/pp/queue/<name>/, all plain files. A job's record names every file that is its own: its log, the
 exit code each attempt wrote, the environment file its runner was handed, and each hook's log. Read a path from the
-record, not from the layout; `drop` and `clean` take those files with the record, and PP_STATE_DIR moves the store.
+record, not from the layout. `drop` and `clean` remove the record and pp's own files for it; a log at a path a `log`
+pattern or --log named is the project's file and stays. PP_STATE_DIR moves the store.
 
 What may change. Verb and flag names, the values a flag takes, config keys and their defaults, the five selection
 forms, the defaults printed above, --json field names and types, the exit statuses, and the variables a job, a runner

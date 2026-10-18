@@ -812,19 +812,28 @@ def _left(skipped: list[dict]) -> None:
         print(ui.c("left as they are: " + ", ".join(f"{j['id']} {j['state']}" for j in skipped), "dim"))
 
 
-def _gate(a, jobs: list[dict], verb: str, ok: tuple) -> int | None:
+# What `drop` and `clean` take away, in the one sentence both plans print: the record, and the files pp made
+# for the job. A log at a path a `log` pattern or --log named belongs to the project, so it stays where it is.
+REMOVES = "this removes the records and pp's own files for them; a log at a path `log` or --log named stays"
+
+
+def _gate(a, jobs: list[dict], verb: str, ok: tuple, note: str = "") -> int | None:
     """kill, drop and retry: a selection naming one job is acted on at once; one naming more is shown first
     and asked about (-y: do not ask). -n only shows. None to go ahead, else the exit code.
 
     A plan over jobs none of which suits the verb asks nothing, since there is nothing to do. It is still
     the verb's own pass that answers for them: a job a selection swept over is left as it is (exit 0), and
-    one named by its own id is refused with the verb that does suit it (exit 2)."""
+    one named by its own id is refused with the verb that does suit it (exit 2).
+
+    note is what the verb does to the jobs it names, for a verb that takes something away."""
     if not a.dry_run and len(jobs) < 2:
         return None
     hits = [j for j in jobs if j["state"] in ok]
     print(f"{verb} {len(hits)} job(s): "
           + (", ".join(f"{j['id']} {_name(j)}" for j in hits) or "none"))
     _left([j for j in jobs if j["state"] not in ok])
+    if note and hits:
+        print(note)
     if a.dry_run:
         return 0
     if not hits:
@@ -1601,7 +1610,7 @@ def _transition(a, src: tuple, dst: str | None, verb: str, done: str) -> int:
     rc, skipped, started = 0, [], set()
     jobs = _named(a, verb)
     if verb == "drop":
-        go = _gate(a, jobs, "drop", src)
+        go = _gate(a, jobs, "drop", src, REMOVES)
         if go is not None:
             return go
     # one transaction per job, each told the states it may act on, so none of them acts on a copy that has
@@ -1707,10 +1716,10 @@ def cmd_clean(a, scope: list[str] | None) -> int:
     if not victims:
         print("nothing to clean")
         return 0
-    print(f"{len(victims)} ended job record(s)" + (f" older than {a.older}" if a.older else "")
-          + ", with their logs")
+    print(f"{len(victims)} ended job record(s)" + (f" older than {a.older}" if a.older else ""))
     for q in sorted({j["queue"] for j in victims}):
         print(f"  {q}: {_ranges(sorted(j['id'] for j in victims if j['queue'] == q))}")
+    print(REMOVES)
     if a.dry_run:
         return 0
     if not ui.confirm("remove them?", a.yes):
@@ -2062,7 +2071,7 @@ def _parser(prog: str, doc: str, add_args=None):
     p.add_argument("-n", "--dry-run", action="store_true", help="only show which jobs it would re-queue")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask about a range or a shared tag")
     p.add_argument("--no-start", action="store_true")
-    p = sp("clean", help="remove ended job records, with the logs that belong to them")
+    p = sp("clean", help="remove ended job records and pp's own files for them")
     p.add_argument("ids", nargs="*", metavar="ID")
     _selectors(p)
     p.add_argument("--older", metavar="AGE", type=_dur_flag("d"),
