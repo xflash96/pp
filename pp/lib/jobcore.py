@@ -34,7 +34,7 @@ import shlex
 import signal
 import time
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 
 from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, session
@@ -270,8 +270,9 @@ class Worker:
                 jobstore._finish(s, cur, a.state, a.rc, a.reason, a.ended, a.not_retried, hook=a.hook)
         if cmd := policy.swept_stop(was, a):
             # after the scope, since starting a process in one would make every reader of the store wait for
-            # it: nobody asked for this stop, so nothing is recorded for it and no outcome rests on it
-            self.hooks += [h for h in [self._stop(was, cmd)] if h is not None]
+            # it: nobody asked for this stop, so nothing is recorded for it, no outcome rests on it, and its
+            # output goes where this worker's own lines go rather than into the job's log
+            self.hooks += [h for h in [self._stop(was, cmd, log=False)] if h is not None]
         if a.do in (policy.TERM, policy.KILL9):
             self._send(cur, a)
             return a
@@ -324,16 +325,20 @@ class Worker:
         self.say("stop", job, {"outcome": outcome, "sig": sig, "cmd": cmd if h is not None else None,
                                "grace": (job.get("stop") or {}).get("grace"), "group": cur.get("pgid")})
 
-    def _stop(self, job: dict, cmd: str) -> proc.Child | None:
-        """The project's stop command, started detached in the job's directory with the job's own environment,
-        its output appended to the job's log: the one thing that reaches work the runner started elsewhere.
+    def _stop(self, job: dict, cmd: str, log: bool = True) -> proc.Child | None:
+        """The project's stop command, started detached in the job's directory with the job's own environment:
+        the one thing that reaches work the runner started elsewhere.
         -> the child, so its caller says what becomes of its exit code, or None where it could not start.
 
         It goes out in place of the SIGTERM to the job's group, and pp's own grace and SIGKILL follow it
         unchanged. It runs through the construct a hook uses, so it cannot hold up the one worker that serves
-        the whole queue."""
+        the whole queue.
+
+        log: its output is appended to the job's log, which is where the stop a kill or a timeout asked for
+        belongs. Without it the output goes where this worker's own lines go, since nobody asked for that run
+        and the job's log is the record of what the job itself did."""
         try:
-            with open(job["log"], "a") as f:
+            with open(job["log"], "a") if log else nullcontext() as f:
                 return proc.spawn(["/bin/sh", "-c", cmd], group="own", stdin="none", env="scrubbed",
                                   add_env=policy.job_env(job), cwd=job["cwd"], stdout=f, stderr=proc.STDOUT)
         except OSError as e:

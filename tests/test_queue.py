@@ -6015,6 +6015,45 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
             w2.tick()
         self.assertEqual(len(self.lines(ran)), 3, "the sweep of one attempt ran that command twice")
 
+    @contextmanager
+    def the_workers_own_output(self):
+        """Where this worker's own lines go, as a file to read: the worker log of a worker pp started, and
+        this process's output while a test is the worker. -> that file's path."""
+        path = self.sb.path("the-workers-own-output")
+        with open(path, "w") as f:
+            saved = os.dup(1)
+            os.dup2(f.fileno(), 1)
+            try:
+                yield path
+            finally:
+                os.dup2(saved, 1)
+                os.close(saved)
+
+    def test_the_stop_a_kill_asked_for_writes_in_the_jobs_log_and_the_sweeps_run_does_not(self):
+        """The job's log is the record of what that job and the stops asked of it did, so the stop command a
+        kill asks for writes there. The sweep's run of the same command is nobody's ask: it writes where the
+        worker's own lines go, and the job's log holds that command's output once."""
+        ran = self.sb.path("what-the-stop-command-did")
+        token = "the-stop-command-said-this"
+        j, w = self.a_running_job_whose_stop_is_a_command(ran)
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = f"echo {token}; echo ${{PP_QUEUE_CONTAINER}} >> {ran}"
+            s.save(cur)
+        log = jobstore.find(j)["log"]
+        self.a_kill_asks(j, grace=30.0)
+        w.tick()
+        journey.until(lambda: len(self.lines(ran)) == 1, timeout=30, what="the stop command the kill ran")
+        journey.until(lambda: token in text(log), timeout=30, what="its output in the job's log")
+        self.the_run_ends_with_no_code(j)
+        with self.the_workers_own_output() as out:
+            w.tick()
+            journey.until(lambda: len(self.lines(ran)) == 2, timeout=30, what="the stop command the sweep ran")
+            journey.until(lambda: token in text(out), timeout=30,
+                          what="the sweep's output where the worker's own lines go")
+        self.assertEqual(jobstore.find(j)["reason"], "killed")
+        self.assertEqual(text(log).count(token), 1)
+
     def test_the_sweep_of_a_retried_attempt_names_that_attempts_own_container(self):
         """A requeue takes the attempt's own names off the record, and the sweep's stop command is started
         after that scope: it is given the attempt that ended, so it names the container that attempt started

@@ -143,7 +143,8 @@ Containers, and anything else a runner starts elsewhere
     reserved, PP_QUEUE, PP_QUEUE_JOB and PP_QUEUE_CONTAINER, and no PATH, VIRTUAL_ENV, CONDA_PREFIX, CONDA_DEFAULT_ENV
     or PP_QUEUE_RCFILE of this machine's, which would name a python or a path outside the image. It is readable by you
     alone.
-        A stop command runs detached in the job's directory with the job's environment, its output in the job's log.
+        A stop command a kill or a timeout asked for runs detached in the job's directory with the job's environment,
+    its output in the job's log.
     `docker stop -t 5 $PP_QUEUE_CONTAINER` waits for the container and `docker rm -f` does not, so keep a -t below the
     job's grace (--grace, 10s by default): the SIGKILL follows the grace whatever the stop command is doing, a -t of
     the whole grace takes the client as it waits, leaving the container. The command is read when the job is queued
@@ -270,7 +271,8 @@ gone out for it, its command's exit code where it had one, and whether pp was re
 by the project's stop command, that command goes out in place of the SIGTERM, and `stop.rc: null` means pp has not
 seen it end, not that it worked. Anything left in the job's group when its run is over goes with it, and a run that
 ended with no exit code of its own, or that a stop was asked of, runs that stop command once more, so nothing the
-runner started outlives its attempt.
+runner started outlives its attempt. Nobody asked for that last run, so its output goes where the worker's own lines
+go (its log, or the output of a `pp queue work`), and the job's log holds the job and the stops asked of it.
 
 Workers, and after a reboot
     One worker per queue starts what fits, reaps what ended, carries out stops, re-queues retries and fires hooks.

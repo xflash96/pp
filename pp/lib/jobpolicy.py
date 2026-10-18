@@ -1159,8 +1159,8 @@ def swept_stop(job: dict, action: Action) -> str | None:
     It runs wherever the sweep of that attempt does: the attempt wrote no exit code of its own, or a stop had
     been asked of the job and not denied. That is what stops a container outliving the attempt that started
     it, so a retry can be trusted not to start beside one still holding a card. Nobody asked for this stop,
-    so its output goes to the job's log, nothing is recorded for it and no outcome rests on it, which is why
-    running the project's command again states no second stop (I25)."""
+    so its output goes where the worker's own lines go, nothing is recorded for it and no outcome rests on
+    it, which is why running the project's command again states no second stop (I25)."""
     return stop_command(job) if action.sweep else None
 
 
