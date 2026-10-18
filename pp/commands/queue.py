@@ -53,7 +53,8 @@ Naming jobs
     family by a common start (c3_recall.s0, c3_recall.s1, c3_shift.s0): --prefix c3_ is then the campaign and --prefix
     c3_recall one arm of it, and a prefix matches from the first character, so the part you select by goes first. A
     job added without --tag has no name, is selected by its id, and shows its command in a view. A tag is a name and
-    never a key: adding a campaign file twice makes a second job per tag.
+    never a key: adding a campaign file twice makes a second job per tag, and a tag or a prefix then selects every
+    job of that name the store holds, the ended jobs of the earlier round among them.
 
 Selecting jobs
     Every verb that takes jobs takes these five forms, and no others; `note` takes one job, by id or a tag of one:
@@ -84,7 +85,8 @@ Order, and a stage after another
     waited for, so it never becomes the head of its queue and never blocks the jobs behind it. `wait` counts a held
     job as not ended: a wait over a stage still held says so and then waits for ever, so wait for the stage before it
     and release this one. A stage over two queues is one wait each (`wait -q grid --prefix s1_`): a prefix spanning
-    two is an error.
+    two is an error. A wait by tag or prefix over a re-queued campaign names the earlier round's jobs too, so wait
+    for the ids that `add` printed, or remove the round before it first (`pp queue clean --prefix s1_ -y`).
 
         IDS=$(pp queue add --from stage1.txt)                         # one id per line on stdout
         pp queue add --from stage2.txt --after "$(echo "$IDS" | tr '\n' ',')"
