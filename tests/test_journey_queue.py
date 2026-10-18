@@ -48,7 +48,9 @@ class QueueJourney(Journey):
 
 class TestFirstSteps(QueueJourney):
     def test_first_job_from_nothing_to_its_log(self):
-        self.assertIn("no queues yet", self.status())
+        # the queue this machine's config names, before anything is queued in it
+        self.assertEqual(json.loads(self.status("--json"))["queues"], ["default"])
+        self.assertIn("== default", self.status())
         r = self.pp("queue", "add", "--", "sh", "-c", "echo hello-from-the-job")
         jid = r.stdout.strip()
         self.assertTrue(jid.isdigit(), r.stdout)
@@ -103,7 +105,8 @@ class TestFirstSteps(QueueJourney):
             r = self.pp("queue", *argv, code=2)
             self.assertIn(want, r.stderr, argv)
             self.assertNotIn("Traceback", r.stderr, argv)
-        self.assertIn("no queues yet", self.status())               # nothing slipped through
+        d = json.loads(self.status("--json"))                       # nothing slipped through
+        self.assertEqual([d[k] for k in ("running", "queued", "held", "recent")], [[], [], [], []])
         for argv in (["show", "999"], ["kill", "abc"], ["log", "7"], ["drop", "3-1"]):
             self.assertIn("no job matches", self.pp("queue", *argv, code=2).stderr)
         self.assertIn("invalid choice", self.pp("queue", "bogus", code=2).stderr)
@@ -1417,7 +1420,8 @@ class TestTheRetriesAndTheRecovery(Lab):
         self.assertEqual((after["state"], after["attempt"]), ("done", 2))
         self.assertEqual(self.field(self.field(after, "history")[0], "reason"), "lost")
         self.add("-q", "r1", "--no-start", "--hold", "--", "true")
-        self.assertEqual(sorted(json.loads(self.status("--json"))["queues"]), ["default", "r1"])
+        # the queues that hold records, and every one this machine's config names
+        self.assertEqual(sorted(json.loads(self.status("--json"))["queues"]), ["default", "lab", "r1"])
         self.write("work/plan.txt", "./hold.sh go\n./hold.sh go\n")
         once = self.pp("queue", "add", "-q", "lab", "--from", "plan.txt", "--no-start").stdout.split()
         again = self.pp("queue", "add", "-q", "lab", "--from", "plan.txt", "--no-start").stdout.split()

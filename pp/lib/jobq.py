@@ -1191,7 +1191,8 @@ def cmd_status(a, scope: list[str] | None) -> int:
 
     `--json` is what an agent reads, and this is its shape, stated once:
 
-        queues          [name], the queues this status covers
+        queues          [name], the queues this status covers: those that hold records, those a worker is up
+                        for, and those config.toml names in a [queue.NAME] table
         workers         {queue: pid or null}, the pid of each queue's worker; null where none is up and while
                         one that holds the claim has not recorded itself yet
         starting        [queue] whose worker holds the claim and has not recorded itself yet, which is the
@@ -1218,13 +1219,17 @@ def cmd_status(a, scope: list[str] | None) -> int:
     # one listing: the counts, the rows and what the shared pools hold are the same jobs, so no job is shown
     # twice or in two states. Every queue is listed, since a shared pool counts every queue's running jobs.
     all_jobs = jobcore.jobs()
+    # every queue in scope: the ones that exist, and the ones config.toml names, which have nothing of their
+    # own to read yet
+    named = _configured_queues() if scope is None else []
     # what each queue's worker is, through the one construct, so the hints that nothing launches or records
     # this queue's jobs come back from the one answer it gave
-    workers = {q: jobcore.worker_now(q) for q in _scope_list(scope)}
+    workers = {q: jobcore.worker_now(q) for q in sorted(set(_scope_list(scope)) | set(named))}
     # the queues those workers are of, so this view comes of one listing of the store: a queue another process
     # creates between two listings would otherwise be one this has no worker for
     qs = [q for q in workers
-          if scope is not None or any(j["queue"] == q for j in all_jobs) or workers[q].how != jobcore.DOWN]
+          if scope is not None or q in named or any(j["queue"] == q for j in all_jobs)
+          or workers[q].how != jobcore.DOWN]
     if a.here or a.project:
         want = a.project or project_name(os.getcwd())
         keep = lambda js: [j for j in js if j.get("project") == want]   # noqa: E731
@@ -1352,10 +1357,22 @@ def cmd_status(a, scope: list[str] | None) -> int:
 
 
 def _configured(q: str) -> bool:
+    return q in _configured_queues()
+
+
+def _configured_queues() -> list[str]:
+    """Every queue config.toml names in a [queue.NAME] table, which `status` covers beside the queues that
+    hold records and the ones a worker is up for. A lane the machine declared and nothing has run in yet is a
+    section of the view with nothing in it, so a reader sees the lanes there are without being told their
+    names, and reading them creates no directory and no file.
+
+    A name no queue could have is left out, as it is wherever a queue is named. A config file that cannot be
+    read names none here; the error is the view's own, from the pools it reads beside this."""
     try:
-        return q in config.load("queue")
+        names = config.load("queue")
     except config.ConfigError:
-        return False
+        return []
+    return sorted(q for q in names if jobstore.NAME_RE.fullmatch(q) and q not in jobstore.RESERVED)
 
 
 def _pool_str(p: dict, now: float) -> str:

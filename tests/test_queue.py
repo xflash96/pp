@@ -1193,7 +1193,26 @@ class TestNamedQueues(QueueCase):
         self.assertIn("== beta", out)
         data = json.loads(self.call("status", "--json")[1])
         self.assertEqual(sorted(j["queue"] for j in data["queued"]), ["alpha", "beta"])
-        self.assertEqual(data["queues"], ["alpha", "beta"])
+        # the two that hold records, and `default`, which this scope's config names and nothing has run in
+        self.assertEqual(data["queues"], ["alpha", "beta", "default"])
+
+    def test_a_queue_the_config_names_is_a_section_with_nothing_in_it(self):
+        """A lane the machine declares is in the view before anything is queued in it, so a reader sees the
+        lanes there are instead of having to be told their names. Reading one creates nothing: the store
+        holds the queues that exist, and a name in a table is not one of them."""
+        self.config("slots = 1", q="lane")
+        rc, out, _ = self.call()
+        self.assertEqual(rc, 0)
+        self.assertIn("== lane", out)
+        data = json.loads(self.call("status", "--json")[1])
+        self.assertIn("lane", data["queues"])
+        self.assertIsNone(data["workers"]["lane"])
+        self.assertIsNone(data["waiting"]["lane"])
+        self.assertNotIn("lane", data["starting"])
+        self.assertEqual([p["name"] for p in data["pools"]["lane"]], ["slots"])
+        self.assertEqual(jobstore.queues(), [])
+        self.assertFalse(os.path.exists(os.path.join(self.sb.state, "queue", "lane")),
+                         "reading the status of a queue a table names created it")
 
     def test_worker_status_lists_every_queue(self):
         self.add(cmd="true", q="alpha")
@@ -1947,6 +1966,9 @@ class TestStatusWait(QueueCase):
         self.assertRegex(out, r"\n  slots 1/1 · queued 1")      # the counts on a line of their own
 
     def test_no_queues(self):
+        """A machine with none of the three: no records, no worker, and no queue its config names."""
+        self.tables.clear()
+        self._write_config()
         rc, out, _ = self.call()
         self.assertEqual(rc, 0)
         self.assertIn("no queues yet", out)
