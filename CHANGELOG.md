@@ -42,6 +42,41 @@ nvidia-smi and Claude Code's session as the defaults.
 - `pp cmd ls` shows each command's aliases of both kinds, and its `--json`
   rows gain `config_aliases` beside `aliases`.
 
+`pp queue`: the views, the plans and the help say more of what pp knows
+about your cards, your queues and your projects.
+
+- `status --json` publishes the gpu_gb pool of each scope in `pools` and
+  `shared`, an entry like every other pool's with one field of its own:
+  `per_card`, that scope's budget on each card of the reading and what its
+  running jobs reserve on that card. The text view shows those numbers card
+  by card. So a job is sized against the smallest budget of every scope its
+  queue draws from before it is queued, instead of being refused first.
+- `pp queue` covers every queue a `[queue.NAME]` table names, beside the
+  queues that hold records and the ones a worker is up for. Such a queue
+  with nothing in it is a section with nothing in it and an entry in
+  `--json`, and reading it creates no directory and no file. "no queues yet"
+  is for a machine with none of the three.
+- `pp queue add` says on stderr where the job has no runner, no `.pp.toml`
+  stands above its directory, and a directory below it is a project whose
+  `[queue]` sets one. It names that directory and `--cwd`, once per
+  directory, and queues the job as it asks.
+- The command `add` hands an agent names the ids it queued as ranges (`wait
+  8-13 20`), which is one word for a campaign of a hundred lines.
+- `clean` and `drop` say in their plan that they remove the records and pp's
+  own files for them, and that a log at a path a `log` pattern or `--log`
+  named stays.
+- A run of the project's stop command that nobody asked for, after a run
+  whose work may still be out there, writes to the worker's own output
+  instead of the job's log. The stop a kill or a timeout asked for still
+  writes in the job's log.
+- `pp help queue` names the shape of each `--json`: one object with its keys
+  for `status`, one job and its watchers for `show`, and a list of `{queue,
+  pid, how, log, up}` for `worker status`.
+- `pp help queue` says that several selection forms are several words on one
+  verb, that a tag or a prefix selects every job of that name the store
+  holds, an earlier round's ended ones too, and that a campaign line's
+  `--cwd` is that line's own directory and so its project.
+
 ## v0.2.0
 
 The interface this minor version keeps. `pp help queue` says what is promised
