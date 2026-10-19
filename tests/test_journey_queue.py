@@ -14,6 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from journey import PP, ROOT, Journey, replace_file  # noqa: E402
+from pp.lib import proc, session  # noqa: E402
 
 BASE = "[queue.default]\npoll = 0.2\nidle_exit = 30\n"
 
@@ -475,6 +476,32 @@ class TestAgent(QueueJourney):
         self.assertEqual(self.read(rc).strip(), "2")
         self.assertEqual(self.state(mine), "held")       # nothing of this session's was answered for
 
+    def test_a_wait_that_outlives_its_shell_stamps_the_session_it_waited_for(self):
+        """The form an agent runs a wait in: in the background of a shell that returns before the job ends. The
+        kernel gives that wait another parent once the shell is gone, and the session it selected the job by is
+        the session its `reported` stamp carries, so no later `wait --mine` of that session hears the outcome
+        again."""
+        me = proc.read(os.getpid())
+        sid = session.walk([(me.comm, me.pid, me.start)], proc.boot_id())   # pp's session with nothing set
+        if sid is None:
+            self.skipTest("this process is no session pp can name, so no job of this story has an owner")
+        jid = self.add("--hold", "--", "sh", "-c", "exit 4")
+        self.assertEqual(self.show(jid)["owner"]["session"], sid)
+        out, rc, go = (os.path.join(self.work, n) for n in ("wait.out", "wait.rc", "go"))
+        shell = self.child(["/bin/sh", "-c",
+                            f'{{ "$PY" "$PP" queue wait --mine --timeout 30 --poll 0.2 >{shlex.quote(out)} 2>&1; '
+                            f'echo $? > {shlex.quote(rc)}; }} & '
+                            f'while [ ! -f {shlex.quote(go)} ]; do sleep 0.05; done'],
+                           env=dict(self.env, PY=sys.executable, PP=PP))
+        self.until(lambda: self.show(jid)["watchers"], what="the wait to be watching the job it selected")
+        self.write("work/go", "")
+        self.assertEqual(shell.wait(timeout=30), 0)      # its shell is gone, so the wait is reparented
+        self.pp("queue", "release", jid)
+        self.until(lambda: os.path.exists(rc), what="the wait to report the outcome and end")
+        self.assertEqual(self.sessions(jid), [sid])
+        self.assertEqual(self.read(rc).strip(), "1")     # a job of this session failed
+        self.wait(code=0, extra=("--mine",))             # and that outcome is not reported a second time
+
     def test_an_agent_names_its_own_session_with_pp_session(self):
         """PP_SESSION names the calling session, so `--mine` and a job's owner are any agent's. The job pp
         starts does not inherit it: the environment it writes down holds no name of its caller's."""
@@ -796,8 +823,6 @@ import shutil  # noqa: E402
 import signal  # noqa: E402
 
 from journey import PROMISED, kill_pid, needs  # noqa: E402
-
-from pp.lib import proc  # noqa: E402
 
 # The machine, described once: the card pool every queue draws from, a queue of three slots, and a lane of one.
 MACHINE = ('[resources]\ngpu_gb = "auto"\n'

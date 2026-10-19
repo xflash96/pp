@@ -321,6 +321,8 @@ Agents
     terminal too. PP_SESSION names the session instead, for an agent that wants a name of its own, and pp strips it
     from what it starts. pid 1 and an init (systemd, init, launchd) are no session, and `--mine` there is a usage
     error: a wait left running by a shell that has returned is reparented to an init, so give such a wait PP_SESSION.
+    pp finds the session once in a run, so a wait that outlives the shell it was started from reports the jobs it
+    selected to the session that queued them.
     The limit: a program between the agent and pp, a script that runs `pp queue add`, is the session pp finds, so
     wait for the ids its `add` printed, or give it PP_SESSION.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not

@@ -8,7 +8,8 @@ The caller is found once, and the first of these that answers is it:
    stop command), and a job is no session;
 4. the process pp runs under: the nearest ancestor of pp that is neither a shell nor a wrapper, named
    `<comm>:<pid>:<boot>:<start>`, so a pid reused later, or reused after a reboot, is another session. pid 1, an
-   init, and an ancestor pp cannot read, are no session.
+   init, and an ancestor pp cannot read, are no session. The ancestry is read once in a process, since pp's own
+   parent can end while pp runs.
 
 Rule 4 is what makes `--mine` work with nothing set: every command an agent runs is a child of the agent's own
 process, and a person's terminal (the terminal program, the tmux server, the ssh connection) is a session the
@@ -26,6 +27,7 @@ session, and a job does not inherit the identity of whoever queued it.
 """
 from __future__ import annotations
 
+import functools
 import os
 
 # a session's identity, never configuration: CLAUDE_CODE_USE_BEDROCK and friends are auth settings and stay
@@ -60,9 +62,15 @@ def walk(ancestry: list, boot: str) -> str | None:
     return None
 
 
+@functools.cache
 def _found() -> str | None:
-    """Rule 4 carried out: the ancestors pp reads, handed to the walk. The reading is here and the rule is
-    there, so the rule is a table and this is the one place /proc is read for a session."""
+    """Rule 4 carried out, once in a process: the ancestors pp reads, handed to the walk. The reading is here
+    and the rule is there, so the rule is a table and this is the one place /proc is read for a session.
+
+    Once, because the process pp runs under can end while pp runs, and the kernel then gives pp an init as its
+    parent: a `wait` an agent leaves running in the background outlives the shell that started it. The session
+    it selected jobs by is the session it stamps their outcomes with, so every answer one pp process gives is
+    one session's."""
     from pp.lib import proc       # proc reads this module, so the one import of it is here
     ancestry = [None if p is None else (p.comm, p.pid, p.start)
                 for p in (proc.read(pid) for pid in proc.ancestors(os.getppid()))]

@@ -25,8 +25,10 @@ nvidia-smi and the process pp runs under as the defaults.
   started itself, a job or its runner or a hook or a stop command, is no
   session. pid 1 and an init are no session either, so a `wait` left running
   by a shell that has returned, which the kernel reparents to an init, says
-  there is none instead of answering for another session's jobs. pp strips
-  those variables from everything it starts.
+  there is none instead of answering for another session's jobs. The session
+  is found once in a run, so such a wait reports the outcomes it selected to
+  the session that queued them and no later `wait --mine` of that session
+  reports them again. pp strips those variables from everything it starts.
 - `pp queue status --mine`, which `pp queue --mine` and `ls --mine` are too,
   is the jobs this session queued, in every state, in the text view and in
   `--json`'s `running`, `queued`, `held` and `recent`. It applies together
