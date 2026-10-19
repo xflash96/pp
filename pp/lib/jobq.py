@@ -730,11 +730,12 @@ def _of_session(verb: str) -> tuple:
     """What `--mine` means, for every verb that takes it: this session's name, and whether a job is its own.
 
     One answer for `wait`, `watch`, `status` and `ls`, so the four select the same jobs. Where there is no
-    session (pp started the process it runs under) `--mine` can name nothing, so it is a usage error."""
+    session (pp started the process it runs under, or that process has ended) `--mine` can name nothing, so it
+    is a usage error."""
     me = session.caller()
     if not me:
-        ui.die(f"{_PROG} {verb} --mine: there is no session, since pp started the process it runs under "
-               f"(set PP_SESSION to name this one)", 2)
+        ui.die(f"{_PROG} {verb} --mine: there is no session, since pp started the process it runs under or that "
+               f"process has ended (set PP_SESSION to name one)", 2)
     sid = me["session"]
     return sid, lambda j: isinstance(j.get("owner"), dict) and j["owner"].get("session") == sid
 
