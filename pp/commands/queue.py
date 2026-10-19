@@ -315,16 +315,13 @@ Agents
     dropped, or a config file is wrong; 2 a usage error or a refusal; 3 wait or watch gave up at its --timeout; 130
     interrupted. So `wait --prefix s1_ && ./next.sh` is a driver for a campaign a failure should stop; one that
     expects failures writes `;`, since exit 1 is a failed or dropped job and a wrong config alike.
-        pp finds this session itself, with nothing set: it is the nearest process above pp that is neither a shell nor
-    a wrapper (timeout, env, nice, nohup, stdbuf, setsid, ionice, time), named with its pid and its start time. That
-    is an agent's own process, and it is a person's terminal, tmux server or ssh connection, so `--mine` works in a
-    terminal too. PP_SESSION names the session instead, for an agent that wants a name of its own, and pp strips it
-    from what it starts. pid 1 and an init (systemd, init, launchd) are no session, and `--mine` there is a usage
-    error: a wait left running by a shell that has returned is reparented to an init, so give such a wait PP_SESSION.
-    pp finds the session once in a run, so a wait that outlives the shell it was started from reports the jobs it
-    selected to the session that queued them.
-    The limit: a program between the agent and pp, a script that runs `pp queue add`, is the session pp finds, so
-    wait for the ids its `add` printed, or give it PP_SESSION.
+        pp finds this session with nothing set: the nearest process above pp that is neither a shell nor a wrapper
+    (timeout, env, nice, nohup, stdbuf, setsid, ionice, time), named by its pid and its start time. That is an
+    agent's own process, or a person's terminal, tmux server or ssh connection. PP_SESSION names it instead, and pp
+    strips it from what it starts. A program between the agent and pp, a script that runs `pp queue add`, is the
+    session pp finds, so wait for the ids its `add` printed, or give it PP_SESSION. pp finds the session once, as it
+    starts. pid 1 and an init (systemd, init, launchd) are no session, so a wait whose shell has already returned
+    wants PP_SESSION.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not
     from the text, and ignore a field you do not know. `status --json` is one object, whose keys are queues, workers,
     starting, waiting, pools, shared, cards, cards_why, config_errors, and running, queued, held and recent: those
