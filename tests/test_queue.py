@@ -6086,8 +6086,10 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         self.a_kill_asks(k, grace=30.0)
         w2.tick()
         journey.until(lambda: len(self.lines(ran)) == 2, timeout=30, what="the stop command the kill ran")
-        journey.until(lambda: jobstore.find(k)["stop"].get("rc") == 0, timeout=30,
-                      what="the exit code that command had, on the stop it carried out")
+        # the worker reaps that command onto the stop on a pass once it has ended, so it is the passes that
+        # record its code
+        self.run_until(w2, lambda: jobstore.find(k)["stop"].get("rc") == 0, timeout=30,
+                       what="the exit code that command had, on the stop it carried out")
         self.the_run_ends_with_no_code(k)
         w2.tick()
         self.assertEqual(jobstore.find(k)["reason"], "killed")
