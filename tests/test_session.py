@@ -20,6 +20,9 @@ class TestTheWalk(unittest.TestCase):
             ("a shell is passed over", [("bash", 400, 11), ("agent", 300, 22)], "agent:300:01234567:22"),
             ("a wrapper is passed over", [("timeout", 400, 11), ("agent", 300, 22)], "agent:300:01234567:22"),
             ("only shells, up to pid 1", [("bash", 400, 11), ("zsh", 90, 7), ("systemd", 1, 0)], None),
+            # a pp whose own parent has ended: the kernel gives it the user's init, whose pid is not 1
+            ("reparented to the user's init", [("systemd", 3106, 23776), ("systemd", 1, 0)], None),
+            ("reparented, through the shell it is still under", [("sh", 400, 11), ("init", 3106, 23776)], None),
             ("an ancestor that cannot be read", [("dash", 400, 11), None, ("agent", 300, 22)], None),
             ("the nearest one wins", [("python3", 400, 11), ("agent", 300, 22)], "python3:400:01234567:11"),
         )

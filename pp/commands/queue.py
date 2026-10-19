@@ -319,8 +319,10 @@ Agents
     a wrapper (timeout, env, nice, nohup, stdbuf, setsid, ionice, time), named with its pid and its start time. That
     is an agent's own process, and it is a person's terminal, tmux server or ssh connection, so `--mine` works in a
     terminal too. PP_SESSION names the session instead, for an agent that wants a name of its own, and pp strips it
-    from what it starts. The limit: a program between the agent and pp, a script that runs `pp queue add`, is the
-    session pp finds, so wait for the ids its `add` printed, or give it PP_SESSION.
+    from what it starts. pid 1 and an init (systemd, init, launchd) are no session, and `--mine` there is a usage
+    error: a wait left running by a shell that has returned is reparented to an init, so give such a wait PP_SESSION.
+    The limit: a program between the agent and pp, a script that runs `pp queue add`, is the session pp finds, so
+    wait for the ids its `add` printed, or give it PP_SESSION.
         --json on status, show and worker status is the machine surface, and the only one: read fields from it and not
     from the text, and ignore a field you do not know. `status --json` is one object, whose keys are queues, workers,
     starting, waiting, pools, shared, cards, cards_why, config_errors, and running, queued, held and recent: those

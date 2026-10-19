@@ -7,13 +7,17 @@ The caller is found once, and the first of these that answers is it:
 3. no session, where PP_QUEUE_JOB is in the environment: pp started this process (a job, its runner, a hook, a
    stop command), and a job is no session;
 4. the process pp runs under: the nearest ancestor of pp that is neither a shell nor a wrapper, named
-   `<comm>:<pid>:<boot>:<start>`, so a pid reused later, or reused after a reboot, is another session. pid 1,
-   and an ancestor pp cannot read, are no session.
+   `<comm>:<pid>:<boot>:<start>`, so a pid reused later, or reused after a reboot, is another session. pid 1, an
+   init, and an ancestor pp cannot read, are no session.
 
 Rule 4 is what makes `--mine` work with nothing set: every command an agent runs is a child of the agent's own
 process, and a person's terminal (the terminal program, the tmux server, the ssh connection) is a session the
 same way. Its limit is that a program between the agent and pp, a script that runs `pp queue add`, is the
 process pp finds, so that program's jobs are its own session's.
+
+An init is no session because it called nothing: pp reaches one by being reparented, which the kernel does when
+pp's own parent ends, and a pp left in the background by a shell that has returned is such a pp. `--mine` there
+names nothing, and says so, instead of naming the init as the caller and answering for its jobs.
 
 pp records the session it found as a queued job's owner, so `pp queue wait --mine` finds the jobs a session
 queued. It strips every variable above from anything it starts (workers, jobs, hooks, stop commands): a process
@@ -33,6 +37,9 @@ SESSION_VARS = ("PP_SESSION", "CLAUDECODE", "AI_AGENT", "CLAUDE_PID", "CLAUDE_EF
 # command for, and a wrapper that only changes how the command runs. Named once, here.
 SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "tcsh", "csh")
 WRAPPERS = ("timeout", "env", "nice", "nohup", "stdbuf", "setsid", "ionice", "time")
+# The processes that run a command nobody spelled: the init a process whose parent has ended is reparented to,
+# whatever its pid is. The user's init is one of these and is not pid 1.
+INITS = ("systemd", "init", "launchd")
 
 
 def walk(ancestry: list, boot: str) -> str | None:
@@ -40,13 +47,13 @@ def walk(ancestry: list, boot: str) -> str | None:
 
     ancestry is (comm, pid, start) for each ancestor of pp from its parent upward, and None for an ancestor
     that cannot be read. A pure function of that list: the nearest entry that is neither a shell nor a wrapper,
-    as `<comm>:<pid>:<boot>:<start>` with the first 8 characters of boot. pid 1, an ancestor that cannot be
-    read, and a chain that holds no such process are each no session."""
+    as `<comm>:<pid>:<boot>:<start>` with the first 8 characters of boot. pid 1, an init, an ancestor that
+    cannot be read, and a chain that holds no such process are each no session."""
     for entry in ancestry:
         if entry is None:
             return None
         comm, pid, start = entry
-        if pid <= 1:
+        if pid <= 1 or comm in INITS:
             return None
         if comm not in SHELLS and comm not in WRAPPERS:
             return f"{comm}:{pid}:{boot[:8]}:{start}"

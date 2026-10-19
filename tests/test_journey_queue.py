@@ -6,13 +6,14 @@ installs fake ones."""
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from journey import ROOT, Journey, replace_file  # noqa: E402
+from journey import PP, ROOT, Journey, replace_file  # noqa: E402
 
 BASE = "[queue.default]\npoll = 0.2\nidle_exit = 30\n"
 
@@ -459,6 +460,20 @@ class TestAgent(QueueJourney):
         self.assertIn("in the background", self.pp("queue", "add", "--no-start", "--", "true").stderr)
         # what pp started is no session, so --mine there can name nothing: a usage error
         self.wait(code=2, env=dict(self.env, PP_QUEUE_JOB="1"), extra=("--mine",))
+
+    def test_a_wait_under_an_init_names_no_session(self):
+        """A pp whose own parent has ended is a child of an init, which called nothing. `--mine` there can name
+        nothing, so it is the usage error, and the job this session queued waits for a wait that can name it."""
+        mine = self.add("--hold", "--", "true")
+        init = os.path.join(self.work, "systemd")        # the name a reparented process reads as its parent's
+        os.symlink("/bin/sh", init)
+        rc = os.path.join(self.work, "wait.rc")
+        # two commands, so the shell stays in the chain instead of exec'ing pp over itself
+        subprocess.run([init, "-c", f'"$PY" "$PP" queue wait --mine --timeout 20 --poll 0.2 >/dev/null 2>&1; '
+                                    f'echo $? > {shlex.quote(rc)}'],
+                       cwd=self.work, timeout=60, env=dict(self.env, PY=sys.executable, PP=PP))
+        self.assertEqual(self.read(rc).strip(), "2")
+        self.assertEqual(self.state(mine), "held")       # nothing of this session's was answered for
 
     def test_an_agent_names_its_own_session_with_pp_session(self):
         """PP_SESSION names the calling session, so `--mine` and a job's owner are any agent's. The job pp
