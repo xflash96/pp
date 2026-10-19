@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.2.1
+
+pp finds the session that runs it with nothing set, so `--mine` works for
+any agent and in a terminal. `pp queue` reads the cards with a command of
+yours, and any command answers to an alias of your own. A `pp-NAME` program
+is a command only in pp's own folders, and no longer on your `PATH`.
 
 `pp`: a program named `pp-NAME` on your `PATH` is no longer a command.
 

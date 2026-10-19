@@ -1,6 +1,6 @@
 [project]
 name = "ppkit"
-version = "0.2.0"           # the same as pp/__init__.py's __version__; tests/test_cli.py checks
+version = "0.2.1"           # the same as pp/__init__.py's __version__; tests/test_cli.py checks
 description = "A CLI kit for user & agents"
 readme = "README.md"
 license = "Apache-2.0"
