@@ -142,6 +142,13 @@ class TestAliasFlags(CmdCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.table()["dq"], "cmd ls -n")
 
+    def test_a_double_dash_the_command_line_holds_is_written_as_it_was_given(self):
+        for name, argv, value in (("br", ("cmd", "ls", "--", "-x.txt"), "cmd ls -- -x.txt"),
+                                  ("st", ("cmd", "--"), "cmd --")):
+            rc, _out, err = self.pp("alias", name, *argv)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(self.table()[name], value)
+
     def test_json_with_a_name_and_a_command_is_a_usage_error(self):
         rc, out, _err = self.pp("alias", "qj", "cmd", "ls", "--json")
         self.assertEqual(rc, 2)
