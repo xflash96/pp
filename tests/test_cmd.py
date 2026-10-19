@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -104,6 +105,53 @@ class CmdCase(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 cmd.main(list(argv))
         return out.getvalue(), err.getvalue()
+
+
+class TestAliasFlags(CmdCase):
+    """`pp cmd alias` reads its own flags wherever they stand before a `--`, and every word after a `--` is
+    the aliased command line's. So a `-n` that follows the command is a dry run, and a command of its own
+    `-n` or `--json` is written by putting it after a `--`."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = os.path.join(self.sb.config, "config.toml")
+
+    def bytes_of(self) -> bytes:
+        with open(self.cfg, "rb") as f:
+            return f.read()
+
+    def table(self) -> dict:
+        return tomllib.loads(self.bytes_of().decode())["alias"]
+
+    def test_a_dry_run_flag_after_the_command_writes_nothing(self):
+        rc, _out, err = self.pp("alias", "st", "cmd", "ls", "-n")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(self.cfg))      # a dry run makes no file where there was none
+
+    def test_a_dry_run_flag_wherever_it_stands_leaves_the_file_as_it_was(self):
+        self.assertEqual(self.pp("alias", "zc", "cmd", "ls")[0], 0)
+        was = self.bytes_of()
+        for args in (("alias", "-n", "st", "cmd"), ("alias", "st", "-n", "cmd"), ("alias", "st", "cmd", "-n")):
+            rc, _out, err = self.pp(*args)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(self.bytes_of(), was)
+        self.assertEqual(sorted(self.table()), ["zc"])
+
+    def test_a_command_line_after_a_double_dash_keeps_the_flags_in_it(self):
+        rc, _out, err = self.pp("alias", "dq", "--", "cmd", "ls", "-n")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.table()["dq"], "cmd ls -n")
+
+    def test_json_with_a_name_and_a_command_is_a_usage_error(self):
+        rc, out, _err = self.pp("alias", "qj", "cmd", "ls", "--json")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertFalse(os.path.exists(self.cfg))
+
+    def test_a_flag_that_is_not_this_verbs_own_belongs_to_the_command(self):
+        rc, _out, err = self.pp("alias", "q", "cmd", "-q", "big")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.table()["q"], "cmd -q big")
 
 
 class TestACtrlCWhileItWorks(CmdCase):

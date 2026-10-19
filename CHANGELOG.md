@@ -51,7 +51,10 @@ nvidia-smi and the process pp runs under as the defaults.
 - `pp cmd alias` lists every alias of both kinds, with what it runs and
   where it is declared (`--json` for the same as data). `pp cmd alias NAME
   CMD [ARGS...]` adds one, `pp cmd alias NAME --rm` takes it back, and `-n`
-  prints the change and writes nothing.
+  prints the change and writes nothing. Those flags count wherever they
+  stand, so `pp cmd alias st promote status -n` is a dry run. A command line
+  of its own `-n`, `--rm` or `--json` goes after a `--`: `pp cmd alias dq --
+  queue drop -n`.
 - `pp cmd alias` is the one place pp writes `config.toml`: one line of the
   `[alias]` table under a lock, the file's mode kept, every other byte as it
   was. A change it cannot make as one line names the file to edit by hand.

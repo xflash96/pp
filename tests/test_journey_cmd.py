@@ -145,6 +145,15 @@ class TestAlias(Journey):
         self.assertEqual((self.bytes_of(), os.stat(self.cfg).st_mtime_ns), (was, stamp))
         self.pp("qz", code=2)       # the name the plan printed names nothing
 
+    def test_its_own_flags_count_wherever_they_stand_and_a_command_line_goes_after_a_double_dash(self):
+        self.pp("cmd", "alias", "ze", "zecho", "a", "-n")       # a -n after the command is still a dry run
+        self.assertFalse(os.path.exists(self.cfg))
+        self.pp("cmd", "alias", "zj", "zecho", "--json", code=2)
+        self.assertFalse(os.path.exists(self.cfg))
+        self.pp("cmd", "alias", "ze", "--", "zecho", "-n", "a")     # the command's own flags, after the --
+        self.assertEqual(self.bytes_of(), b'[alias]\nze = "zecho -n a"\n')
+        self.assertEqual(self.pp("ze", "b").stdout, "-n a b\n")
+
     def test_a_name_or_a_command_it_refuses_leaves_the_file_alone(self):
         self.config(self.KEPT)
         was = self.bytes_of()

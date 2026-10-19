@@ -15,7 +15,8 @@
     pp cmd ls                       every command and where it comes from (--json, with its aliases)
     pp cmd alias                    every alias, what it runs and where it is declared (--json)
     pp cmd alias st promote status  `pp st` runs `pp promote status`; pp cmd alias st --rm removes it
-    pp cmd alias st -n promote      print the change, write nothing
+    pp cmd alias st promote -n      print the change, write nothing: -n counts wherever it stands
+    pp cmd alias dq -- queue drop   `pp dq` runs `pp queue drop`; a CMD of its own -n or --json goes after --
 
 A new command has a docstring whose first line is its summary, a main(argv), and only the standard library at
 the top of the file (the rest: https://github.com/xflash96/pp/blob/main/CONTRIBUTING.md).
@@ -651,23 +652,46 @@ def _alias_rows(cmds: dict, table: dict) -> list[dict]:
                    for c in sorted(cmds.values(), key=lambda c: c.name) for a in c.aliases]
 
 
+OWN_FLAGS = ("-n", "--dry-run", "--rm", "--json", "-h", "--help")       # `pp cmd alias`'s own, before a `--`
+
+
 def _own_flags(argv: list[str]) -> tuple[list[str], list[str]]:
-    """This verb's own words, and the command line after NAME, which is read as nobody's flags but that
-    command's: `pp cmd alias q queue -q big` gives `-q big` to `queue` and not to argparse here."""
-    plain = [i for i, w in enumerate(argv) if not w.startswith("-")]
-    cut = plain[1] if len(plain) > 1 else len(argv)
-    return argv[:cut], argv[cut:]
+    """This verb's own words, and the aliased command line.
+
+    The verb's own flags count wherever they stand before a `--`, so `pp cmd alias st promote status -n` is a
+    dry run. Every word after a `--` is the command's, so `pp cmd alias dq -- queue drop -n` writes an alias
+    whose command line holds `-n`. Before a `--` the first word that is no flag is NAME, and the words after
+    it are the command's: `pp cmd alias q queue -q big` gives `-q big` to `queue` and not to argparse here."""
+    cut = argv.index("--") if "--" in argv else len(argv)
+    head: list[str] = []
+    line: list[str] = []
+    named = False
+    for w in argv[:cut]:
+        if w in OWN_FLAGS:
+            head.append(w)
+        elif named:
+            line.append(w)
+        else:
+            head.append(w)
+            named = not w.startswith("-")
+    return head, line + argv[cut + 1:]
 
 
 def cmd_alias(argv: list[str]) -> int:
     ap = ui.parser("cmd alias", "Name a command whatever you like, on this machine.",
-                   usage="pp cmd alias [-n] [NAME [CMD [ARGS...] | --rm]]  (bare: the listing, --json for data)")
+                   usage="pp cmd alias [-n] [NAME [[--] CMD [ARGS...] | --rm]]  (bare: the listing, --json for "
+                         "data; -n anywhere is a dry run, and a CMD holding one of these flags goes after --)")
     ap.add_argument("name", nargs="?", help="the name to give; without one, every alias is listed")
     ap.add_argument("--rm", action="store_true", help="take this name back")
     ap.add_argument("--json", action="store_true", help="the listing as data")
     ap.add_argument("-n", "--dry-run", action="store_true", help="print the change, write nothing")
     head, line = _own_flags(argv)
     a = ap.parse_args(head)
+    if line and a.name is None:     # a command line and no name to give it: the `--` came before NAME
+        ui.die("usage: pp cmd alias NAME -- CMD [ARGS...]", 2)
+    if line and a.json:
+        ui.die("--json is this verb's own flag wherever it stands; write the command line after a `--`: "
+               f"pp cmd alias {ui.printable(a.name)} -- {ui.printable(shlex.join(line))} --json", 2)
     cmds = cli.discover()
     table, unreadable = cli.alias_table(cmds)
     if unreadable:      # this verb's own file: the error every reader of a bad config file gives
