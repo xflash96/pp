@@ -4,12 +4,17 @@ import subprocess
 import sys
 import unittest
 
-from pp.lib import proc, session
+from pp.lib import session
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOOT = "0123456789abcdef-boot"
 # a child that prints what caller() makes of the chain it is in, with no variable of its own to go by
 SAYS_ITS_CALLER = "import json;from pp.lib import session;print(json.dumps(session.caller({})))"
+# an agent: a process of the test's own, so no shell and not pid 1 whatever tree the suite runs in. It prints
+# the session string it is, then runs the child through a shell
+AGENT = ("import os,subprocess,sys;from pp.lib import proc;me=proc.read(os.getpid());"
+         "print(f'{me.comm}:{me.pid}:{proc.boot_id()[:8]}:{me.start}',flush=True);"
+         "subprocess.run(['/bin/sh','-c',sys.executable+' -c \"$PY\" ; :'],check=True)")
 
 
 class TestTheWalk(unittest.TestCase):
@@ -31,13 +36,13 @@ class TestTheWalk(unittest.TestCase):
                 self.assertEqual(session.walk(ancestry, BOOT), want)
 
     def test_a_real_chain_through_a_shell_names_the_process_that_started_it(self):
-        """This test process -> sh -c -> python: the shell is passed over and this process is the session. The
-        `; :` keeps the shell in the chain, which `sh -c CMD` on its own is free to exec away."""
-        me = proc.read(os.getpid())
-        r = subprocess.run(["/bin/sh", "-c", f'{sys.executable} -c "$PY" ; :'], capture_output=True, text=True,
-                           cwd=ROOT, timeout=60, env={"PYTHONPATH": ROOT, "PY": SAYS_ITS_CALLER})
+        """agent -> sh -c -> python: the shell is passed over and the agent is the session. The `; :` keeps the
+        shell in the chain, which `sh -c CMD` on its own is free to exec away."""
+        r = subprocess.run([sys.executable, "-c", AGENT], capture_output=True, text=True, cwd=ROOT, timeout=60,
+                           env={"PYTHONPATH": ROOT, "PY": SAYS_ITS_CALLER})
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout)["session"], f"{me.comm}:{me.pid}:{proc.boot_id()[:8]}:{me.start}")
+        agent, said = r.stdout.splitlines()
+        self.assertEqual(json.loads(said)["session"], agent)
 
 
 class TestSession(unittest.TestCase):

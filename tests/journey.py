@@ -304,10 +304,11 @@ class Journey(unittest.TestCase):
 
     def setUp(self):
         # The session pp finds for the commands of a story: every one of them is a child of this test process,
-        # which is no shell and no wrapper, so it is the session (pp.lib.session, rule 4). A story that wants a
-        # session of its own names one with PP_SESSION, and one that wants none sets PP_QUEUE_JOB.
+        # which is no shell and no wrapper, so it is the session (pp.lib.session, rule 4), or None where this
+        # process is pid 1, as `ci/check --cpus N` runs it. A story that wants a session of its own names one
+        # with PP_SESSION, and one that wants none sets PP_QUEUE_JOB.
         me = proc.read(os.getpid())
-        self.my_session = f"{me.comm}:{me.pid}:{proc.boot_id()[:8]}:{me.start}"
+        self.my_session = session.walk([(me.comm, me.pid, me.start)], proc.boot_id())
         self._tmp = tempfile.TemporaryDirectory(prefix="ppj-")
         self.addCleanup(self._tmp.cleanup)
         t = self.tmp = os.path.realpath(self._tmp.name)

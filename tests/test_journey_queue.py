@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from journey import PP, ROOT, Journey, replace_file  # noqa: E402
-from pp.lib import proc, session  # noqa: E402
+from pp.lib import proc  # noqa: E402
 
 BASE = "[queue.default]\npoll = 0.2\nidle_exit = 30\n"
 
@@ -183,9 +183,9 @@ class TestFailures(QueueJourney):
         self.pp("queue", "note", jid, "--by", "nightly", "told the team")
         self.assertIn("note: told the team", self.status())        # the latest note, in the recent list
         notes = self.show(jid)["notes"]
-        # the note with no --by carries the session pp found, which here is the terminal the story is typed in
+        # the note with no --by carries the session pp found, the process the story is typed in, or `user`
         self.assertEqual([(n["text"], n["by"]) for n in notes],
-                         [("kaboom because X", self.my_session), ("told the team", "nightly")])
+                         [("kaboom because X", self.my_session or "user"), ("told the team", "nightly")])
         self.pp("queue", "note", jid, code=2)
         r = self.pp("queue", "retry", jid)
         new = r.stdout.strip()
@@ -456,9 +456,13 @@ class TestAgent(QueueJourney):
         self.assertNotIn(f" {theirs} ", r.stdout)
         self.assertIn("wait pid", self.pp("queue", "show", mine).stdout)       # reported to
         self.assertIn("nothing of this session's", self.wait(env=me, extra=("--mine",)).stdout)
-        # a person's terminal is a session too, so --mine works with nothing set and the hint is printed there
-        self.assertIn("nothing of this session's", self.wait(extra=("--mine",)).stdout)
-        self.assertIn("in the background", self.pp("queue", "add", "--no-start", "--", "true").stderr)
+        # a person's terminal is a session too, so --mine works with nothing set and the hint is printed there;
+        # where the story's own process is pid 1 there is no session, and --mine says so
+        if self.my_session:
+            self.assertIn("nothing of this session's", self.wait(extra=("--mine",)).stdout)
+            self.assertIn("in the background", self.pp("queue", "add", "--no-start", "--", "true").stderr)
+        else:
+            self.wait(code=2, extra=("--mine",))
         # what pp started is no session, so --mine there can name nothing: a usage error
         self.wait(code=2, env=dict(self.env, PP_QUEUE_JOB="1"), extra=("--mine",))
 
@@ -481,8 +485,7 @@ class TestAgent(QueueJourney):
         kernel gives that wait another parent once the shell is gone, and the session it selected the job by is
         the session its `reported` stamp carries, so no later `wait --mine` of that session hears the outcome
         again."""
-        me = proc.read(os.getpid())
-        sid = session.walk([(me.comm, me.pid, me.start)], proc.boot_id())   # pp's session with nothing set
+        sid = self.my_session       # pp's session with nothing set
         if sid is None:
             self.skipTest("this process is no session pp can name, so no job of this story has an owner")
         jid = self.add("--hold", "--", "sh", "-c", "exit 4")
