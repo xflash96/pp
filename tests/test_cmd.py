@@ -144,7 +144,7 @@ class TestAliasFlags(CmdCase):
 
     def test_a_double_dash_the_command_line_holds_is_written_as_it_was_given(self):
         for name, argv, value in (("br", ("cmd", "ls", "--", "-x.txt"), "cmd ls -- -x.txt"),
-                                  ("st", ("cmd", "--"), "cmd --")):
+                                  ("st", ("cmd", "--"), "cmd --"), ("bn", ("cmd", "ls", "--", "-n"), "cmd ls -- -n")):
             rc, _out, err = self.pp("alias", name, *argv)
             self.assertEqual(rc, 0, err)
             self.assertEqual(self.table()[name], value)

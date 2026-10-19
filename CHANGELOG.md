@@ -6,10 +6,10 @@
 
 - pp looks for such a program in `~/.config/pp/commands/`, in each plugin
   and in each `PP_PATH` folder, and reads no `PATH` for one. Other software
-  installs programs named `pp-*`, and one of those took a command's name or
-  a unique prefix of it (`pp q`) and showed in `pp -h`. A program of yours
-  stays a command by moving it into `~/.config/pp/commands/`, or by listing
-  the folder it is in in `PP_PATH`.
+  installs programs named `pp-*`, and on `PATH` such a program takes a
+  command's name or a unique prefix of it (`pp q`) and shows in `pp -h`. A
+  program of yours stays a command by moving it into
+  `~/.config/pp/commands/`, or by listing the folder it is in in `PP_PATH`.
 - Every Python command is still found before any such program, and the
   programs in that folder order, so nothing pp found in those folders
   moves.

@@ -658,18 +658,18 @@ OWN_FLAGS = ("-n", "--dry-run", "--rm", "--json", "-h", "--help")       # `pp cm
 def _own_flags(argv: list[str]) -> tuple[list[str], list[str]]:
     """This verb's own words, and the aliased command line.
 
-    The verb's own flags count wherever they stand before the separator, so `pp cmd alias st promote status
-    -n` is a dry run. The separator is the `--` that stands before the command line's first word, and every
-    word after it is the command's: `pp cmd alias dq -- queue drop -n` writes an alias whose command line
-    holds `-n`. A `--` the command line already started is one of its own words, so `pp cmd alias br batch
-    rename a b -- -x.txt` writes that `--` too. The first word that is no flag is NAME, and the words after it
-    are the command's: `pp cmd alias q queue -q big` gives `-q big` to `queue` and not to argparse here."""
+    The verb's own flags count wherever they stand before the first `--`, so `pp cmd alias st promote status
+    -n` is a dry run, and every word after that `--` is the command's: `pp cmd alias dq -- queue drop -n`
+    writes an alias whose command line holds `-n`. A `--` before the command line's first word separates, and
+    one inside the command line is also one of its words, so `pp cmd alias br batch rename a b -- -n` writes
+    `batch rename a b -- -n`. The first word that is no flag is NAME, and the words after it are the command's:
+    `pp cmd alias q queue -q big` gives `-q big` to `queue` and not to argparse here."""
     head: list[str] = []
     line: list[str] = []
     named = False
     for i, w in enumerate(argv):
-        if w == "--" and not line:      # the separator, and the words after it are the command's
-            return head, list(argv[i + 1:])
+        if w == "--":       # the words after it are the command's, and so is this one once the command began
+            return head, line + argv[i + (0 if line else 1):]
         if w in OWN_FLAGS:
             head.append(w)
         elif named:
