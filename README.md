@@ -39,10 +39,11 @@ pp needs no packages beyond Python itself, and it completes in zsh and bash.
 
 Each command is one Python file. pp looks for them when it runs: its own in
 `pp/commands/`, yours in `~/.config/pp/commands/`, the plugins you added
-with `pp cmd add`, the folders listed in `PP_PATH`, and any program named
-`pp-NAME` on your `PATH`. The first one found wins, so a plugin cannot hide
-a built-in or one of yours. `pp` lists commands without loading them, so
-one broken command cannot break the others.
+with `pp cmd add`, and the folders listed in `PP_PATH`. A program named
+`pp-NAME` in one of those folders, pp's own aside, is a command too. The
+first one found wins, so a plugin cannot hide a built-in or one of yours.
+`pp` lists commands without loading them, so one broken command cannot
+break the others.
 `pp help NAME` prints a command's manual, with examples.
 
 A command answers to its file's name, to a unique prefix of it, and to any
@@ -324,8 +325,10 @@ pp clones the plugin into `~/.local/share/pp/plugins/` and checks out the
 commit you said yes to. Only `pp cmd update` moves it, after showing you
 the diff. A plugin's code runs as you, so read it before you say yes.
 
-A program named `pp-NAME` on your `PATH`, in any language, is a command
-too. To add a command to pp itself, see [CONTRIBUTING.md](https://github.com/xflash96/pp/blob/main/CONTRIBUTING.md).
+A program named `pp-NAME` in `~/.config/pp/commands/`, in a plugin or in a
+`PP_PATH` folder, in any language, is a command too. Your `PATH` is not
+read, so a program named `pp-*` that other software installs takes no
+command's name. To add a command to pp itself, see [CONTRIBUTING.md](https://github.com/xflash96/pp/blob/main/CONTRIBUTING.md).
 
 ## Status
 

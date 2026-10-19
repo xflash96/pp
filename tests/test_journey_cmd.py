@@ -37,7 +37,7 @@ class TestNew(Journey):
         self.assertEqual(self.read(path), was)
 
     def test_names_that_are_taken_or_invalid(self):
-        self.tool("pp-ext", "echo ext\n")
+        self.prog("pp-ext", "echo ext\n")
         self.write("home/.config/pp/commands/al.py", '"""A"""\nALIASES = ["alias1"]\ndef main(argv):\n    pass\n')
         for name, why in ((ANY, "builtin command"), ("help", "pp's own"), ("ext", "external command"),
                           ("alias1", "an alias of 'al'")):
@@ -45,7 +45,8 @@ class TestNew(Journey):
             self.assertIn(why, r.stderr, name)
         for name in ("Foo-Bar", "1x", "_x", "x.y", "a b", ""):
             self.assertIn("lowercase letters", self.pp("cmd", "new", name, "--user", code=2).stderr, name)
-        self.assertEqual(os.listdir(os.path.join(self.env["PP_CONFIG_DIR"], "commands")), ["al.py"])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.env["PP_CONFIG_DIR"], "commands"))),
+                         ["al.py", "pp-ext"])       # the two this step wrote, and nothing a refusal left
 
     def test_a_builtin_in_a_source_tree_passes_its_own_test(self):
         src = copy_tree(os.path.join(self.tmp, "src"))

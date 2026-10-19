@@ -185,7 +185,9 @@ These rules keep pp working as commands come and go:
 | 3 | `pp queue wait` or `watch` gave up at its `--timeout` |
 | 130 | interrupted (Ctrl-C) |
 
-A `pp-NAME` program's own exit status passes through unchanged.
+A `pp-NAME` program in `~/.config/pp/commands/`, in a plugin or in a
+`PP_PATH` folder is a command, and its own exit status passes through
+unchanged. `PATH` is not read for one.
 
 ## How pp works
 

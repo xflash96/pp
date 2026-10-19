@@ -1,5 +1,6 @@
 """Discovery and dispatch: help never imports commands, one broken command never breaks another."""
 import ast
+import json
 import os
 import subprocess
 import sys
@@ -36,13 +37,30 @@ class TestCli(unittest.TestCase):
 
     def test_help_lists_builtins_and_plugins(self):
         self.write("config/commands/hello.py", '"""Say hello"""\ndef main(argv):\n    print("hi", *argv)\n')
-        self.write("bin/pp-ext", "#!/bin/sh\necho ext \"$@\"\n", 0o755)
+        self.write("plug/pp-ext", "#!/bin/sh\necho ext \"$@\"\n", 0o755)
         r = self.pp()
         self.assertEqual(r.returncode, 0)
         for word in ("kill", "cmd", "hello", "Say hello", "ext"):
             self.assertIn(word, r.stdout)
         self.assertEqual(self.pp("hello", "a").stdout.strip(), "hi a")
         self.assertEqual(self.pp("ext", "b").stdout.strip(), "ext b")
+
+    def test_a_program_is_a_command_in_pps_folders_and_not_on_path(self):
+        """A pp-NAME program is a command where pp keeps commands, and `$PATH` is not read for one: other
+        software installs programs named pp-*, and one of those would take a command's name or its prefix."""
+        self.write("config/commands/pp-mine", "#!/bin/sh\nexit 3\n", 0o755)
+        self.write("plug/pp-theirs", "#!/bin/sh\nexit 4\n", 0o755)
+        self.write("bin/pp-elsewhere", "#!/bin/sh\nexit 5\n", 0o755)
+        self.write("bin/pp-ki", "#!/bin/sh\nexit 6\n", 0o755)
+        self.assertEqual(self.pp("mine").returncode, 3)         # its own exit status passes through
+        self.assertEqual(self.pp("theirs").returncode, 4)
+        rows = {r["name"]: r for r in json.loads(self.pp("cmd", "ls", "--json").stdout)}
+        self.assertEqual([rows["mine"]["origin"], rows["theirs"]["origin"]], ["external", "external"])
+        self.assertNotIn("elsewhere", rows)
+        self.assertEqual(self.pp("elsewhere").returncode, 2)    # as an unknown command does
+        self.assertNotIn("elsewhere", self.pp().stdout)
+        self.assertEqual(self.pp("ki", "-h").returncode, 0)     # the prefix is the built-in's, not that file's
+        self.assertIn("usage: pp kill", self.pp("ki", "-h").stdout)
 
     def test_broken_commands_are_isolated(self):
         self.write("plug/syntax.py", '"""Broken"""\ndef main(argv:\n')

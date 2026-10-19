@@ -213,14 +213,15 @@ class TestPlugins(Journey):
         self.write(f"{cmds}/says.py", '"""Returns a message"""\ndef main(argv):\n    return "it went wrong"\n')
         self.write(f"{cmds}/says2.py", '"""Returns several lines"""\ndef main(argv):\n'
                    '    return "it went wrong\\nand here is why"\n')
-        self.tool("pp-shout", 'echo "SHOUT $*"; exit 3\n')
-        self.write("bin/pp-notexec", "#!/bin/sh\necho no\n", 0o644)
-        self.write("bin/pp-noshebang", "echo no\n", 0o755)               # the kernel cannot run this file
-        self.write("bin/pp-badinterp", "#!/no/such/interpreter\n", 0o755)
+        self.prog("pp-shout", 'echo "SHOUT $*"; exit 3\n')
+        self.write(f"{cmds}/pp-notexec", "#!/bin/sh\necho no\n", 0o644)
+        self.write(f"{cmds}/pp-noshebang", "echo no\n", 0o755)            # the kernel cannot run this file
+        self.write(f"{cmds}/pp-badinterp", "#!/no/such/interpreter\n", 0o755)
 
     def test_listing_sorts_them_and_runs_none(self):
         out = self.pp().stdout
-        user, external = out.split("user commands")[1], out.split("external (pp-* on PATH):")[1]
+        user = out.split("user commands")[1]
+        external = out.split("external (pp-* in the user, plugin and PP_PATH folders):")[1]
         self.assertIn("hello", user)
         self.assertIn("Say hello", user)
         self.assertIn("wrapper", user)               # `from x import main` defines main too
@@ -259,12 +260,22 @@ class TestPlugins(Journey):
         """An external command is listed because it is executable, which is not the same as runnable: a file
         with no shebang and one naming an interpreter that is gone are both listed and neither can exec. Each
         says what is wrong, like every other broken command, rather than printing a traceback."""
-        out = self.pp().stdout.split("external (pp-* on PATH):")[1]
+        out = self.pp().stdout.split("external (pp-* in the user, plugin and PP_PATH folders):")[1]
         for name in ("noshebang", "badinterp"):
             self.assertIn(name, out)
             r = self.pp(name, code=1)
-            self.assertIn(f"command '{name}' ({self.bin}/pp-{name}) could not run:", r.stderr)
+            where = os.path.join(self.env["PP_CONFIG_DIR"], "commands", f"pp-{name}")
+            self.assertIn(f"command '{name}' ({where}) could not run:", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_program_on_path_alone_is_no_command(self):
+        """pp reads no $PATH for a pp-NAME program: other software installs programs named pp-*, and one of
+        those would otherwise take a command's name, or a prefix a command answers to."""
+        self.tool("pp-zelsewhere", "exit 3\n")
+        self.tool("pp-he", "exit 3\n")                      # `pp he` is the prefix of the command hello
+        self.pp("zelsewhere", code=2)
+        self.assertNotIn("zelsewhere", self.pp().stdout)
+        self.assertEqual(self.pp("he", "x").stdout, "hello x\n")
 
 
 class TestLauncher(Journey):

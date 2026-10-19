@@ -702,5 +702,5 @@ def say_ready() -> None:
 
 def exec_replace(path: str, argv: list) -> None:
     """Become another program: pp's pid, group and terminal stay as they are, and nothing after this runs. What
-    an external pp-NAME command gets, so it behaves as if the user had run it."""
+    an external pp-NAME command of one of pp's folders gets, so it behaves as if the user had run it."""
     os.execv(path, [path] + argv)

@@ -6,7 +6,10 @@ A command is found in one of five places, first match wins (so a plugin cannot s
     user       ~/.config/pp/commands/<name>.py  this machine's own, never published
     plugin     ~/.local/share/pp/plugins/<plugin>/[commands/]<name>.py   added by `pp cmd add`, pinned to a commit
     path       <dir>/<name>.py for dir in $PP_PATH (os.pathsep-separated)
-    external   pp-<name> executable on $PATH   any language, git-style
+    external   pp-<name> executable in the user, plugin or $PP_PATH folder   any language, git-style
+
+Every Python command is found before any pp-<name> program, and the programs in the folder order above. $PATH
+is not read: other software installs programs named pp-*, and one of those would take a command's name.
 
 A Python command is a module whose docstring's first line is its summary and which defines main(argv) -> int.
 Listing reads modules with `ast` and never imports them, so a command whose file is absent, unparsable or whose
@@ -113,6 +116,11 @@ def _py_dirs() -> list[tuple[str, str]]:
     return dirs
 
 
+def _prog_dirs() -> list[str]:
+    """Where a pp-NAME program is a command: pp's own folders, less the one pp keeps its own modules in."""
+    return [d for origin, d in _py_dirs() if origin != "builtin"]
+
+
 def discover() -> dict[str, Command]:
     found: dict[str, Command] = {}
 
@@ -133,9 +141,9 @@ def discover() -> dict[str, Command]:
             path = os.path.join(d, fn)
             summary, aliases, err = _scan(path)
             add(Command(fn[:-3], origin, path, summary, aliases, err))
-    for d in os.environ.get("PATH", "").split(os.pathsep):
+    for d in _prog_dirs():
         try:
-            names = sorted(os.listdir(d or "."))
+            names = sorted(os.listdir(d))
         except OSError:
             continue
         for fn in names:
@@ -296,7 +304,7 @@ def help_text(cmds: dict[str, Command], show_all: bool = False) -> str:
            ""]
     heads = {"builtin": "commands:", "user": f"user commands ({os.path.join(paths.config_dir(), 'commands')}):",
              "plugin": f"plugins ({paths.data_dir('plugins', create=False)}):", "path": "PP_PATH commands:",
-             "external": "external (pp-* on PATH):"}
+             "external": "external (pp-* in the user, plugin and PP_PATH folders):"}
     table, unreadable = alias_table(cmds)
     named = sorted((n, argv) for n, (argv, why) in table.items() if not why)
     for origin in ORIGINS:

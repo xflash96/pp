@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+`pp`: a program named `pp-NAME` on your `PATH` is no longer a command.
+
+- pp looks for such a program in `~/.config/pp/commands/`, in each plugin
+  and in each `PP_PATH` folder, and reads no `PATH` for one. Other software
+  installs programs named `pp-*`, and one of those took a command's name or
+  a unique prefix of it (`pp q`) and showed in `pp -h`. A program of yours
+  stays a command by moving it into `~/.config/pp/commands/`, or by listing
+  the folder it is in in `PP_PATH`.
+- Every Python command is still found before any such program, and the
+  programs in that folder order, so nothing pp found in those folders
+  moves.
+
 `pp queue`: the card reading and the calling session are named by you, with
 nvidia-smi and the process pp runs under as the defaults.
 

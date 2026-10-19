@@ -382,6 +382,11 @@ class Journey(unittest.TestCase):
         """A fake executable on the sandbox's PATH (nvidia-smi, ...)."""
         return self.write(f"bin/{name}", "#!/bin/sh\n" + script, 0o755)
 
+    def prog(self, name: str, script: str) -> str:
+        """A pp-NAME program in the sandbox's own command folder, which is where pp looks for one. Its PATH is
+        not read for them, so `tool` makes no command."""
+        return self.write(f"{self.env['PP_CONFIG_DIR']}/commands/{name}", "#!/bin/sh\n" + script, 0o755)
+
     def gpus(self, *cards: tuple[int, int]) -> None:
         """Fake nvidia-smi: one (total_gb, used_gb) per card."""
         rows = "\n".join(f"{i}, Fake GPU, {t * 1024}, {u * 1024}, 0" for i, (t, u) in enumerate(cards))
