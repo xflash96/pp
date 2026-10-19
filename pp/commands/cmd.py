@@ -680,7 +680,8 @@ def _own_flags(argv: list[str]) -> tuple[list[str], list[str]]:
 def cmd_alias(argv: list[str]) -> int:
     ap = ui.parser("cmd alias", "Name a command whatever you like, on this machine.",
                    usage="pp cmd alias [-n] [NAME [[--] CMD [ARGS...] | --rm]]  (bare: the listing, --json for "
-                         "data; -n anywhere is a dry run, and a CMD holding one of these flags goes after --)")
+                         "data)\n       -n, --rm and --json count wherever they stand; a CMD holding one of "
+                         "them goes after the --")
     ap.add_argument("name", nargs="?", help="the name to give; without one, every alias is listed")
     ap.add_argument("--rm", action="store_true", help="take this name back")
     ap.add_argument("--json", action="store_true", help="the listing as data")
