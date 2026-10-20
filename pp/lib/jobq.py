@@ -1005,7 +1005,8 @@ def public(j: dict) -> dict:
     A stop's `timeout` is set on the one a worker wrote because the job's own time ran out, and on no other,
     so what a stop is never rests on the name of whoever asked. `going` is when pp began sending it, recorded
     before anything went out, so an exit code the attempt wrote after it is late against it and is that stop's
-    outcome (`jobpolicy.went`). `sent` and `kill9` are when each signal went out, read just before it did.
+    outcome (`jobpolicy.went`). A stop pp was refused before anything went out counts as never begun, whatever
+    its `going` says. `sent` and `kill9` are when each signal went out, read just before it did.
     `denied` is when pp was refused the job's process group. A stop with `denied` set is not in flight:
     nothing more goes out for it, and the job runs on until it ends on its own. `was` is who asked for the
     stop this one landed on, where a kill landed on a timeout's."""

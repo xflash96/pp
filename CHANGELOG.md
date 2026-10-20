@@ -11,11 +11,13 @@
   in the same window now ends as a timeout.
 - A stop gains `going` in `show --json` and `status --json`: when pp began
   sending it, recorded before anything goes out. An exit code the attempt
-  wrote after that time is the stop's outcome, with the code kept. A job that
-  ends on its own just as its worker dies before sending is recorded the
-  same way.
+  wrote after that time is the stop's outcome, with the code kept, unless pp
+  was refused the stop. A job that ends on its own just as its worker dies
+  before sending is recorded the same way.
 - `show` says "sending began" for a stop pp began sending and has nothing
   marked sent for. A stop pp was refused still says "nothing signalled".
+- `kill` reports a job that ended in that window as killed, "ended as its
+  stop was being sent", instead of saying the job had already ended.
 
 ## v0.2.1
 

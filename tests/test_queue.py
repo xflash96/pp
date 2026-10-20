@@ -3093,21 +3093,22 @@ class TestTwoAtOnce(QueueCase):
         self.assertIsNone(rec.get("reason"))        # the code it wrote itself, not a kill's
         self.assertIsNone(rec.get("history"))       # and no second attempt of a job a kill has touched
 
-    def test_a_stop_whose_worker_died_before_it_recorded_the_signal_is_not_retried(self):
-        """A worker killed between signalling a job's group and recording that it did leaves a stop with
-        nothing marked on it and a run that is over. The next worker ends the job there: a stop is never
-        retried, however little of it was recorded.
+    def test_a_kill_whose_run_ended_before_any_send_is_not_retried(self):
+        """A kill's stop lands, and the run ends before any worker began sending it: something else ended the
+        group. The next worker ends the job there, and a job a kill has touched is never retried, however
+        little of its stop was carried out.
 
-        What the record says went out is all the decision has, and it says nothing did, so the job is
-        recorded as its own run ended rather than as a kill pp carried out."""
+        No worker recorded a `going` for that stop, so the job is recorded as its own run ended (`lost`)
+        rather than as a kill pp carried out. A worker that dies after it began sending is the other case
+        (test_a_kill_whose_worker_died_before_marking_its_signal_is_still_a_kill)."""
         j = self.add("--retries", "3", cmd="sleep 30")
         w = jobq.worker_for("default")
         w.tick()
         with jobstore.txn() as s:
             cur = s.job(j, must_be=("running",))
-            cur["stop"] = {"by": "user", "t": time.time(), "grace": 10.0}   # written; nothing recorded yet
+            cur["stop"] = {"by": "user", "t": time.time(), "grace": 10.0}   # asked; no worker began sending it
             s.save(cur)
-        proc.signal_group(jobcore._group_handle(cur), signal.SIGKILL)          # the signal went out ...
+        proc.signal_group(jobcore._group_handle(cur), signal.SIGKILL)          # something else ends the run ...
         journey.until(lambda: jobq.lock.Claim.holder(jobstore.run_claim("default", j)) is None, timeout=10,
                       what="the job's run to be over")
         jobq.worker_for("default").carry_out()                                       # ... and the next worker reaps it
@@ -5526,6 +5527,8 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         self.assertEqual(self.a_worker_killed_at("the signal of the group"), [f"sent {int(signal.SIGTERM)} alive"])
         stop = jobstore.find(j)["stop"]
         self.assertEqual((stop.get("sent"), stop.get("going") is not None), (None, True))
+        self.assertIn("going", jobq.public.__doc__)     # it is named where the stop's fields are, and is there
+        self.assertEqual(json.loads(self.call("show", str(j), "--json")[1])["stop"]["going"], stop["going"])
         self.the_run_is_over(j)
         w.carry_out()
         rec = jobstore.find(j)

@@ -129,8 +129,8 @@ def attempt_of(job: dict, rc: int | None, reason: str | None, ended: float) -> d
 def facts(held: bool, code: int | None = None, rc: int | None = None, rc_at: float | None = None,
           now: float = 0.0, hit: bool = False) -> Facts:
     """The facts about one running job, from the readings the core took: whether a run of it is live, the exit
-    code it wrote and when, the status of a child this worker holds, the time those were read at, and whether
-    --retry-if matched the tail of its log.
+    code it wrote and when, the status of a child this worker holds, and whether --retry-if matched the tail of
+    its log. `now` is the decision's clock, which the core puts on inside the decision's transaction (`Facts`).
 
     While the run is live none of the rest counts for anything, since the command itself can write the exit
     code file, so those facts are dropped here rather than read by the decision. A child's status below zero
