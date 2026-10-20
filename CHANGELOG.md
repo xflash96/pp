@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.2.2
+
+`pp queue` records a kill as a kill when the worker sending it dies before
+it records the send. Such a job no longer ends as its own failure, and its
+`on_fail` hook does not run. A stop's new `going` field says when pp began
+sending it.
 
 `pp queue`: a kill whose worker dies while sending it is still a kill.
 

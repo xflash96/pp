@@ -1,4 +1,4 @@
 """pp: a CLI kit for user & agents. One file per subcommand, discovered at runtime."""
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 TAGLINE = "a CLI kit for user & agents"      # pp -h's header; README and pyproject say it too (tests/test_cli.py)
