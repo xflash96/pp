@@ -5005,46 +5005,6 @@ class TestWatchEvents(unittest.TestCase):
 # process holds, a reader of the store beside a writer of it. The processes the tests need come first, each a
 # program of a few lines, then the scope they share (InjectedCase), then the tests.
 
-
-# ---- one test per mechanism invariant, by fault injection -------------------------------------------
-#
-# What follows is one test per invariant the mechanism keeps, each by a fault at a named step: a worker that
-# ends where a SIGKILL would end it, two processes that act at once, a record naming a process id another
-# process holds, a reader of the store beside a writer of it. The processes the tests need come first, each a
-# program of a few lines, then the scope they share (InjectedCase), then the tests.
-
-
-# ---- one test per mechanism invariant, by fault injection -------------------------------------------
-#
-# What follows is one test per invariant the mechanism keeps, each by a fault at a named step: a worker that
-# ends where a SIGKILL would end it, two processes that act at once, a record naming a process id another
-# process holds, a reader of the store beside a writer of it. The processes the tests need come first, each a
-# program of a few lines, then the scope they share (InjectedCase), then the tests.
-
-
-# ---- one test per mechanism invariant, by fault injection -------------------------------------------
-#
-# What follows is one test per invariant the mechanism keeps, each by a fault at a named step: a worker that
-# ends where a SIGKILL would end it, two processes that act at once, a record naming a process id another
-# process holds, a reader of the store beside a writer of it. The processes the tests need come first, each a
-# program of a few lines, then the scope they share (InjectedCase), then the tests.
-
-
-# ---- one test per mechanism invariant, by fault injection -------------------------------------------
-#
-# What follows is one test per invariant the mechanism keeps, each by a fault at a named step: a worker that
-# ends where a SIGKILL would end it, two processes that act at once, a record naming a process id another
-# process holds, a reader of the store beside a writer of it. The processes the tests need come first, each a
-# program of a few lines, then the scope they share (InjectedCase), then the tests.
-
-
-# ---- one test per mechanism invariant, by fault injection -------------------------------------------
-#
-# What follows is one test per invariant the mechanism keeps, each by a fault at a named step: a worker that
-# ends where a SIGKILL would end it, two processes that act at once, a record naming a process id another
-# process holds, a reader of the store beside a writer of it. The processes the tests need come first, each a
-# program of a few lines, then the scope they share (InjectedCase), then the tests.
-
 AT_THE_STEP = 97        # the exit status of a worker of a test's own that ended at the step it was given
 
 # A worker of one queue, in a process of its own, which ends with os._exit at a named step of pp's. That is
