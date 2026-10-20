@@ -269,14 +269,16 @@ PP_QUEUE_RCFILE itself: what is done about such a job is what its stop asks for.
 One run of a job carries one stop: a kill's ask on a timeout's makes it a kill, a second ask keeps what has gone out
 and only shortens the grace, a refused stop is asked for again, and `show` and --json say whose stop it is, what has
 gone out for it, its command's exit code where it had one, and whether pp was refused. A stop begins going out when
-the worker records its `going` time, before it sends anything. A stop pp was refused before anything went out counts
-as one it never began sending. A worker that dies before recording what it sent leaves that time, so the next worker
-counts the stop as gone out and sends it again while the run is live. Where a job's work is reached by the project's
-stop command, that command goes out in place of the SIGTERM, and `stop.rc: null` means pp has not seen it end, not
-that it worked. Anything left in the job's group when its run is over goes with it, and a run that ended with no
-exit code of its own, or that a stop was asked of, runs that stop command once more, so nothing the runner started
-outlives its attempt. Nobody asked for that last run, so its output goes where the worker's own lines go (its log,
-or the output of a `pp queue work`), and the job's log holds the job and the stops asked of it.
+the worker records its `going` time, before it sends anything. pp tells whether an exit code came before that time by
+the clock the system stamps files with, which moves in ticks of 1 to 10 ms. An exit code written in the same tick as
+`going` counts as written after it. A stop pp was refused before anything went out counts as one it never began
+sending. A worker that dies before recording what it sent leaves that time, so the next worker counts the stop as
+gone out and sends it again while the run is live. Where a job's work is reached by the project's stop command, that
+command goes out in place of the SIGTERM, and `stop.rc: null` means pp has not seen it end, not that it worked.
+Anything left in the job's group when its run is over goes with it, and a run that ended with no exit code of its
+own, or that a stop was asked of, runs that stop command once more, so nothing the runner started outlives its
+attempt. Nobody asked for that last run, so its output goes where the worker's own lines go (its log, or the output
+of a `pp queue work`), and the job's log holds the job and the stops asked of it.
 
 Workers, and after a reboot
     One worker per queue starts what fits, reaps what ended, carries out stops, re-queues retries and fires hooks.

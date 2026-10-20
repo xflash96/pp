@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+`pp queue`: a stop command that ends its job at once is still that stop's
+outcome.
+
+- pp read a stop's time from a finer clock than the one the system stamps
+  an exit code's file with. That clock moves in ticks of 1 to 10 ms, so a
+  code written within one tick after a stop began going out could read as
+  written before it. Such a job was recorded as its own failure, exit code
+  137, and its `on_fail` hook ran. A timeout's stop in that window was
+  recorded as the job's own failure instead of a timeout.
+- A stop's `going`, `sent` and `kill9` are now read from the clock the
+  system stamps files with. An exit code written in the same tick as
+  `going` counts as written after it, and its code is kept.
+
 ## v0.2.2
 
 `pp queue` records a kill as a kill when the worker sending it dies before

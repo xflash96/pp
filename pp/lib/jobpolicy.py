@@ -55,7 +55,9 @@ class Facts:
     sig     the signal the attempt's process died of, where this worker started it and so holds the child.
     now     the time the decision is made at, which is the only clock the decision has. The core reads it
             inside the decision's transaction (`Worker._step`), after the rest, since a stop's `going` is this
-            time: an exit code the attempt wrote before it is the job's own, however stale the rest is.
+            time: an exit code the attempt wrote before it is the job's own, however stale the rest is. It is
+            on the clock a file is stamped from, as `rc_at` is, so a code written after it is never stamped
+            before it, and one written in the same tick of that clock can be stamped the same.
     hit     whether --retry-if matches the tail of this attempt's log (`tail_hit`), matched where the facts
             were read: a pattern of the caller's own takes as long as it likes over a tail, and the decision
             runs inside the store's transaction (I12).
@@ -250,7 +252,9 @@ def went(stop: dict) -> float | None:
 
 
 def after(stop: dict, rc_at: float | None) -> bool:
-    """Whether the attempt wrote its exit code after this stop began going out (`went`).
+    """Whether the attempt's exit code is stamped no earlier than this stop began going out (`went`). Both times
+    are on the clock a file is stamped from, so a code written after that is, and one written in the same tick of
+    that clock counts as after it.
 
     A stop decides the reason: a container runner writes the code of a container the stop command ended (137),
     so without this a kill or a timeout of a container job would read as the job's own failure. The code is

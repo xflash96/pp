@@ -5,7 +5,8 @@
     data    ~/.local/share/pp   PP_DATA_DIR     releases made by `pp promote`, plugins added by `pp cmd add`
 
 `json_txn` is the read-modify-write a JSON record goes through; its docstring is the contract. `write_json` and
-`write_text` replace a whole file in one step, and `staging` hands out a name no other writer picks.
+`write_text` replace a whole file in one step, and `staging` hands out a name no other writer picks. `file_now`
+and `stamp` are one clock: the time now and a file's time, as the file system keeps them.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import secrets
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 
 from pp.lib.lock import locked
@@ -111,6 +113,23 @@ def write_text(path: str, s: str, mode: int | None = None) -> None:
     with _replacing(path) as f:
         os.fchmod(f.fileno(), mode)
         f.write(s)
+
+
+# CLOCK_REALTIME_COARSE, which no Python pp runs on names: the clock Linux stamps a file's times from
+FILE_CLOCK = 5
+
+
+def file_now() -> float:
+    """Now, by the clock a file's times are stamped from. A file written after this read is stamped no earlier
+    than it, which time.time() does not give: that runs ahead of the stamp by up to one tick of the kernel's
+    clock, 1 to 10 ms. So a time read here and a file's `stamp` say which came first, and in the same tick the
+    two can be equal. Whole nanoseconds over 1e9, as `stamp` reads them, so equal times compare equal."""
+    return time.clock_gettime_ns(FILE_CLOCK) / 1e9
+
+
+def stamp(fd: int) -> float:
+    """When the open file fd was last written, on the clock `file_now` reads."""
+    return os.fstat(fd).st_mtime_ns / 1e9
 
 
 _counter = itertools.count(1)       # the number in a staging name; one process hands each out once

@@ -75,14 +75,15 @@ def ended_on_its_own(job: dict) -> tuple[int, float] | None:
 
     The job's own wrapper writes it, under the name the record names, after the command has returned and before
     the wrapper exits. So a code means the command ran to its end, whatever else was on its way, and its time
-    is when the job really ended, however late a worker reaps it. A signal that ends the wrapper leaves no code.
+    is when the job really ended, however late a worker reaps it: the file's stamp, on the clock a stop's times
+    are read from (`paths.file_now`). A signal that ends the wrapper leaves no code.
     Both come from one open file, so the code and its time are the same attempt's."""
     path = job.get("rcfile")
     if not path:
         return None
     try:
         with open(path) as f:
-            return int(f.read().strip()), os.fstat(f.fileno()).st_mtime
+            return int(f.read().strip()), paths.stamp(f.fileno())
     except (OSError, ValueError):
         return None
 
@@ -250,13 +251,14 @@ class Worker:
         The decision is made inside the transaction, on the record the store holds and the facts read before
         it: a stop another actor wrote since those facts were read is part of it, so a job a kill has touched
         is never retried past its stop. Its clock is read in there too, after the facts, since that is the
-        time a stop's `going` records: a code the job wrote while its stale facts said it ran is its own."""
+        time a stop's `going` records: a code the job wrote while its stale facts said it ran is its own. That
+        clock is the one a file is stamped from, so a code written after `going` is never stamped before it."""
         jid = j["id"]
         with jobstore.txn() as s:
             cur = s.job(jid, must_be=("running",))
             if cur is None:
                 return policy.Action(policy.NOTHING)      # nothing else records a running job: there is nothing to record
-            a = policy.decide(cur, replace(facts, now=time.time()))
+            a = policy.decide(cur, replace(facts, now=paths.file_now()))
             was = dict(cur)     # this attempt's own names, which a requeue below takes off the record
             if a.sweep:
                 # the leader of this job's group is gone and its run is over, so anything left in that group
@@ -302,7 +304,7 @@ class Worker:
         and nothing where pp's own signal went. So a reader of the record says what went out for that stop
         rather than reading the job's configured command, which a command that could not start never ran."""
         sig, mark = (signal.SIGTERM, "sent") if a.do == policy.TERM else (signal.SIGKILL, "kill9")
-        now = time.time()       # before anything goes out for this stop, and recorded once it has
+        now = paths.file_now()      # before anything goes out for this stop, and recorded once it has
         # the project's command in place of the SIGTERM, where the job carries one. pp's own grace and SIGKILL
         # follow it either way, and a command that could not start sent nothing: pp's own signal goes out for
         # that stop instead, so the job is left no worse off than 0.1.1

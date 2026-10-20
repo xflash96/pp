@@ -54,6 +54,28 @@ class TestWriteJson(unittest.TestCase):
             self.assertEqual(os.listdir(t), ["x.json"])
 
 
+class TestFileClock(unittest.TestCase):
+    def test_a_file_written_after_a_read_is_never_stamped_before_it(self):
+        """file_now and stamp are one clock: a file written after a read of file_now is stamped no earlier than
+        that read. The queue's worker tells a stop's exit code from the job's own by this. A read of
+        time.time() runs up to a tick of the kernel's clock ahead of the stamp, so on it nearly every file
+        written at once after the read is stamped before it."""
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "rc")
+            early = []
+            for _ in range(2000):
+                now = paths.file_now()
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+                try:
+                    os.write(fd, b"137\n")
+                    at = paths.stamp(fd)
+                finally:
+                    os.close(fd)
+                if at < now:
+                    early.append(now - at)
+            self.assertEqual(early, [], f"{len(early)} of 2000 files were stamped before the read")
+
+
 class TestWriteText(unittest.TestCase):
     def test_a_rewritten_file_keeps_its_mode_and_a_new_one_is_0644(self):
         with tempfile.TemporaryDirectory() as t:

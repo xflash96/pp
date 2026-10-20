@@ -5563,7 +5563,8 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         """The time a stop began going out is read inside the decision's transaction, never with the facts
         before it. A job that ends on its own after its facts were read and before that transaction is sent
         its stop on facts that say it runs. It still ends with its own outcome and fires the hook that outcome
-        owes, since its code was written before the stop's `going`.
+        owes, since its code was written in a tick of the clock before the one the stop's `going` was read in.
+        A code written in that same tick counts as the stop's, so the test waits that tick out.
 
         The window is driven by a named step, the reading of the facts, so the test says which window it is
         about instead of hoping a sleep lands in it."""
@@ -5576,6 +5577,8 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
             self.assertTrue(facts.held)
             self.open_the_gate()
             self.the_run_is_over(j)
+            at = jobcore.ended_on_its_own(jobstore.find(j))[1]
+            journey.until(lambda: jobcore.paths.file_now() > at, what="the tick after the job's own code")
             return facts
         self.a_kill_asks(j, grace=10.0)
         with mock.patch.object(jobcore.Worker, "_facts", the_job_ends_once_its_facts_are_read):
@@ -5588,6 +5591,32 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec.get("reason"), rec["rc"]), ("done", None, 0))
         self.assertEqual([h["event"] for h in rec.get("hooks") or []], ["done"])
+
+    def test_a_stops_times_and_its_codes_are_on_the_clock_a_file_is_stamped_from(self):
+        """A code the attempt wrote after its stop began going out is that stop's outcome, and pp tells which came
+        first by the code's file stamp against the stop's `going`. So `going`, `sent` and the code's time are all
+        read on the clock a file is stamped from (`paths.file_now`, `paths.stamp`). time.time() runs up to a tick
+        of the kernel's clock ahead of a stamp, so a stop command that ended the job within that tick would read
+        as the job's own end, and its on_fail would fire.
+
+        That clock is held still here, so the test names the times it expects instead of reading them: a code
+        stamped in the same tick as `going` is the stop's, with its code kept."""
+        j, w = self.a_job_whose_run_is_live()
+        self.a_kill_asks(j, grace=10.0)
+        went = self.recording()
+        t = jobcore.paths.file_now()
+        with mock.patch.object(jobcore.paths, "file_now", return_value=t), \
+                mock.patch.object(jobcore.paths, "stamp", return_value=t):
+            w.carry_out()                               # the SIGTERM, recorded and never sent
+            stop = jobstore.find(j)["stop"]
+            self.assertEqual(went, [signal.SIGTERM])
+            self.assertEqual((stop["going"], stop["sent"]), (t, t))
+            self.open_the_gate()
+            self.the_run_is_over(j)
+            self.assertEqual(jobcore.ended_on_its_own(jobstore.find(j)), (0, t))
+            w.carry_out()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec.get("reason"), rec["rc"]), ("failed", "killed", 0))
 
     def test_a_grace_that_is_up_escalates_once_and_only_once(self):
         """The SIGKILL of a stop whose grace is up goes out once. A worker that ends between the grace being

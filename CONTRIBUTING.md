@@ -375,7 +375,11 @@ going out is that stop's outcome, with the code kept, since a container runner
 writes the code of a container the stop command ended. And that moment is the
 stop's `going`, which the decision's transaction records with its own clock
 before anything goes out: a worker can die between a signal and its record,
-and a job can end between its facts and its decision.
+and a job can end between its facts and its decision. That clock is the one
+the system stamps a file with (`paths.file_now`), so an exit code written
+after `going` is never stamped before it. `time.time()` runs up to a tick of
+the kernel's clock ahead of a file's stamp, and with it a code written just
+after `going` would read as written before.
 
 `TestTheDecision` in `tests/test_queue.py` is a table over every combination
 of those facts. Each row carries the rule from that help as its own label,
