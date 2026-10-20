@@ -35,6 +35,7 @@ import signal
 import time
 import traceback
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from datetime import datetime
 
 from pp.lib import config, jobpolicy as policy, jobstore, lock, paths, proc, session
@@ -203,14 +204,13 @@ class Worker:
         A timeout, a kill and a reap are not three passes over the queue with three views of a job. They are
         facts about one job and one decision made from all of them, so no part of it can be wrong about what
         another part did."""
-        now = time.time()
         with jobstore.listing() as s:    # one pass: the jobs to decide about, and the hooks the queue still owes
             jobs = list(s.jobs(("running",) + jobstore.ENDED, self.queue))
         owed = [j for j in jobs if j["state"] in jobstore.ENDED and j.get("hook_due")]
         # while a stop is in flight, and a verb is waking this worker for it, the loop's wait is STOP_PERIOD
         # and not the poll (work()); `policy.in_flight` is what one of them is, over the record this pass
         # listed and the action it came to
-        self.serving = sum(policy.in_flight(j, self._step(j, self._facts(j, now)))
+        self.serving = sum(policy.in_flight(j, self._step(j, self._facts(j)))
                            for j in jobs if j["state"] == "running")
         for j in owed:
             self.fire(j, j["hook_due"])     # owed by a worker that did not get to fire it
@@ -220,7 +220,7 @@ class Worker:
             if p.poll() is not None and (jobstore.find(jid) or {}).get("state") != "running":
                 del self.children[jid]
 
-    def _facts(self, j: dict, now: float) -> policy.Facts:
+    def _facts(self, j: dict) -> policy.Facts:
         """What is true of this running job besides its record, all of it read here and nothing decided:
         whether a run of it is live, the exit code that run wrote and when, the signal its own child died of,
         and whether --retry-if matches the tail of its log.
@@ -236,10 +236,10 @@ class Worker:
             # them, before its parent can read how it ended.
             if held is not None:
                 self._adopt(j, held)
-            return policy.facts(True, now=now)
+            return policy.facts(True)
         self.children.pop(j["id"], None)
         rc, ended = ended_on_its_own(j) or (None, None)
-        return policy.facts(False, p.poll() if p is not None else None, rc, ended, now=now,
+        return policy.facts(False, p.poll() if p is not None else None, rc, ended,
                             hit=policy.wants_tail(j, rc) and policy.tail_hit(j, self.tail(j, 200)))
 
     def _step(self, j: dict, facts: policy.Facts) -> policy.Action:
@@ -249,20 +249,21 @@ class Worker:
 
         The decision is made inside the transaction, on the record the store holds and the facts read before
         it: a stop another actor wrote since those facts were read is part of it, so a job a kill has touched
-        is never retried past its stop."""
+        is never retried past its stop. Its clock is read in there too, after the facts, since that is the
+        time a stop's `going` records: a code the job wrote while its stale facts said it ran is its own."""
         jid = j["id"]
         with jobstore.txn() as s:
             cur = s.job(jid, must_be=("running",))
             if cur is None:
                 return policy.Action(policy.NOTHING)      # nothing else records a running job: there is nothing to record
-            a = policy.decide(cur, facts)
+            a = policy.decide(cur, replace(facts, now=time.time()))
             was = dict(cur)     # this attempt's own names, which a requeue below takes off the record
             if a.sweep:
                 # the leader of this job's group is gone and its run is over, so anything left in that group
                 # goes too: a command that held the signal back does not outlive the job
                 self._signal_group(cur, signal.SIGKILL)
-            if a.do == policy.TIME_UP:
-                cur["stop"] = {"by": "timeout", "timeout": True, "t": a.t, "grace": a.grace}
+            if a.stop:          # a timeout's stop, or the time a stop began going out, before anything does
+                cur["stop"] = a.stop
                 s.save(cur)
             elif a.do == policy.AGAIN:
                 jobstore._requeue(s, cur, a)
@@ -292,10 +293,10 @@ class Worker:
         job's processes, so a kill, a timeout and a reap never cross.
 
         The signal goes out first and is recorded after, so a record that says a signal went out is one that
-        did, which is all the decision about this job has to go on. The time recorded with it is read before
-        it goes out, because that time is what an exit code is late against (I10): a code the attempt wrote
-        while this stop was on its way out is that stop's outcome, and a time read afterwards would leave the
-        window the stop command takes to start reading as the job's own end.
+        did. What an exit code is late against (I10) is the stop's `going`, which the decision's transaction
+        recorded before this was called, so a worker that dies between the signal and its record leaves a stop
+        the next decision still counts as gone out. The time recorded here is read before the signal goes out
+        too, and the grace runs from it.
 
         Which of the two went out is recorded with it, as `cmd`: the command where the project's one started,
         and nothing where pp's own signal went. So a reader of the record says what went out for that stop

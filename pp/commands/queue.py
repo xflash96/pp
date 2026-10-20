@@ -256,25 +256,27 @@ PP_QUEUE_RCFILE itself: what is done about such a job is what its stop asks for.
     Once the run is over the exit code the attempt wrote is the command's last word, and the job ends here. A stop
     someone asked for is never retried.
 
-    A job a kill's signal stopped is recorded "killed" and fires no hook; an exit code the attempt wrote after that
-    signal went out is kept as the attempt's code.
-    A job that wrote its own exit code before a kill's signal went out, or that a kill wrote a stop for that no signal
-    of pp's ever reached, ends with its own outcome, the exit code it wrote or the signal it died of, and fires the
-    hook that outcome owes.
+    A job still running when a kill's stop began going out is recorded "killed" and fires no hook; an exit code the
+    attempt wrote after that is kept as the attempt's code.
+    A job that wrote its own exit code before a kill's stop began going out, or whose kill pp never began sending,
+    ends with its own outcome, the exit code it wrote or the signal it died of, and fires the hook that outcome owes.
     An exit code of 0 is done, and on_done fires.
-    A timeout's stop pp signalled or was refused is a timeout, which may be retried; an exit code the attempt wrote
-    after that stop went out is kept as the attempt's code, and on a final timeout on_fail fires.
+    A timeout's stop pp began sending or was refused is a timeout, which may be retried; an exit code the attempt
+    wrote after that stop began going out is kept as the attempt's code, and on a final timeout on_fail fires.
     Anything else is the job's own failure, the exit code it wrote or the signal it died of, retried while an attempt
     is left and --retry-if matches it, and on_fail fires on the last.
 
 One run of a job carries one stop: a kill's ask on a timeout's makes it a kill, a second ask keeps what has gone out
 and only shortens the grace, a refused stop is asked for again, and `show` and --json say whose stop it is, what has
-gone out for it, its command's exit code where it had one, and whether pp was refused. Where a job's work is reached
-by the project's stop command, that command goes out in place of the SIGTERM, and `stop.rc: null` means pp has not
-seen it end, not that it worked. Anything left in the job's group when its run is over goes with it, and a run that
-ended with no exit code of its own, or that a stop was asked of, runs that stop command once more, so nothing the
-runner started outlives its attempt. Nobody asked for that last run, so its output goes where the worker's own lines
-go (its log, or the output of a `pp queue work`), and the job's log holds the job and the stops asked of it.
+gone out for it, its command's exit code where it had one, and whether pp was refused. A stop begins going out when
+the worker records its `going` time, before it sends anything. A worker that dies before recording what it sent
+leaves that time, so the next worker counts the stop as gone out and sends it again while the run is live. Where a
+job's work is reached by the project's stop command, that command goes out in place of the SIGTERM, and
+`stop.rc: null` means pp has not seen it end, not that it worked. Anything left in the job's group when its run is
+over goes with it, and a run that ended with no exit code of its own, or that a stop was asked of, runs that stop
+command once more, so nothing the runner started outlives its attempt. Nobody asked for that last run, so its output
+goes where the worker's own lines go (its log, or the output of a `pp queue work`), and the job's log holds the job
+and the stops asked of it.
 
 Workers, and after a reboot
     One worker per queue starts what fits, reaps what ended, carries out stops, re-queues retries and fires hooks.
@@ -331,7 +333,7 @@ Agents
     runner (each an argv), stop_cmd ("group", or the command that reaches what the runner started), prio, needs,
     cards, after, grace, timeout, retries, attempt, rc, reason, not_retried, added, started, ended, seconds, log,
     log_at, container, envfile, rcfile, owner, history (one entry per attempt that ended, with its own files and
-    cards), notes, reported, hooks, stop (by, t, grace, timeout, sent, kill9, denied, was, cmd, rc), env and
+    cards), notes, reported, hooks, stop (by, t, grace, timeout, going, sent, kill9, denied, was, cmd, rc), env and
     shell_env (their names, every value ***). Each is on a job in every state, null or empty where the record holds
     none yet, but `after` only on a job that names what it waits for and `stop` only on one asked to stop. A field is
     added and never renamed or retyped inside a minor version.

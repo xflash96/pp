@@ -993,9 +993,9 @@ def public(j: dict) -> dict:
     attempt's own output begins), cards (the card indices it reserved), container (the name whatever its
     runner started elsewhere carries), envfile (the file that runner reads its environment from),
     notes [{t, by, text}], reported [{t, by, session}], history (one entry per attempt that ended, each with
-    that attempt's own rcfile, envfile, container, log_at and cards), stop {by, t, grace, timeout, sent,
-    kill9, denied, was, cmd, rc} on a job asked to stop, after [id] on a job that names the jobs it waits
-    for, and from `show` also jobcore.watchers [{pid, verb, session}].
+    that attempt's own rcfile, envfile, container, log_at and cards), stop {by, t, grace, timeout, going,
+    sent, kill9, denied, was, cmd, rc} on a job asked to stop, after [id] on a job that names the jobs it
+    waits for, and from `show` also jobcore.watchers [{pid, verb, session}].
 
     `env` and `shell_env` keep their keys and give every value as "***". A token or a secret is what the help
     says to pass with --env, and an agent reads `--json` to see how its jobs are getting on, so the values
@@ -1003,11 +1003,12 @@ def public(j: dict) -> dict:
     disk, which is the job's own, holds what the job runs with.
 
     A stop's `timeout` is set on the one a worker wrote because the job's own time ran out, and on no other,
-    so what a stop is never rests on the name of whoever asked. `sent` and `kill9` are when each signal went
-    out, read just before it did, so an exit code the attempt wrote while that stop was going out is late
-    against it and is that stop's outcome. `denied` is when pp was refused the job's process group. A stop with `denied` set is not in
-    flight: nothing more goes out for it, and the job runs on until it ends on its own. `was` is who asked
-    for the stop this one landed on, where a kill landed on a timeout's."""
+    so what a stop is never rests on the name of whoever asked. `going` is when pp began sending it, recorded
+    before anything went out, so an exit code the attempt wrote after it is late against it and is that stop's
+    outcome (`jobpolicy.went`). `sent` and `kill9` are when each signal went out, read just before it did.
+    `denied` is when pp was refused the job's process group. A stop with `denied` set is not in flight:
+    nothing more goes out for it, and the job runs on until it ends on its own. `was` is who asked for the
+    stop this one landed on, where a kill landed on a timeout's."""
     out = {**NOT_YET, **{k: v for k, v in j.items() if not k.startswith("_")}}
     for k in ("env", "shell_env"):
         if isinstance(out.get(k), dict):
@@ -1456,7 +1457,8 @@ def cmd_show(a) -> int:
                      # what went out for it, off the record: the project's command where that is what went
                      # out, and pp's own signal where it is
                      + ((f", its stop command went out ({_text(st['cmd'])})" if st.get("cmd")
-                         else ", SIGTERM sent") if st.get("sent") else ", nothing signalled")
+                         else ", SIGTERM sent") if st.get("sent")
+                        else ", sending began" if policy.went(st) is not None else ", nothing signalled")
                      + (", SIGKILL sent" if st.get("kill9") else "")
                      + (f", its command exited {st['rc']}" if st.get("rc") is not None else "")
                      # a denied stop is not in flight: say so, or it reads as one still being carried out
@@ -1627,7 +1629,8 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
             q, waited = j["queue"], ui.human_duration(time.time() - started_at)
             went = ("the SIGKILL went out" if stop.get("kill9") else
                     "the project's stop command went out" if stop.get("cmd") else
-                    "the SIGTERM went out" if stop.get("sent") else "no signal of pp's has gone out")
+                    "the SIGTERM went out" if stop.get("sent") else
+                    "sending it began" if policy.went(stop) is not None else "no signal of pp's has gone out")
             said = (f"{_PROG}: job {jid} is still running {waited} after it was asked to stop; {went}. "
                     f"`pp {_PROG} show {jid}` says what went out for it.")
             if jobcore.worker_now(q).up:
@@ -1644,7 +1647,7 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
             continue        # a round of starts took this pass past the deadline: look once more and report
         time.sleep(KILL_POLL)
     stop = cur.get("stop") or {}
-    if not stop.get("sent"):
+    if policy.went(stop) is None:
         print(f"job {jid} had already ended: {_ended_line(cur, jid)}")
     elif not cur.get("reason"):
         # the reason on the record says whose outcome this is: an exit code the attempt wrote after the stop
@@ -1656,8 +1659,10 @@ def _await_stop(j: dict, grace: float, t: float) -> int:
         # and what went out for it, off the record and not off the command the job carries: a command that
         # could not start ran nothing, and pp's own signal went out for that stop instead
         went = ("the project's stop command" if stop.get("cmd") else "SIGTERM")
+        # a stop with nothing marked sent is one whose worker ended while sending it, or whose send found the
+        # run already gone: the record cannot say what went out
         how = (f"SIGKILL after {float(stop.get('grace') or 0):g}s" if stop.get("kill9")
-               else f"stopped on {went}")
+               else f"stopped on {went}" if stop.get("sent") else "ended as its stop was being sent")
         # a stop command that failed is said with its code: pp will not report a stop it did not achieve
         said = "" if not stop.get("rc") else f"; the project's stop command failed (exit {stop['rc']})"
         print(f"killed {jid} ({how}){said}  {_name(cur)}")

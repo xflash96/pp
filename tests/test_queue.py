@@ -3477,8 +3477,10 @@ class TestTheWorkersWait(QueueCase):
         self.assertEqual(self.state(j), "running")
 
 
-# what has gone out for a stop, and whether pp was refused it: every state `_send` can leave one in
-SENT = ("unsent", "sent", "sent-kill9", "denied", "sent-denied")
+# what has gone out for a stop, and whether pp was refused it: every state `_send` can leave one in, with the
+# `going` the decision's transaction records before it and without it, as a record an older worker wrote is
+SENT = tuple(f"{going}{out}" for going in ("", "going-")
+             for out in ("unsent", "sent", "sent-kill9", "denied", "sent-denied"))
 # and the stop states a record can hold: who asked crossed with those, and no stop at all
 STOPS = ("none",) + tuple(f"{by}-{out}" for by in ("kill", "timeout") for out in SENT)
 
@@ -3488,23 +3490,24 @@ class TestTheDecision(unittest.TestCase):
     the one place that says what a second stop on it comes to. Both are pure, so this table needs no process,
     no thread and no clock.
 
-    Every combination of the facts is a row: the run's claim held or free, no exit code or one that is 0 or
-    not (written while the run was live, or after it), the eleven states a stop on the record can be in (who
-    asked for it crossed with what has gone out for it, and no stop), the grace up or not, the attempt number
-    (its first, and one far enough along that the delay would pass RETRY_DELAY_CAP), attempts left or none,
-    the job's time up or not, a signal its child died of or none, and a --retry-if that matches or one that
-    cannot. Each row's expected action is written once below, against the rule `pp help queue` states it as,
-    in the order that help states them; a row no rule holds for is a failure, so a new fact or a new action
-    cannot go in without saying what it means everywhere.
+    Every combination of the facts is a row: the run's claim held or free, no exit code or one that is 0 or not
+    (written while the run was live, or after it), the twenty-one states a stop on the record can be in (who asked
+    for it crossed with whether pp began sending it and what has gone out for it, and no stop), the grace up or not,
+    the attempt number (its first, and one far enough along that the delay would pass RETRY_DELAY_CAP), attempts
+    left or none, the job's time up or not, a signal its child died of or none, and a --retry-if that matches or one
+    that cannot. Each row's expected action is written once below, against the rule `pp help queue` states it as, in
+    the order that help states them; a row no rule holds for is a failure, so a new fact or a new action cannot go
+    in without saying what it means everywhere.
 
-    Each rule is written on the facts a stop carries, namely whether a kill asked for it, whether a signal
-    of pp's went out and whether pp was refused, and never on the name of a state, so a state nobody thought
-    of cannot slip past a rule that matched its name."""
+    Each rule is written on the facts a stop carries, namely whether a kill asked for it, whether pp began
+    sending it, what went out for it and whether pp was refused, and never on the name of a state, so a state
+    nobody thought of cannot slip past a rule that matched its name."""
 
     NOW = 2000.0
     GRACE = 10.0
     JOB_GRACE = 7.0         # the job's own, which a timeout's stop takes and no constant of pp's does
     RC_AT = 1990.0          # when the code was written, which is when the job really ended
+    GOING = 1960.0          # when pp began sending a stop that records it: before anything of it went out
     DELAY = 20.0
 
     def stop(self, kind: str, grace_up: bool) -> dict | None:
@@ -3517,6 +3520,8 @@ class TestTheDecision(unittest.TestCase):
         st = {"by": "timeout" if by == "timeout" else "user", "t": self.NOW - 60, "grace": self.GRACE}
         if by == "timeout":
             st["timeout"] = True
+        if "going" in went:
+            st["going"] = self.GOING
         if "sent" in went:
             st["sent"] = self.NOW - (self.GRACE + 5 if grace_up else 1)
         if "kill9" in went:
@@ -3531,12 +3536,14 @@ class TestTheDecision(unittest.TestCase):
         whether a kill asked for it (and not a worker's own timeout), whether a signal of pp's went out, and
         whether pp was refused the job's group."""
         if kind == "none":
-            return {"any": False, "asked": False, "sent": False, "kill9": False, "denied": False, "out": False}
+            return {"any": False, "asked": False, "going": False, "sent": False, "kill9": False,
+                    "denied": False, "out": False}
         by, out = kind.split("-", 1)
         went = out.split("-")           # the field names, so "unsent" is not read as a sent one
-        sent, kill9 = "sent" in went, "kill9" in went
-        return {"any": True, "asked": by != "timeout", "sent": sent, "kill9": kill9,
-                "denied": "denied" in went, "out": sent or kill9}
+        going, sent, kill9, denied = "going" in went, "sent" in went, "kill9" in went, "denied" in went
+        # what went out, or what pp began to send and was not refused: a worker can die between the two
+        return {"any": True, "asked": by != "timeout", "going": going, "sent": sent, "kill9": kill9,
+                "denied": denied, "out": sent or kill9 or (going and not denied)}
 
     # the first attempt, and one far enough along that doubling the delay per attempt would pass the cap
     ATTEMPTS = (1, 20)
@@ -3571,9 +3578,10 @@ class TestTheDecision(unittest.TestCase):
 
     # -- what each row's action is -------------------------------------------------------------------------
     def went(self, r: dict):
-        """When the first thing went out for this row's stop, or None where nothing has."""
+        """When pp began sending this row's stop, or None where nothing has gone out for it: its `going`, and
+        for a record without one the first signal's time."""
         st = self.stop(r["stop"], r["grace_up"]) or {}
-        return st.get("sent") or st.get("kill9")
+        return (st.get("going") or st.get("sent") or st.get("kill9")) if r["out"] else None
 
     def rc_at(self, r: dict):
         """When the attempt wrote its exit code: a second after the first thing went out for its stop, or a
@@ -3582,6 +3590,13 @@ class TestTheDecision(unittest.TestCase):
             return None
         went = self.went(r)
         return self.RC_AT if went is None else (went + 1 if r["late"] else went - 1)
+
+    def term(self, r: dict) -> jobpolicy.Action:
+        """The SIGTERM of a stop nothing is marked sent for. The decision's transaction records `going` on it
+        the first time, and keeps the first one after that, since a stop already begun is sent again."""
+        if r["going"]:
+            return jobpolicy.Action(jobpolicy.TERM)
+        return jobpolicy.Action(jobpolicy.TERM, stop={**self.stop(r["stop"], r["grace_up"]), "going": self.NOW})
 
     def late(self, r: dict) -> bool:
         """Whether the code this attempt wrote came after its stop went out, which an attempt that wrote none
@@ -3638,7 +3653,7 @@ class TestTheDecision(unittest.TestCase):
              lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             ("A stop nobody has signalled yet goes out as SIGTERM to the job's process group.",
              lambda r: r["held"] and r["any"] and not r["sent"],
-             lambda r: jobpolicy.Action(jobpolicy.TERM)),
+             self.term),
             ("A stop whose grace is up is escalated to SIGKILL, once.",
              lambda r: r["held"] and r["sent"] and not r["kill9"] and r["grace_up"],
              lambda r: jobpolicy.Action(jobpolicy.KILL9)),
@@ -3647,27 +3662,28 @@ class TestTheDecision(unittest.TestCase):
              lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             ("A job with no stop whose own timeout has run out gets a timeout's stop.",
              lambda r: r["held"] and not r["any"] and r["due"],
-             lambda r: jobpolicy.Action(jobpolicy.TIME_UP, t=self.NOW, grace=self.JOB_GRACE)),
+             lambda r: jobpolicy.Action(jobpolicy.TIME_UP, stop={"by": "timeout", "timeout": True, "t": self.NOW,
+                                                                  "grace": self.JOB_GRACE})),
             ("A job with no stop whose time is not up is left as it is.",
              lambda r: r["held"] and not r["any"],
              lambda r: jobpolicy.Action(jobpolicy.NOTHING)),
             # its run is over, so its exit code is the command's last word and this is where it ends
-            ('A job a kill\'s signal stopped is recorded "killed" and fires no hook; an exit code the attempt '
-             "wrote after that signal went out is kept as the attempt's code.",
+            ('A job still running when a kill\'s stop began going out is recorded "killed" and fires no hook; '
+             "an exit code the attempt wrote after that is kept as the attempt's code.",
              lambda r: not r["held"] and r["asked"] and r["out"] and self.late(r),
              lambda r: self.ends(r["rc"], "killed", self.rc_at(r), self.sweep(r), None)),
-            ("A job that wrote its own exit code before a kill's signal went out, or that a kill wrote a stop "
-             "for that no signal of pp's ever reached, ends with its own outcome, the exit code it wrote or "
-             "the signal it died of, and fires the hook that outcome owes.",
+            ("A job that wrote its own exit code before a kill's stop began going out, or whose kill pp never "
+             "began sending, ends with its own outcome, the exit code it wrote or the signal it died of, and "
+             "fires the hook that outcome owes.",
              lambda r: not r["held"] and r["asked"],
              lambda r: self.ends(r["rc"], self.own(r), self.rc_at(r), self.sweep(r),
                                  "done" if r["rc"] == 0 else "failed")),
             ("An exit code of 0 is done, and on_done fires.",
              lambda r: not r["held"] and r["rc"] == 0 and not self.late(r),
              lambda r: self.ends(0, None, self.rc_at(r), self.sweep(r), "done")),
-            ("A timeout's stop pp signalled or was refused is a timeout, which may be retried; an exit code "
-             "the attempt wrote after that stop went out is kept as the attempt's code, and on a final "
-             "timeout on_fail fires.",
+            ("A timeout's stop pp began sending or was refused is a timeout, which may be retried; an exit "
+             "code the attempt wrote after that stop began going out is kept as the attempt's code, and on a "
+             "final timeout on_fail fires.",
              lambda r: not r["held"] and self.late(r) and (r["out"] or r["denied"]),
              lambda r: self.failure(r, r["rc"], "timeout", self.rc_at(r), self.sweep(r))),
             ("Anything else is the job's own failure, the exit code it wrote or the signal it died of, "
@@ -3688,7 +3704,7 @@ class TestTheDecision(unittest.TestCase):
             seen.add(what)
             job, facts = self.case(r)
             self.assertEqual(jobpolicy.decide(job, facts), then(r), f"{what}: {r}")
-        self.assertEqual(n, 8448)                               # 2*3*11*2*2*2*2*2*2*2 rows
+        self.assertEqual(n, 16128)                              # 2*3*21*2*2*2*2*2*2*2 rows
         self.assertEqual(seen, {what for what, _w, _t in rules})    # and every rule is a row of its own
         # both sides of the delay's cap are a row here, so neither arm can go quiet under a later constant
         self.assertGreater(self.DELAY * 2 ** (max(self.ATTEMPTS) - 1), jobpolicy.RETRY_DELAY_CAP)
@@ -3780,10 +3796,13 @@ class TestTheDecision(unittest.TestCase):
 
     def test_a_second_stop_merges_into_the_one_on_the_record(self):
         """One stop per run of a job: what went out is all the decision and the waiting verb have to go on, so
-        a second ask keeps `t`, `sent` and `kill9` and only shortens the grace. A kill's ask on a timeout's
-        stop is a kill, so the job is ended as one and never retried."""
-        tout = {"by": "timeout", "timeout": True, "t": 100.0, "grace": 300.0, "sent": 101.0, "kill9": 102.0}
-        out = {"by": "ann", "t": 100.0, "grace": 300.0, "sent": 101.0, "kill9": 102.0}
+        a second ask keeps `t`, `going`, `sent` and `kill9` and only shortens the grace. A kill's ask on a
+        timeout's stop is a kill, so the job is ended as one and never retried. A refused stop is asked for
+        again, and where nothing of it went out it begins going out again, so its `going` goes too."""
+        tout = {"by": "timeout", "timeout": True, "t": 100.0, "grace": 300.0, "going": 100.5, "sent": 101.0,
+                "kill9": 102.0}
+        out = {"by": "ann", "t": 100.0, "grace": 300.0, "going": 100.5, "sent": 101.0, "kill9": 102.0}
+        refused = {"by": "ann", "t": 100.0, "grace": 300.0, "going": 100.5, "denied": 101.0}
         kill = {"by": "ann", "t": 500.0, "grace": 10.0}
         tmo = {"by": "timeout", "timeout": True, "t": 500.0, "grace": 10.0}
         rows = [
@@ -3794,6 +3813,8 @@ class TestTheDecision(unittest.TestCase):
              {**out, "was": "timeout", "grace": 10.0}),
             ("a timeout on a kill's stop changes nothing but the grace", out, tmo, {**out, "grace": 10.0}),
             ("a refused stop is asked for again", {**out, "denied": 103.0}, kill, {**out, "grace": 10.0}),
+            ("a stop refused before anything went out begins going out again", refused, kill,
+             {"by": "ann", "t": 100.0, "grace": 10.0}),
             ("a timeout on a timeout's stop is still the timeout's", tout, tmo, {**tout, "grace": 10.0}),
             ("an asker called timeout asks as a kill, and the stop stops being a timeout's", tout,
              {"by": "timeout", "t": 500.0, "grace": 10.0},
@@ -5369,11 +5390,13 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         stop = jobstore.find(j)["stop"]
         self.assertEqual((stop["t"], stop.get("sent"), stop.get("kill9"), stop.get("denied")),
                          (asked["t"], None, None, None))
+        self.assertIsNotNone(stop["going"])         # the decision's transaction recorded it before the send
         self.assertEqual(self.state(j), "running")
         went = self.recording()
         w.carry_out()
         self.assertEqual(went, [signal.SIGTERM])
         self.assertIsNotNone(jobstore.find(j)["stop"]["sent"])
+        self.assertEqual(jobstore.find(j)["stop"]["going"], stop["going"])     # the time it first began
         for _ in range(3):              # inside the grace it was given, so nothing more goes out for it
             w.carry_out()
         self.assertEqual(went, [signal.SIGTERM])
@@ -5381,7 +5404,8 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
     def test_a_signal_that_went_out_is_recorded_before_anything_else_goes_out(self):
         """What went out for a stop is recorded after it went out, so a record that says a signal went out is
         a record of one that did. A worker that ends between the signal and the record leaves a stop with
-        nothing marked on it, which is the one side of that order a decision can be wrong on."""
+        nothing marked sent on it. The `going` the decision recorded before the signal is still on it, which is
+        what keeps the next decision right about that stop (the two tests after this one)."""
         j, w = self.a_job_whose_run_is_live()
         asked = self.a_kill_asks(j, grace=10.0)
         self.assertEqual(self.a_worker_killed_at("the signal"), [f"sent {int(signal.SIGTERM)}"])
@@ -5447,10 +5471,11 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         self.assertNotIn("cmd", group)
 
     def test_a_code_written_while_the_stop_goes_out_is_that_stops_outcome(self):
-        """A stop decides the reason, and what an exit code is late against is the time that stop went out.
-        That time is read before anything goes out for it, so the window in which the project's stop command
-        is starting belongs to the stop: a container runner writing the code of the container that command
-        ended (137) inside it is that stop's outcome, with the code kept, and not the job's own failure.
+        """A stop decides the reason, and what an exit code is late against is the time that stop began going
+        out, its `going`. That time is recorded before anything goes out for it, so the window in which the
+        project's stop command is starting belongs to the stop: a container runner writing the code of the
+        container that command ended (137) inside it is that stop's outcome, with the code kept, and not the
+        job's own failure.
 
         The window is driven by a named step, the start of the project's stop command, so the test says
         which window it is about instead of hoping a sleep lands in it."""
@@ -5480,6 +5505,7 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         stop = jobstore.find(j)["stop"]
         self.assertEqual(len(wrote), 1)
         self.assertIsNotNone(stop["sent"])
+        self.assertLessEqual(stop["going"], wrote[0])   # recorded before the stop went out
         self.assertLessEqual(stop["sent"], wrote[0])    # read before the stop went out, recorded once it had
         # the run ends with no code of its own, so the code written inside the window is the one that is read
         proc.signal_group(jobcore._group_handle(jobstore.find(j)), signal.SIGKILL)
@@ -5488,6 +5514,77 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["reason"], rec["rc"]), ("failed", "killed", 137))
         self.assertIsNone(rec.get("history"), "a job a kill has touched was retried")
+
+    def test_a_kill_whose_worker_died_before_marking_its_signal_is_still_a_kill(self):
+        """A worker that ends between a kill's SIGTERM and the record of it leaves a stop with nothing marked
+        sent, and the signal ended the job. The `going` the decision recorded before the signal is on that
+        stop, so the next worker ends the job as the kill's: "killed", and no hook (A11), rather than as the
+        signal the job died of with its on_fail."""
+        f = self.hook_file()
+        j, w = self.a_job_whose_run_is_live("--on-fail", f"echo x >> {f}")
+        self.a_kill_asks(j, grace=10.0)
+        self.assertEqual(self.a_worker_killed_at("the signal of the group"), [f"sent {int(signal.SIGTERM)} alive"])
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual((stop.get("sent"), stop.get("going") is not None), (None, True))
+        self.the_run_is_over(j)
+        w.carry_out()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["reason"], rec.get("rc")), ("failed", "killed", None))
+        self.assertNotIn("hook_due", rec)
+        self.assertEqual(rec.get("hooks") or [], [], "a kill fired the job's hook")
+
+    def test_a_kill_whose_worker_died_as_its_stop_command_started_is_still_a_kill(self):
+        """The same window where the project's stop command is what goes out: the worker ends once that command
+        has started, the command ends the work, and the runner writes the code the work got (137). That code
+        came after the stop began going out, so it is the kill's outcome with the code kept, and the job's
+        on_fail does not fire."""
+        f, stopped = self.hook_file(), self.gate("stopped")
+        j, w = self.a_job_whose_run_is_live("--on-fail", f"echo x >> {f}",
+                                            cmd=f"while [ ! -f {stopped} ]; do sleep 0.02; done; exit 137")
+        with jobstore.txn() as s:
+            cur = s.job(j, must_be=("running",))
+            cur["stop_cmd"] = f"touch {stopped}"
+            s.save(cur)
+        self.a_kill_asks(j, grace=10.0)
+        self.a_worker_killed_at("the start")        # the stop command started, and the worker ended
+        stop = jobstore.find(j)["stop"]
+        self.assertEqual((stop.get("sent"), stop.get("going") is not None), (None, True))
+        self.the_run_is_over(j)
+        w.carry_out()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec["reason"], rec["rc"]), ("failed", "killed", 137))
+        self.assertNotIn("hook_due", rec)
+        self.assertEqual(rec.get("hooks") or [], [], "a kill fired the job's hook")
+
+    def test_a_code_written_before_the_decision_is_the_jobs_own(self):
+        """The time a stop began going out is read inside the decision's transaction, never with the facts
+        before it. A job that ends on its own after its facts were read and before that transaction is sent
+        its stop on facts that say it runs. It still ends with its own outcome and fires the hook that outcome
+        owes, since its code was written before the stop's `going`.
+
+        The window is driven by a named step, the reading of the facts, so the test says which window it is
+        about instead of hoping a sleep lands in it."""
+        f = self.hook_file()
+        j, w = self.a_job_whose_run_is_live("--on-done", f"echo x >> {f}")
+        real = jobcore.Worker._facts
+
+        def the_job_ends_once_its_facts_are_read(wk, job):
+            facts = real(wk, job)
+            self.assertTrue(facts.held)
+            self.open_the_gate()
+            self.the_run_is_over(j)
+            return facts
+        self.a_kill_asks(j, grace=10.0)
+        with mock.patch.object(jobcore.Worker, "_facts", the_job_ends_once_its_facts_are_read):
+            w.carry_out()
+        rec = jobstore.find(j)
+        at = jobcore.ended_on_its_own(rec)[1]
+        self.assertEqual(rec["state"], "running")
+        self.assertLess(at, rec["stop"]["going"], "the stop began going out before the job's own end")
+        w.carry_out()
+        rec = jobstore.find(j)
+        self.assertEqual((rec["state"], rec.get("reason"), rec["rc"]), ("done", None, 0))
+        self.assertEqual([h["event"] for h in rec.get("hooks") or []], ["done"])
 
     def test_a_grace_that_is_up_escalates_once_and_only_once(self):
         """The SIGKILL of a stop whose grace is up goes out once. A worker that ends between the grace being

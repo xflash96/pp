@@ -37,7 +37,7 @@ GROUP = "group"             # the stop of a job whose work is in its own process
 
 NOTHING = "nothing"         # leave it as it is
 TIME_UP = "time-up"         # write a timeout's stop on it; from there it is a stop like any other
-TERM = "term"               # SIGTERM to its group, recorded as the stop's `sent`
+TERM = "term"               # SIGTERM to its group, recorded as the stop's `sent`, after its `going`
 KILL9 = "kill9"             # SIGKILL to its group, recorded as the stop's `kill9`
 ENDED_AS = "ended-as"       # record how it ended, and the hook that is owed for it
 AGAIN = "again"             # back to its queue for another attempt
@@ -53,7 +53,9 @@ class Facts:
             is in its environment); a code is the command's last word only once the run is over.
     rc, rc_at   the exit code this attempt wrote and when it wrote it (`ended_on_its_own`), or None for both.
     sig     the signal the attempt's process died of, where this worker started it and so holds the child.
-    now     the time the facts were read at, which is the only clock the decision has.
+    now     the time the decision is made at, which is the only clock the decision has. The core reads it
+            inside the decision's transaction (`Worker._step`), after the rest, since a stop's `going` is this
+            time: an exit code the attempt wrote before it is the job's own, however stale the rest is.
     hit     whether --retry-if matches the tail of this attempt's log (`tail_hit`), matched where the facts
             were read: a pattern of the caller's own takes as long as it likes over a tail, and the decision
             runs inside the store's transaction (I12).
@@ -72,16 +74,18 @@ class Action:
     """The one thing to be done about a job. `do` is which, and a field a kind does not use is None.
 
         nothing                                                      leave it alone
-        time-up   t, grace                                  write {by: timeout, timeout: True, t, grace} on it
-        term                                                         SIGTERM to its group
+        time-up   stop                                      write {by: timeout, timeout: True, t, grace} on it
+        term      stop                                               SIGTERM to its group
         kill9                                                        SIGKILL to its group
         ended-as  state, rc, reason, hook, ended, sweep, not_retried  record how it ended
         again     attempt, not_before, history, clear, ended, sweep   back to its queue for another attempt
 
-    hook is the event whose hook is owed ("failed", "done"), or None where the outcome owes none or the job
-    carries no such hook. sweep says anything left in the job's process group goes with it. history is the
-    entry a requeue writes for the attempt that ended, and clear the keys it takes off the record, so the
-    store writes what this says and works nothing out again.
+    stop is the job's stop as the decision's transaction writes it, or None where it writes none: a timeout's,
+    and a stop's `going` the first time a TERM is decided for it. hook is the event whose hook is owed
+    ("failed", "done"), or None where the outcome owes none or the job carries no such hook. sweep says
+    anything left in the job's process group goes with it. history is the entry a requeue writes for the
+    attempt that ended, and clear the keys it takes off the record, so the store writes what this says and
+    works nothing out again.
     """
 
     do: str
@@ -94,8 +98,7 @@ class Action:
     attempt: int | None = None
     not_before: float | None = None
     not_retried: str | None = None
-    t: float | None = None
-    grace: float | None = None
+    stop: dict | None = None
     history: dict | None = None
     clear: tuple = ()
 
@@ -194,7 +197,7 @@ def decide(job: dict, facts: Facts) -> Action:
     """
     stop = job.get("stop") or {}
     asked = bool(stop) and not stop.get("timeout")      # a kill: someone asked for this job to stop
-    out = bool(stop.get("sent")) or bool(stop.get("kill9"))     # a signal of pp's went out for this stop
+    out = went(stop) is not None        # pp began sending this stop, and was not refused it
     if facts.held:
         # a run of it is live, so nothing is recorded about how it ended and its exit code says nothing yet:
         # the one thing to do about it is to carry out the stop it carries, or to write a timeout's
@@ -203,9 +206,12 @@ def decide(job: dict, facts: Facts) -> Action:
         if not stop:
             due = (job.get("timeout") and job.get("started")
                    and facts.now - float(job["started"]) >= float(job["timeout"]))
-            return Action(TIME_UP, t=facts.now, grace=grace(job)) if due else Action(NOTHING)
+            return (Action(TIME_UP, stop={"by": "timeout", "timeout": True, "t": facts.now, "grace": grace(job)})
+                    if due else Action(NOTHING))
         if stop.get("sent") is None:
-            return Action(TERM)
+            # recorded before anything goes out, so a worker that dies before recording `sent` leaves it, and
+            # the next one sends the stop again with its first time kept
+            return Action(TERM, stop=None if stop.get("going") else {**stop, "going": facts.now})
         if not stop.get("kill9") and facts.now - float(stop["sent"]) >= float(stop.get("grace") or 0):
             return Action(KILL9)
         return Action(NOTHING)      # signalled, and inside the grace it was given
@@ -215,11 +221,11 @@ def decide(job: dict, facts: Facts) -> Action:
     own = None if facts.rc is not None else (f"signal {facts.sig}" if facts.sig else "lost")
     late = facts.rc is None or after(stop, facts.rc_at)
     if asked and out and late:
-        # a kill's signal stopped it: "killed", and no hook. A code the attempt wrote after that signal went
-        # out is that stop's outcome, and the code is kept
+        # a kill's stop began going out while it ran: "killed", and no hook. A code the attempt wrote after
+        # that is that stop's outcome, and the code is kept
         return _ends(job, facts.rc, "killed", facts.rc_at, sweep, None)
     if asked:
-        # it wrote its own code before the stop went out, or no signal of pp's ever went out for that stop:
+        # it wrote its own code before the stop began going out, or pp never began sending that stop:
         # the job ended as it ended, and the hook that outcome owes fires. A job a kill touched is never retried
         return _ends(job, facts.rc, own, facts.rc_at, sweep, "done" if facts.rc == 0 else "failed")
     if facts.rc == 0 and not late:
@@ -231,18 +237,28 @@ def decide(job: dict, facts: Facts) -> Action:
     return _or_again(job, facts, facts.rc, own, facts.rc_at, sweep)
 
 
+def went(stop: dict) -> float | None:
+    """When pp began sending this stop, or None where it never did or was refused before anything went out.
+
+    `going` is that time. The decision's transaction records it before anything goes out (`decide`), so a
+    worker that dies between sending the stop and recording `sent` leaves it, and the job ends as that stop's
+    outcome rather than as its own. A record whose stop carries no `going` (an older worker's) has `sent` or
+    `kill9` instead, each read before its signal went out."""
+    if stop.get("denied") and not (stop.get("sent") or stop.get("kill9")):
+        return None
+    return stop.get("going") or stop.get("sent") or stop.get("kill9")
+
+
 def after(stop: dict, rc_at: float | None) -> bool:
-    """Whether the attempt wrote its exit code after the first thing went out for this stop.
+    """Whether the attempt wrote its exit code after this stop began going out (`went`).
 
     A stop decides the reason: a container runner writes the code of a container the stop command ended (137),
     so without this a kill or a timeout of a container job would read as the job's own failure. The code is
-    kept either way, and what it decides is the reason (I10). A stop nothing has gone out for has no time to
-    compare against, so no code is ever late for one.
-
-    The time to compare against is read before the stop goes out and recorded once it has (`Worker._send`),
-    so the window in which a stop command is starting belongs to that stop and not to the job."""
-    went = stop.get("sent") or stop.get("kill9")
-    return went is not None and rc_at is not None and rc_at >= went
+    kept either way, and what it decides is the reason (I10). A stop pp never began sending has no time to
+    compare against, so no code is ever late for one. So the window in which a stop command is starting, or a
+    signal is on its way, belongs to that stop and not to the job."""
+    w = went(stop)
+    return w is not None and rc_at is not None and rc_at >= w
 
 
 def hook_due(job: dict, event: str | None) -> str | None:
@@ -319,8 +335,9 @@ def merge_stop(existing: dict | None, ask: dict) -> dict:
     asked and when.
 
     One stop per run: what went out is all the decision and the waiting verb have to go on, so a second ask
-    never writes over `t`, `sent` or `kill9`, and keeps only the shorter of the two graces, since a second ask
-    hastens the SIGKILL and never delays it. It clears `denied`, so a signal pp was refused is asked for again.
+    never writes over `t`, `going`, `sent` or `kill9`, and keeps only the shorter of the two graces, since a
+    second ask hastens the SIGKILL and never delays it. It clears `denied`, so a signal pp was refused is asked
+    for again, and with it the `going` of a stop nothing went out for, which begins again when it is next sent.
 
     A kill's ask on the stop a worker wrote for a timeout becomes the kill's: `by` is the asker, `timeout`
     goes, and the timeout stays in `was`. So a job a kill has touched is ended as a kill, never retried,
@@ -332,7 +349,8 @@ def merge_stop(existing: dict | None, ask: dict) -> dict:
         return dict(ask)
     out = dict(existing)
     out["grace"] = min(float(existing.get("grace") or 0), float(ask.get("grace") or 0))
-    out.pop("denied", None)
+    if out.pop("denied", None) is not None and went(existing) is None:
+        out.pop("going", None)
     if existing.get("timeout") and not ask.get("timeout"):
         out["was"], out["by"] = existing["by"], ask["by"]
         out.pop("timeout")

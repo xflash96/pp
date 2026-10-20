@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+`pp queue`: a kill whose worker dies while sending it is still a kill.
+
+- A worker that died between sending a kill's stop and recording it left the
+  next worker to read the job's end as the job's own. That job was recorded
+  as its own failure, with exit code 137 or reason `lost`, and its `on_fail`
+  hook ran. It is now recorded `killed`, and no hook runs. A timeout's stop
+  in the same window now ends as a timeout.
+- A stop gains `going` in `show --json` and `status --json`: when pp began
+  sending it, recorded before anything goes out. An exit code the attempt
+  wrote after that time is the stop's outcome, with the code kept. A job that
+  ends on its own just as its worker dies before sending is recorded the
+  same way.
+- `show` says "sending began" for a stop pp began sending and has nothing
+  marked sent for. A stop pp was refused still says "nothing signalled".
+
 ## v0.2.1
 
 pp finds the session that runs it with nothing set, so `--mine` works for

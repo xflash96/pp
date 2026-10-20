@@ -351,8 +351,9 @@ A kill, pass by pass:
 
 ```
 kill:   ask_stop(merge_stop) -> worker_up(wake=True) -> SIGUSR1 to the worker
-worker: carry_out: the facts -> decide = TERM -> the project's stop command,
-        or the SIGTERM to the group, then txn marks `sent`
+worker: carry_out: the facts -> decide = TERM, and its txn records `going`
+     -> the project's stop command, or the SIGTERM to the group,
+        then txn marks `sent`
      -> (the grace) -> decide = KILL9 -> signal
      -> the wrapper ends, so the job's run claim is free
      -> decide = ENDED_AS -> _finish records the outcome and the hook it owes
@@ -367,11 +368,14 @@ own exit time and not the queue's poll period.
 
 The rules the worker follows are the ones `pp help queue` states under "How a
 job ends, whatever reached it", and that help text is their one statement.
-Two more are for contributors: which of the two a stop is comes from the
+Three more are for contributors. Which of the two a stop is comes from the
 `timeout` field a worker writes on the stop it wrote itself, never from the
-name of whoever asked; and an exit code the attempt wrote after its stop went
-out is that stop's outcome, with the code kept, since a container runner writes
-the code of a container the stop command ended.
+name of whoever asked. An exit code the attempt wrote after its stop began
+going out is that stop's outcome, with the code kept, since a container runner
+writes the code of a container the stop command ended. And that moment is the
+stop's `going`, which the decision's transaction records with its own clock
+before anything goes out: a worker can die between a signal and its record,
+and a job can end between its facts and its decision.
 
 `TestTheDecision` in `tests/test_queue.py` is a table over every combination
 of those facts. Each row carries the rule from that help as its own label,
