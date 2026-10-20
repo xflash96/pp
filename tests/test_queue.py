@@ -250,6 +250,13 @@ class QueueCase(unittest.TestCase):
         self.assertEqual(r.stderr, "")
         return r.stdout.strip()
 
+    def a_tick_after(self, path: str) -> None:
+        """Wait until the clock a stop's times are read from has moved past the stamp of path. A code written in
+        the same tick as a stop began going out counts as that stop's, so a test of a code written before the
+        stop waits that tick out, however coarse the kernel's tick is (1 ms here, 4 ms on many runners)."""
+        at = os.stat(path).st_mtime_ns / 1e9
+        journey.until(lambda: jobcore.paths.file_now() > at, every=0.001, what=f"the tick after {path}'s stamp")
+
     def started_earlier(self, jid, seconds: float):
         """Move job jid's start time that far back, which is all the clock does to a running job. A pool's
         `settle` and a job's timeout are counted from that time, so a test says which side of the window it
@@ -3046,7 +3053,8 @@ class TestTwoAtOnce(QueueCase):
 
         def it_exits():         # the job exits 0 of its own accord, and nothing is signalled until it has
             open(os.path.join(self.work, "go"), "w").close()
-            journey.until(lambda: os.path.exists(self.rc_file(j)), timeout=10, what="the job's exit code")
+            journey.until(lambda: jobq.lock.Claim.holder(jobstore.run_claim("default", j)) is None, timeout=10,
+                          what="the job's run to be over")
 
         def serve(wk, *a, **kw):              # once the kill's stop is on the record, never before
             gate.once(it_exits, when=lambda: (jobstore.find(j) or {}).get("stop"))
@@ -3120,7 +3128,8 @@ class TestTwoAtOnce(QueueCase):
         a code the command itself wrote, with the command still running. An exit code counts only once the
         run is over, so the stop is carried out as for any other job: the SIGTERM goes out, the SIGKILL
         follows once the grace is up, and nothing waits out the job's own life. The run ends there, and the
-        code that was written stands as the outcome."""
+        code that was written stands as the outcome, since it was written in a tick before the stop began.
+        """
         j = self.add(cmd="sleep 30")
         w = jobq.worker_for("default")
         w.tick()
@@ -3128,6 +3137,7 @@ class TestTwoAtOnce(QueueCase):
         self.addCleanup(proc.signal_group, held, signal.SIGKILL)
         with open(self.rc_file(j), "w") as f:       # the command's own doing: `echo 0 > "$PP_QUEUE_RCFILE"`
             f.write("0\n")
+        self.a_tick_after(self.rc_file(j))          # written before the stop begins, not in its tick
         self.assertIsNotNone(jobq.lock.Claim.holder(jobstore.run_claim("default", j)), "its run is already over")
         with jobstore.txn() as s:
             cur = s.job(j, must_be=("running",))
@@ -5577,8 +5587,7 @@ class TestAWorkerKilledWhileItStops(InjectedCase):
             self.assertTrue(facts.held)
             self.open_the_gate()
             self.the_run_is_over(j)
-            at = jobcore.ended_on_its_own(jobstore.find(j))[1]
-            journey.until(lambda: jobcore.paths.file_now() > at, what="the tick after the job's own code")
+            self.a_tick_after(jobstore.find(j)["rcfile"])
             return facts
         self.a_kill_asks(j, grace=10.0)
         with mock.patch.object(jobcore.Worker, "_facts", the_job_ends_once_its_facts_are_read):
@@ -5717,7 +5726,8 @@ class TestAWorkerKilledWhileItReaps(InjectedCase):
         w.carry_out()
         rec = jobstore.find(j)
         self.assertEqual((rec["state"], rec["rc"]), ("failed", 7))
-        self.assertEqual(rec["ended"], os.stat(rcfile).st_mtime)
+        with open(rcfile) as fh:
+            self.assertEqual(rec["ended"], jobcore.paths.stamp(fh.fileno()))       # the code's time, as pp reads it
         self.run_until(w, lambda: not w.hooks)
         self.assertEqual([h["event"] for h in jobstore.find(j)["hooks"]], ["failed"])
         self.assertEqual(self.ran(f), 1)
@@ -5838,7 +5848,7 @@ class TestAStopAndAReapThatCross(InjectedCase):
         its code on the next attempt's stop, for which nothing has gone out: the record would say a stop
         failed that nothing had yet been sent for."""
         opens = self.gate("the-stop-command-may-end")
-        j = self.add("--retries", "1", "--retry-delay", "0.01", "--retry-if", "^timeout$", cmd=self.gated())
+        j = self.add("--retries", "1", "--retry-delay", "0.05", "--retry-if", "^timeout$", cmd=self.gated())
         w = jobq.worker_for("default")
         w.tick()
         self.nothing_of_the_job_is_left(w, j)
@@ -6235,7 +6245,7 @@ class TestTheGroupTheLeaseAndTheSweep(InjectedCase):
         j, w = self.a_running_job_whose_stop_is_a_command(ran)
         with jobstore.txn() as s:
             cur = s.job(j, must_be=("running",))
-            cur.update(retries=1, retry_delay=0.01)
+            cur.update(retries=1, retry_delay=0.05)
             s.save(cur)
         was = jobstore.find(j)["container"]
         self.the_run_ends_with_no_code(j)
